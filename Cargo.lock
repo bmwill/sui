@@ -3391,7 +3391,7 @@ dependencies = [
  "move-stackless-bytecode",
  "num",
  "once_cell",
- "pretty",
+ "pretty 0.10.0",
  "rand 0.8.5",
  "serde 1.0.137",
  "serde_json",
@@ -3419,7 +3419,7 @@ dependencies = [
  "move-stackless-bytecode",
  "num",
  "once_cell",
- "pretty",
+ "pretty 0.10.0",
  "rand 0.8.5",
  "regex",
  "serde 1.0.137",
@@ -4405,6 +4405,18 @@ checksum = "ad9940b913ee56ddd94aec2d3cd179dd47068236f42a1a6415ccf9d880ce2a61"
 dependencies = [
  "arrayvec 0.5.2",
  "typed-arena",
+]
+
+[[package]]
+name = "pretty"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83f3aa1e3ca87d3b124db7461265ac176b40c277f37e503eaa29c9c75c037846"
+dependencies = [
+ "arrayvec 0.5.2",
+ "log",
+ "typed-arena",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -7726,7 +7738,7 @@ dependencies = [
  "pin-utils",
  "pkg-config",
  "ppv-lite86",
- "pretty",
+ "pretty 0.11.3",
  "pretty_assertions",
  "prettyplease",
  "primary",
