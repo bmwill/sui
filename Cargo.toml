@@ -125,6 +125,7 @@ members = [
     "crates/telemetry-subscribers",
     "crates/test-utils",
     "crates/tsunami",
+    "crates/tsunami-test-plugin",
     "crates/transaction-fuzzer",
     "crates/typed-store",
     "crates/typed-store-derive",

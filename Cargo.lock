@@ -1687,7 +1687,7 @@ checksum = "fa2e27ae6ab525c3d369ded447057bca5438d86dc3a68f6faafb8269ba82ebf3"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.7.4",
 ]
 
 [[package]]
@@ -4505,6 +4505,16 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d580318f95776505201b28cf98eb1fa5e4be3b689633ba6a3e6cd880ff22d8cb"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -11630,7 +11640,16 @@ name = "tsunami"
 version = "0.0.0"
 dependencies = [
  "const-str",
+ "libloading 0.8.0",
  "tracing",
+]
+
+[[package]]
+name = "tsunami-test-plugin"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tsunami",
 ]
 
 [[package]]
@@ -12733,7 +12752,7 @@ dependencies = [
  "leb128",
  "lexical-core",
  "libc",
- "libloading",
+ "libloading 0.7.4",
  "libm",
  "librocksdb-sys",
  "libtest-mimic",

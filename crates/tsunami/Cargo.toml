@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 tracing = "0.1.37"
 const-str = "0.5.3"
+libloading = "0.8.0"

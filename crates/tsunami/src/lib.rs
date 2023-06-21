@@ -1,3 +1,5 @@
+use std::ffi::CStr;
+
 use tracing::info;
 
 /// The package version of the `tsunami` library
@@ -19,7 +21,7 @@ pub const RUSTC_VERSION_CSTR: &std::ffi::CStr = const_str::cstr!(RUSTC_VERSION);
 macro_rules! declare_plugin {
     ($plugin_type:ty, $constructor:path) => {
         #[no_mangle]
-        pub extern "C" fn _tsunami_package_version() -> *const std::ffi::c_char {
+        pub extern "C" fn _package_version() -> *const std::ffi::c_char {
             $crate::PACKAGE_VERSION_CSTR.as_ptr()
         }
 
@@ -41,14 +43,17 @@ macro_rules! declare_plugin {
     };
 }
 
-pub struct Error {
-    _inner: Box<dyn std::error::Error + Send + Sync>,
-}
+// #[derive(Debug)]
+// pub struct Error {
+//     _inner: Box<dyn std::error::Error + Send + Sync>,
+// }
+
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Defines a Geyser plugin, to stream data from the runtime.
-/// Geyser plugins must describe desired behavior for load and unload,
+/// Defines a Tsunami plugin, to stream data from the runtime.
+/// Tsunami plugins must describe desired behavior for load and unload,
 /// as well as how they will handle streamed data.
 pub trait Plugin: std::any::Any + Send + Sync + std::fmt::Debug {
     fn name(&self) -> &'static str;
@@ -56,6 +61,10 @@ pub trait Plugin: std::any::Any + Send + Sync + std::fmt::Debug {
     /// The callback called when a plugin is loaded by the system,
     /// used for doing whatever initialization is required by the plugin.
     fn on_load(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn trigger(&self, _val: usize) -> Result<()> {
         Ok(())
     }
 
@@ -90,8 +99,46 @@ impl PluginManager {
         self.plugins.iter().map(PluginType::plugin)
     }
 
-    pub fn load_plugin(&mut self) -> Result<()> {
-        todo!()
+    pub fn load_plugin<P: AsRef<std::path::Path>>(&mut self, filename: P) -> Result<()> {
+        use libloading::{Library, Symbol};
+
+        type RustcVersion = unsafe fn() -> *const std::ffi::c_char;
+        type PackageVersion = unsafe fn() -> *const std::ffi::c_char;
+        type PluginCreate = unsafe fn() -> *mut dyn Plugin;
+
+        let library = unsafe { Library::new(filename.as_ref()) }?;
+
+        let rustc_version: Symbol<RustcVersion> = unsafe { library.get(b"_rustc_version") }?;
+        let rustc_version = unsafe { CStr::from_ptr(rustc_version()) };
+        if rustc_version != RUSTC_VERSION_CSTR {
+            let rustc_version = rustc_version.to_str()?;
+            return Err(format!(
+                "rustc version does not match. expected {RUSTC_VERSION} found {rustc_version}"
+            )
+            .into());
+        }
+
+        let package_version: Symbol<PackageVersion> = unsafe { library.get(b"_package_version") }?;
+        let package_version = unsafe { CStr::from_ptr(package_version()) };
+        if package_version != PACKAGE_VERSION_CSTR {
+            let package_version = package_version.to_str()?;
+            return Err(format!(
+                "package version does not match. expected {PACKAGE_VERSION} found {package_version}"
+            )
+            .into());
+        }
+
+        let plugin_create: Symbol<PluginCreate> = unsafe { library.get(b"_plugin_create") }?;
+        let boxed_raw = unsafe { plugin_create() };
+
+        let plugin = unsafe { Box::from_raw(boxed_raw) };
+        info!("Loaded plugin: {}", plugin.name());
+
+        let mut plugin = PluginType::Dynamic { plugin, library };
+        plugin.plugin_mut().on_load()?;
+        self.plugins.push(plugin);
+
+        Ok(())
     }
 
     pub fn load_static_plugin<P: Plugin>(&mut self, plugin: P) -> Result<()> {
@@ -116,7 +163,8 @@ enum PluginType {
     /// Dynamiclly Loaded/Linked Plugin
     Dynamic {
         plugin: Box<dyn Plugin>,
-        library: Box<()>,
+        #[allow(unused)]
+        library: libloading::Library,
     },
 
     /// Staticlly Linked Plugin
@@ -164,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_plugin() {
-        let pkg_version = unsafe { std::ffi::CStr::from_ptr(_tsunami_package_version()) };
+        let pkg_version = unsafe { std::ffi::CStr::from_ptr(_package_version()) };
         assert_eq!(pkg_version, PACKAGE_VERSION_CSTR);
         let rust_version = unsafe { std::ffi::CStr::from_ptr(_rustc_version()) };
         assert_eq!(rust_version, RUSTC_VERSION_CSTR);
