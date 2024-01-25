@@ -200,6 +200,15 @@ impl ReadStore for RocksDbStore {
             .map_err(StorageError::custom)
     }
 
+    fn get_transaction_checkpoint(&self, _tx_digest: &TransactionDigest) -> Result<Option<CheckpointSequenceNumber>, StorageError> {
+        //TODO figure out if we want to support this or not
+        Ok(None)
+        // self.authority_store
+        //     .deprecated_get_transaction_checkpoint(tx_digest)
+        //     .map(|maybe| maybe.map(|(_epoch, checkpoint)| checkpoint))
+        //     .map_err(StorageError::custom)
+    }
+
     fn get_transaction_effects(
         &self,
         digest: &TransactionDigest,

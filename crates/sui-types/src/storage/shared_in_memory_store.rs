@@ -124,6 +124,11 @@ impl ReadStore for SharedInMemoryStore {
             .pipe(Ok)
     }
 
+    //TODO
+    fn get_transaction_checkpoint(&self, _tx_digest: &TransactionDigest) -> Result<Option<CheckpointSequenceNumber>> {
+        Ok(None)
+    }
+
     fn get_transaction_effects(
         &self,
         digest: &TransactionDigest,
@@ -538,6 +543,11 @@ impl ReadStore for SingleCheckpointSharedInMemoryStore {
         digest: &TransactionDigest,
     ) -> Result<Option<Arc<VerifiedTransaction>>> {
         self.0.get_transaction(digest)
+    }
+
+    //TODO
+    fn get_transaction_checkpoint(&self, _tx_digest: &TransactionDigest) -> Result<Option<CheckpointSequenceNumber>> {
+        Ok(None)
     }
 
     fn get_transaction_effects(

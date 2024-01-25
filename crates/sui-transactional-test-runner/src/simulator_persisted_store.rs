@@ -660,6 +660,10 @@ impl ReadStore for PersistedStoreInnerReadOnlyWrapper {
             .map(|transaction| Arc::new(transaction.into())))
     }
 
+    fn get_transaction_checkpoint(&self, _tx_digest: &TransactionDigest) -> sui_types::storage::error::Result<Option<CheckpointSequenceNumber>> {
+        todo!()
+    }
+
     fn get_transaction_effects(
         &self,
         tx_digest: &TransactionDigest,

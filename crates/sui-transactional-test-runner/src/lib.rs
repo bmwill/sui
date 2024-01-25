@@ -284,6 +284,10 @@ impl ReadStore for ValidatorWithFullnode {
             .map_err(sui_types::storage::error::Error::custom)
     }
 
+    fn get_transaction_checkpoint(&self, _tx_digest: &TransactionDigest) -> sui_types::storage::error::Result<Option<sui_types::messages_checkpoint::CheckpointSequenceNumber>> {
+        todo!()
+    }
+
     fn get_transaction_effects(
         &self,
         tx_digest: &TransactionDigest,

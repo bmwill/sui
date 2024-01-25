@@ -477,6 +477,11 @@ impl<T, V: store::SimulatorStore> ReadStore for Simulacrum<T, V> {
         Ok(self.store().get_transaction(tx_digest).map(Arc::new))
     }
 
+    //TODO
+    fn get_transaction_checkpoint(&self, _tx_digest: &sui_types::digests::TransactionDigest) -> sui_types::storage::error::Result<Option<sui_types::messages_checkpoint::CheckpointSequenceNumber>> {
+        Ok(None)
+    }
+
     fn get_transaction_effects(
         &self,
         tx_digest: &sui_types::digests::TransactionDigest,

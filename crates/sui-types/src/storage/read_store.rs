@@ -97,6 +97,18 @@ pub trait ReadStore: ObjectStore {
             .collect::<Result<Vec<_>, _>>()
     }
 
+    fn get_transaction_checkpoint(&self, tx_digest: &TransactionDigest) -> Result<Option<CheckpointSequenceNumber>>;
+
+    fn multi_get_transaction_checkpoint(
+        &self,
+        tx_digests: &[TransactionDigest],
+    ) -> Result<Vec<Option<CheckpointSequenceNumber>>> {
+        tx_digests
+            .iter()
+            .map(|digest| self.get_transaction_checkpoint(digest))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
     fn get_transaction_effects(
         &self,
         tx_digest: &TransactionDigest,
@@ -351,6 +363,17 @@ impl<T: ReadStore + ?Sized> ReadStore for &T {
         (*self).multi_get_transactions(tx_digests)
     }
 
+    fn get_transaction_checkpoint(&self, tx_digest: &TransactionDigest) -> Result<Option<CheckpointSequenceNumber>> {
+        (*self).get_transaction_checkpoint(tx_digest)
+    }
+
+    fn multi_get_transaction_checkpoint(
+        &self,
+        tx_digests: &[TransactionDigest],
+    ) -> Result<Vec<Option<CheckpointSequenceNumber>>> {
+        (*self).multi_get_transaction_checkpoint(tx_digests)
+    }
+
     fn get_transaction_effects(
         &self,
         tx_digest: &TransactionDigest,
@@ -473,6 +496,17 @@ impl<T: ReadStore + ?Sized> ReadStore for Box<T> {
         (**self).multi_get_transactions(tx_digests)
     }
 
+    fn get_transaction_checkpoint(&self, tx_digest: &TransactionDigest) -> Result<Option<CheckpointSequenceNumber>> {
+        (**self).get_transaction_checkpoint(tx_digest)
+    }
+
+    fn multi_get_transaction_checkpoint(
+        &self,
+        tx_digests: &[TransactionDigest],
+    ) -> Result<Vec<Option<CheckpointSequenceNumber>>> {
+        (**self).multi_get_transaction_checkpoint(tx_digests)
+    }
+
     fn get_transaction_effects(
         &self,
         tx_digest: &TransactionDigest,
@@ -593,6 +627,17 @@ impl<T: ReadStore + ?Sized> ReadStore for Arc<T> {
         tx_digests: &[TransactionDigest],
     ) -> Result<Vec<Option<Arc<VerifiedTransaction>>>> {
         (**self).multi_get_transactions(tx_digests)
+    }
+
+    fn get_transaction_checkpoint(&self, tx_digest: &TransactionDigest) -> Result<Option<CheckpointSequenceNumber>> {
+        (**self).get_transaction_checkpoint(tx_digest)
+    }
+
+    fn multi_get_transaction_checkpoint(
+        &self,
+        tx_digests: &[TransactionDigest],
+    ) -> Result<Vec<Option<CheckpointSequenceNumber>>> {
+        (**self).multi_get_transaction_checkpoint(tx_digests)
     }
 
     fn get_transaction_effects(

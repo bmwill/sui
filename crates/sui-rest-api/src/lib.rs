@@ -11,7 +11,16 @@ mod health;
 mod info;
 mod objects;
 mod response;
+mod transactions;
 pub mod types;
+
+pub use error::{RestError, Result};
+
+//TODO
+// transactions end points (return tx fx events)
+// governance info
+// protocol config
+// account info (transactions, owned objects, etc)
 
 pub use client::Client;
 pub use error::{RestError, Result};
@@ -53,6 +62,10 @@ where
         .route(
             objects::GET_OBJECT_WITH_VERSION_PATH,
             get(objects::get_object_with_version::<S>),
+        )
+        .route(
+            transactions::GET_TRANSACTION_PATH,
+            get(transactions::get_transaction::<S>),
         )
         .layer(axum::middleware::map_response_with_state(
             service,

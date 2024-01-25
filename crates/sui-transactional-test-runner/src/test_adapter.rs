@@ -2197,6 +2197,10 @@ impl ReadStore for SuiTestAdapter<'_> {
         self.executor.get_transaction(tx_digest)
     }
 
+    fn get_transaction_checkpoint(&self, tx_digest: &TransactionDigest) -> sui_types::storage::error::Result<Option<CheckpointSequenceNumber>> {
+        self.executor.get_transaction_checkpoint(tx_digest)
+    }
+
     fn get_transaction_effects(
         &self,
         tx_digest: &TransactionDigest,
