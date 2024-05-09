@@ -13507,6 +13507,8 @@ dependencies = [
  "fastcrypto",
  "itertools 0.10.5",
  "mime",
+ "mysten-network",
+ "prometheus",
  "rand 0.8.5",
  "reqwest",
  "serde",
