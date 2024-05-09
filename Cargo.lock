@@ -1688,6 +1688,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "604178f6c5c21f02dc555784810edfb88d34ac2c73b2eae109655649ee73ce3d"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1708,9 +1714,9 @@ dependencies = [
 
 [[package]]
 name = "base64ct"
-version = "1.5.3"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b645a089122eccb6111b4f81cbc1a49f5900ac4666bb93ac027feaecf15607bf"
+checksum = "8c3c1a368f70d6cf7302d78f8f7093da241fb8e8807c05cc9e51a125895a6d5b"
 
 [[package]]
 name = "bcrypt-pbkdf"
@@ -2032,6 +2038,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bnum"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56953345e39537a3e18bdaeba4cb0c58a78c1f61f361dc0fa7c5c7340ae87c5f"
+
+[[package]]
 name = "brotli"
 version = "3.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2114,15 +2126,15 @@ checksum = "2c676a478f63e9fa2dd5368a42f28bba0d6c560b775f38583c8bbaa7fcd67c9c"
 
 [[package]]
 name = "bytemuck"
-version = "1.12.3"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaa3a8d9a1ca92e282c96a32d6511b695d7d994d1d102ba85d279f9b2756947f"
+checksum = "78834c15cb5d5efe3452d58b1e8ba890dd62d21907f867f383358198e56ebca5"
 
 [[package]]
 name = "byteorder"
-version = "1.4.3"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14c189c53d098945499cdfa7ecc63567cf3886b3332b312a5b4585d8d3a6a610"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
@@ -3703,7 +3715,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
 ]
 
 [[package]]
@@ -4422,7 +4434,7 @@ dependencies = [
  "secp256k1",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "sha2 0.10.6",
  "sha3 0.10.6",
  "signature 2.0.0",
@@ -7869,7 +7881,7 @@ dependencies = [
  "rustversion",
  "serde",
  "serde_test",
- "serde_with",
+ "serde_with 2.1.0",
  "sui-protocol-config",
  "thiserror",
  "tokio",
@@ -10077,12 +10089,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "retain_mut"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c31b5c4033f8fdde8700e4657be2c497e7288f01515be52168c631e2e4d4086"
-
-[[package]]
 name = "retry-policies"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10176,13 +10182,12 @@ dependencies = [
 
 [[package]]
 name = "roaring"
-version = "0.10.1"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef0fb5e826a8bde011ecae6a8539dd333884335c57ff0f003fbe27c25bbe8f71"
+checksum = "b26f4c25a604fcb3a1bcd96dd6ba37c93840de95de8198d94c0d571a74a804d1"
 dependencies = [
  "bytemuck",
  "byteorder",
- "retain_mut",
 ]
 
 [[package]]
@@ -11038,6 +11043,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_with"
+version = "3.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ad483d2ab0149d5a5ebcd9972a3852711e0153d863bf5a5d0391d28883c4a20"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "serde_with_macros"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11721,7 +11741,7 @@ dependencies = [
  "sui-package-management",
  "sui-protocol-config",
  "sui-replay",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-simulator",
  "sui-source-validation",
  "sui-swarm",
@@ -12030,7 +12050,7 @@ dependencies = [
  "sui-macros",
  "sui-network",
  "sui-protocol-config",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-simulator",
  "sui-storage",
  "sui-surfer",
@@ -12075,14 +12095,14 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "shared-crypto",
  "sui-common",
  "sui-config",
  "sui-json-rpc-api",
  "sui-json-rpc-types",
  "sui-keys",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-test-transaction-builder",
  "sui-types",
  "tap",
@@ -12107,13 +12127,13 @@ dependencies = [
  "move-core-types",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "shared-crypto",
  "sui-bridge",
  "sui-config",
  "sui-json-rpc-types",
  "sui-keys",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-types",
  "telemetry-subscribers",
  "tokio",
@@ -12147,7 +12167,7 @@ dependencies = [
  "sui-json",
  "sui-json-rpc-types",
  "sui-keys",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-swarm",
  "sui-swarm-config",
  "sui-test-transaction-builder",
@@ -12190,7 +12210,7 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "serde",
- "serde_with",
+ "serde_with 2.1.0",
  "serde_yaml 0.8.26",
  "sui-keys",
  "sui-protocol-config",
@@ -12267,7 +12287,7 @@ dependencies = [
  "serde",
  "serde-reflection",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "serde_yaml 0.8.26",
  "shared-crypto",
  "signature 1.6.4",
@@ -12428,7 +12448,7 @@ dependencies = [
  "sui-network",
  "sui-node",
  "sui-protocol-config",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-simulator",
  "sui-storage",
  "sui-swarm",
@@ -12521,7 +12541,7 @@ dependencies = [
  "sui-config",
  "sui-json-rpc-types",
  "sui-keys",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-types",
  "tap",
  "telemetry-subscribers",
@@ -12604,7 +12624,7 @@ dependencies = [
  "prometheus",
  "rand 0.8.5",
  "serde",
- "serde_with",
+ "serde_with 2.1.0",
  "serde_yaml 0.8.26",
  "shared-crypto",
  "sui-config",
@@ -12672,7 +12692,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "serde_yaml 0.8.26",
  "serial_test",
  "shared-crypto",
@@ -12687,7 +12707,7 @@ dependencies = [
  "sui-package-resolver",
  "sui-protocol-config",
  "sui-rest-api",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-swarm-config",
  "sui-test-transaction-builder",
  "sui-types",
@@ -12757,7 +12777,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "simulacrum",
  "sui-data-ingestion-core",
  "sui-json",
@@ -12770,7 +12790,7 @@ dependencies = [
  "sui-package-resolver",
  "sui-protocol-config",
  "sui-rest-api",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-test-transaction-builder",
  "sui-transaction-builder",
  "sui-types",
@@ -12902,7 +12922,7 @@ dependencies = [
  "sui-open-rpc",
  "sui-open-rpc-macros",
  "sui-protocol-config",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-simulator",
  "sui-swarm-config",
  "sui-test-transaction-builder",
@@ -12931,7 +12951,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "sui-enum-compat-util",
  "sui-json",
  "sui-macros",
@@ -12980,7 +13000,7 @@ dependencies = [
  "sui-json-rpc-types",
  "sui-package-resolver",
  "sui-rest-api",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-types",
  "tokio",
 ]
@@ -13307,7 +13327,7 @@ dependencies = [
  "sui-json-rpc-types",
  "sui-keys",
  "sui-move-build",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-types",
  "tap",
  "telemetry-subscribers",
@@ -13322,7 +13342,7 @@ dependencies = [
  "anyhow",
  "move-package",
  "sui-json-rpc-types",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "tracing",
 ]
 
@@ -13370,7 +13390,7 @@ dependencies = [
  "move-vm-config",
  "schemars",
  "serde",
- "serde_with",
+ "serde_with 2.1.0",
  "sui-protocol-config-macros",
  "tracing",
 ]
@@ -13415,7 +13435,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "serde_yaml 0.8.26",
  "snap",
  "sui-tls",
@@ -13449,7 +13469,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "serde_yaml 0.8.26",
  "shared-crypto",
  "shellexpand",
@@ -13462,7 +13482,7 @@ dependencies = [
  "sui-json-rpc-api",
  "sui-json-rpc-types",
  "sui-protocol-config",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-storage",
  "sui-transaction-checks",
  "sui-types",
@@ -13487,7 +13507,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "sui-types",
  "tap",
  "thiserror",
@@ -13524,7 +13544,7 @@ dependencies = [
  "sui-keys",
  "sui-move-build",
  "sui-node",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-swarm-config",
  "sui-types",
  "telemetry-subscribers",
@@ -13556,13 +13576,30 @@ dependencies = [
  "sui-json-rpc",
  "sui-json-rpc-types",
  "sui-keys",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-types",
  "telemetry-subscribers",
  "test-cluster",
  "tokio",
  "tonic 0.11.0",
  "tracing",
+]
+
+[[package]]
+name = "sui-sdk"
+version = "0.0.0"
+source = "git+https://github.com/bmwill/sui-sdk.git?rev=b4f9eac0d75ab1c1c6a8c487468f1c9ce838b54f#b4f9eac0d75ab1c1c6a8c487468f1c9ce838b54f"
+dependencies = [
+ "base64ct",
+ "bcs",
+ "bnum",
+ "bs58 0.5.0",
+ "hex",
+ "roaring",
+ "serde",
+ "serde_derive",
+ "serde_with 3.8.1",
+ "winnow 0.6.8",
 ]
 
 [[package]]
@@ -13586,7 +13623,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "shared-crypto",
  "sui-config",
  "sui-json",
@@ -13729,7 +13766,7 @@ dependencies = [
  "rand 0.8.5",
  "sui-json-rpc-types",
  "sui-move-build",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-test-transaction-builder",
  "sui-types",
  "tar",
@@ -13765,7 +13802,7 @@ dependencies = [
  "sui-json-rpc-types",
  "sui-move",
  "sui-move-build",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-source-validation",
  "telemetry-subscribers",
  "tempfile",
@@ -13901,7 +13938,7 @@ dependencies = [
  "prometheus",
  "rand 0.8.5",
  "serde",
- "serde_with",
+ "serde_with 2.1.0",
  "serde_yaml 0.8.26",
  "shared-crypto",
  "sui-config",
@@ -13934,7 +13971,7 @@ dependencies = [
  "shared-crypto",
  "sui-genesis-builder",
  "sui-move-build",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-types",
 ]
 
@@ -14014,7 +14051,7 @@ dependencies = [
  "sui-network",
  "sui-protocol-config",
  "sui-replay",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-snapshot",
  "sui-storage",
  "sui-types",
@@ -14158,7 +14195,7 @@ dependencies = [
  "serde",
  "serde-name",
  "serde_json",
- "serde_with",
+ "serde_with 2.1.0",
  "serde_yaml 0.8.26",
  "shared-crypto",
  "signature 1.6.4",
@@ -14168,6 +14205,7 @@ dependencies = [
  "sui-enum-compat-util",
  "sui-macros",
  "sui-protocol-config",
+ "sui-sdk 0.0.0",
  "tap",
  "thiserror",
  "tonic 0.11.0",
@@ -14619,7 +14657,7 @@ dependencies = [
  "sui-macros",
  "sui-node",
  "sui-protocol-config",
- "sui-sdk",
+ "sui-sdk 1.26.0",
  "sui-simulator",
  "sui-swarm",
  "sui-swarm-config",
@@ -15058,7 +15096,7 @@ dependencies = [
  "serde",
  "serde_spanned",
  "toml_datetime 0.6.2",
- "winnow",
+ "winnow 0.4.6",
 ]
 
 [[package]]
@@ -16272,6 +16310,15 @@ name = "winnow"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61de7bac303dc551fe038e2b3cef0f571087a47571ea6e79a87692ac99b99699"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3c52e9c97a68071b23e836c9380edae937f17b9c4667bd021973efc689f618d"
 dependencies = [
  "memchr",
 ]
