@@ -95,6 +95,11 @@ impl RestService {
                 get(committee::get_latest_committee),
             )
             .route(committee::GET_COMMITTEE_PATH, get(committee::get_committee))
+            .route(objects::GET_OBJECT_PATH, get(objects::get_object))
+            .route(
+                objects::GET_OBJECT_WITH_VERSION_PATH,
+                get(objects::get_object_with_version),
+            )
             .with_state(self.clone())
             .merge(rest_router(store))
             .pipe(|router| {
@@ -150,11 +155,6 @@ where
         .route(
             checkpoints::GET_LATEST_CHECKPOINT_PATH,
             get(checkpoints::get_latest_checkpoint::<S>),
-        )
-        .route(objects::GET_OBJECT_PATH, get(objects::get_object::<S>))
-        .route(
-            objects::GET_OBJECT_WITH_VERSION_PATH,
-            get(objects::get_object_with_version::<S>),
         )
         .with_state(state)
 }
