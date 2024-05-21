@@ -29,6 +29,7 @@ use sui_core::consensus_adapter::SubmitToConsensus;
 use sui_core::consensus_manager::ConsensusClient;
 use sui_core::epoch::randomness::RandomnessManager;
 use sui_core::execution_cache::build_execution_cache;
+use sui_core::storage::RestReadStore;
 use sui_core::traffic_controller::metrics::TrafficControllerMetrics;
 use sui_json_rpc::bridge_api::BridgeReadApi;
 use sui_json_rpc::ServerType;
@@ -1818,8 +1819,6 @@ pub async fn build_http_server(
         return Ok(None);
     }
 
-    let chain_id = state.get_chain_identifier().unwrap();
-
     let mut router = axum::Router::new();
 
     let json_rpc_router = {
@@ -1883,7 +1882,7 @@ pub async fn build_http_server(
             metrics,
             config.indexer_max_subscriptions,
         ))?;
-        server.register_module(MoveUtils::new(state))?;
+        server.register_module(MoveUtils::new(state.clone()))?;
 
         let server_type = if config.websocket_only {
             Some(ServerType::WebSocket)
@@ -1896,8 +1895,10 @@ pub async fn build_http_server(
     router = router.merge(json_rpc_router);
 
     if config.enable_experimental_rest_api {
-        let mut rest_service =
-            sui_rest_api::RestService::new(Arc::new(store.clone()), chain_id, software_version);
+        let mut rest_service = sui_rest_api::RestService::new(
+            Arc::new(RestReadStore::new(state, store)),
+            software_version,
+        );
 
         rest_service.with_metrics(RestMetrics::new(prometheus_registry));
 
