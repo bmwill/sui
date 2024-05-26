@@ -37,6 +37,13 @@ pub const TEXT_PLAIN_UTF_8: &str = "text/plain; charset=utf-8";
 pub const APPLICATION_BCS: &str = "application/bcs";
 pub const APPLICATION_JSON: &str = "application/json";
 
+#[derive(Debug, Copy, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    Ascending,
+    Descending,
+}
+
 #[derive(Clone)]
 pub struct RestService {
     reader: StateReader,
