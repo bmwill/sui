@@ -17,6 +17,7 @@ use tap::Pipe;
 
 use crate::reader::StateReader;
 use crate::Direction;
+use crate::Page;
 use crate::RestError;
 use crate::Result;
 use crate::{accept::AcceptFormat, response::ResponseContent};
@@ -66,7 +67,7 @@ impl From<TransactionNotFoundError> for crate::RestError {
 pub const LIST_TRANSACTIONS_PATH: &str = "/transactions";
 
 pub async fn list_transactions(
-    Query(parameters): Query<GetTransactionsQueryParameters>,
+    Query(parameters): Query<ListTransactionsQueryParameters>,
     accept: AcceptFormat,
     State(state): State<StateReader>,
 ) -> Result<Page<TransactionResponse, TransactionCursor>> {
@@ -116,24 +117,6 @@ pub async fn list_transactions(
     });
 
     Ok(Page { entries, cursor })
-}
-
-pub struct Page<T, C> {
-    pub entries: ResponseContent<Vec<T>>,
-    pub cursor: Option<C>,
-}
-
-const DEFAULT_PAGE_SIZE: usize = 50;
-const MAX_PAGE_SIZE: usize = 100;
-
-impl<T: serde::Serialize, C: std::fmt::Display> axum::response::IntoResponse for Page<T, C> {
-    fn into_response(self) -> axum::response::Response {
-        let cursor = self
-            .cursor
-            .map(|cursor| [(crate::types::X_SUI_CURSOR, cursor.to_string())]);
-
-        (cursor, self.entries).into_response()
-    }
 }
 
 /// A Cursor that points at a specific transaction in history.
@@ -202,17 +185,17 @@ impl serde::Serialize for TransactionCursor {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct GetTransactionsQueryParameters {
+pub struct ListTransactionsQueryParameters {
     limit: Option<u32>,
     start: Option<TransactionCursor>,
     direction: Option<Direction>,
 }
 
-impl GetTransactionsQueryParameters {
+impl ListTransactionsQueryParameters {
     pub fn limit(&self) -> usize {
         self.limit
-            .map(|l| (l as usize).clamp(1, MAX_PAGE_SIZE))
-            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .map(|l| (l as usize).clamp(1, crate::MAX_PAGE_SIZE))
+            .unwrap_or(crate::DEFAULT_PAGE_SIZE)
     }
 
     pub fn start(&self, default: CheckpointSequenceNumber) -> TransactionCursor {

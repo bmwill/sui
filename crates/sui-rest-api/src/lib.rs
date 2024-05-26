@@ -44,6 +44,24 @@ pub enum Direction {
     Descending,
 }
 
+pub struct Page<T, C> {
+    pub entries: response::ResponseContent<Vec<T>>,
+    pub cursor: Option<C>,
+}
+
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+pub const MAX_PAGE_SIZE: usize = 100;
+
+impl<T: serde::Serialize, C: std::fmt::Display> axum::response::IntoResponse for Page<T, C> {
+    fn into_response(self) -> axum::response::Response {
+        let cursor = self
+            .cursor
+            .map(|cursor| [(crate::types::X_SUI_CURSOR, cursor.to_string())]);
+
+        (cursor, self.entries).into_response()
+    }
+}
+
 #[derive(Clone)]
 pub struct RestService {
     reader: StateReader,

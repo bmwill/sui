@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use axum::extract::Query;
 use axum::extract::{Path, State};
 use sui_sdk2::types::{
     CheckpointData, CheckpointDigest, CheckpointSequenceNumber, SignedCheckpointSummary,
@@ -8,6 +9,9 @@ use sui_sdk2::types::{
 use sui_types::storage::ReadStore;
 use tap::Pipe;
 
+use crate::reader::StateReader;
+use crate::Direction;
+use crate::Page;
 use crate::{accept::AcceptFormat, response::ResponseContent, Result};
 
 pub const GET_LATEST_CHECKPOINT_PATH: &str = "/checkpoints";
@@ -131,5 +135,67 @@ impl std::error::Error for CheckpointNotFoundError {}
 impl From<CheckpointNotFoundError> for crate::RestError {
     fn from(value: CheckpointNotFoundError) -> Self {
         Self::new(axum::http::StatusCode::NOT_FOUND, value.to_string())
+    }
+}
+
+pub async fn list_checkpoints(
+    Query(parameters): Query<ListCheckpointsQueryParameters>,
+    accept: AcceptFormat,
+    State(state): State<StateReader>,
+) -> Result<Page<SignedCheckpointSummary, CheckpointSequenceNumber>> {
+    let latest_checkpoint = state.inner().get_latest_checkpoint()?.sequence_number;
+    let oldest_checkpoint = state.inner().get_lowest_available_checkpoint()?;
+    let limit = parameters.limit();
+    let start = parameters.start(latest_checkpoint);
+    let direction = parameters.direction();
+
+    if start < oldest_checkpoint {
+        return Err(crate::RestError::new(
+            axum::http::StatusCode::GONE,
+            "Old checkpoints have been pruned",
+        ));
+    }
+
+    let checkpoints = state
+        .checkpoint_iter(direction, start)
+        .map(|result| {
+            result.map(|(checkpoint, _contents)| SignedCheckpointSummary::from(checkpoint))
+        })
+        .take(limit)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let cursor = checkpoints.last().and_then(|checkpoint| match direction {
+        Direction::Ascending => checkpoint.checkpoint.sequence_number.checked_add(1),
+        Direction::Descending => checkpoint.checkpoint.sequence_number.checked_sub(1),
+    });
+
+    let entries = match accept {
+        AcceptFormat::Json => ResponseContent::Json(checkpoints),
+        AcceptFormat::Bcs => ResponseContent::Bcs(checkpoints),
+    };
+
+    Ok(Page { entries, cursor })
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ListCheckpointsQueryParameters {
+    limit: Option<u32>,
+    start: Option<CheckpointSequenceNumber>,
+    direction: Option<Direction>,
+}
+
+impl ListCheckpointsQueryParameters {
+    pub fn limit(&self) -> usize {
+        self.limit
+            .map(|l| (l as usize).clamp(1, crate::MAX_PAGE_SIZE))
+            .unwrap_or(crate::DEFAULT_PAGE_SIZE)
+    }
+
+    pub fn start(&self, default: CheckpointSequenceNumber) -> CheckpointSequenceNumber {
+        self.start.unwrap_or(default)
+    }
+
+    pub fn direction(&self) -> Direction {
+        self.direction.unwrap_or(Direction::Descending)
     }
 }
