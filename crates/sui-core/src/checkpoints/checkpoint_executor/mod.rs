@@ -1286,6 +1286,8 @@ async fn finalize_checkpoint(
             checkpoint.sequence_number,
         )?;
 
+    // TODO new indexing should be done here
+
     let checkpoint_acc =
         accumulator.accumulate_checkpoint(effects, checkpoint.sequence_number, epoch_store)?;
 

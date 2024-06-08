@@ -277,6 +277,7 @@ impl<'a> TestAuthorityBuilder<'a> {
                     .max_move_identifier_len_as_option(),
             )))
         };
+        let rest_index = self.disable_indexer
         let transaction_deny_config = self.transaction_deny_config.unwrap_or_default();
         let certificate_deny_config = self.certificate_deny_config.unwrap_or_default();
         let authority_overload_config = self.authority_overload_config.unwrap_or_default();
@@ -303,6 +304,7 @@ impl<'a> TestAuthorityBuilder<'a> {
             epoch_store,
             committee_store,
             index_store,
+            None, //TODO build RestIndexStore
             checkpoint_store,
             &registry,
             genesis.objects(),
