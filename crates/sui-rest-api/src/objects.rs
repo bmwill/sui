@@ -1,8 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::Page;
-use crate::{accept::AcceptFormat, reader::StateReader, response::ResponseContent, Result};
+use crate::{
+    accept::AcceptFormat,
+    openapi::{ApiEndpoint, RouteHandler},
+    reader::StateReader,
+    response::ResponseContent,
+    Page, RestService, Result,
+};
 use axum::extract::Query;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
@@ -11,7 +16,26 @@ use sui_types::storage::{DynamicFieldIndexInfo, DynamicFieldKey};
 use sui_types::sui_sdk2_conversions::type_tag_core_to_sdk;
 use tap::Pipe;
 
-pub const GET_OBJECT_PATH: &str = "/objects/:object_id";
+pub struct GetObject;
+
+impl ApiEndpoint<RestService> for GetObject {
+    fn method(&self) -> axum::http::Method {
+        axum::http::Method::GET
+    }
+
+    fn path(&self) -> &'static str {
+        "/objects/{object_id}"
+    }
+
+    fn register_schemas(&self, generator: &mut schemars::gen::SchemaGenerator) {
+        generator.subschema_for::<ObjectId>();
+        generator.subschema_for::<Object>();
+    }
+
+    fn handler(&self) -> crate::openapi::RouteHandler<RestService> {
+        RouteHandler::new(self.method(), get_object)
+    }
+}
 
 pub async fn get_object(
     Path(object_id): Path<ObjectId>,
@@ -29,7 +53,27 @@ pub async fn get_object(
     .pipe(Ok)
 }
 
-pub const GET_OBJECT_WITH_VERSION_PATH: &str = "/objects/:object_id/version/:version";
+pub struct GetObjectWithVersion;
+
+impl ApiEndpoint<RestService> for GetObjectWithVersion {
+    fn method(&self) -> axum::http::Method {
+        axum::http::Method::GET
+    }
+
+    fn path(&self) -> &'static str {
+        "/objects/{object_id}/version/{version}"
+    }
+
+    fn register_schemas(&self, generator: &mut schemars::gen::SchemaGenerator) {
+        generator.subschema_for::<ObjectId>();
+        generator.subschema_for::<Version>();
+        generator.subschema_for::<Object>();
+    }
+
+    fn handler(&self) -> crate::openapi::RouteHandler<RestService> {
+        RouteHandler::new(self.method(), get_object_with_version)
+    }
+}
 
 pub async fn get_object_with_version(
     Path((object_id, version)): Path<(ObjectId, Version)>,

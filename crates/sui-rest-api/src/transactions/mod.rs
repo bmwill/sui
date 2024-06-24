@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod execution;
-pub use execution::execute_transaction;
+pub use execution::ExecuteTransaction;
 pub use execution::ExecuteTransactionQueryParameters;
 pub use execution::TransactionExecutor;
-pub use execution::POST_EXECUTE_TRANSACTION_PATH;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -15,16 +14,38 @@ use sui_sdk2::types::{
 };
 use tap::Pipe;
 
+use crate::openapi::ApiEndpoint;
+use crate::openapi::RouteHandler;
 use crate::reader::StateReader;
 use crate::Direction;
 use crate::Page;
 use crate::RestError;
+use crate::RestService;
 use crate::Result;
 use crate::{accept::AcceptFormat, response::ResponseContent};
 
-pub const GET_TRANSACTION_PATH: &str = "/transactions/:transaction";
+pub struct GetTransaction;
 
-pub async fn get_transaction(
+impl ApiEndpoint<RestService> for GetTransaction {
+    fn method(&self) -> axum::http::Method {
+        axum::http::Method::GET
+    }
+
+    fn path(&self) -> &'static str {
+        "/transactions/{transaction}"
+    }
+
+    fn register_schemas(&self, generator: &mut schemars::gen::SchemaGenerator) {
+        generator.subschema_for::<SignedTransaction>();
+        generator.subschema_for::<sui_sdk2::types::Transaction>();
+    }
+
+    fn handler(&self) -> RouteHandler<RestService> {
+        RouteHandler::new(self.method(), get_transaction)
+    }
+}
+
+async fn get_transaction(
     Path(transaction_digest): Path<TransactionDigest>,
     accept: AcceptFormat,
     State(state): State<StateReader>,
@@ -64,9 +85,27 @@ impl From<TransactionNotFoundError> for crate::RestError {
     }
 }
 
-pub const LIST_TRANSACTIONS_PATH: &str = "/transactions";
+pub struct ListTransactions;
 
-pub async fn list_transactions(
+impl ApiEndpoint<RestService> for ListTransactions {
+    fn method(&self) -> axum::http::Method {
+        axum::http::Method::GET
+    }
+
+    fn path(&self) -> &'static str {
+        "/transactions"
+    }
+
+    fn register_schemas(&self, generator: &mut schemars::gen::SchemaGenerator) {
+        generator.subschema_for::<SignedTransaction>();
+    }
+
+    fn handler(&self) -> RouteHandler<RestService> {
+        RouteHandler::new(self.method(), list_transactions)
+    }
+}
+
+async fn list_transactions(
     Query(parameters): Query<ListTransactionsQueryParameters>,
     accept: AcceptFormat,
     State(state): State<StateReader>,

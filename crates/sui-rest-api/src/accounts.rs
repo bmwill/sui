@@ -1,9 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::openapi::{ApiEndpoint, RouteHandler};
 use crate::reader::StateReader;
-use crate::Page;
 use crate::{accept::AcceptFormat, response::ResponseContent, Result};
+use crate::{Page, RestService};
 use axum::extract::Query;
 use axum::extract::{Path, State};
 use itertools::Itertools;
@@ -11,9 +12,27 @@ use sui_sdk2::types::{Address, Object, ObjectId};
 use sui_types::storage::ObjectKey;
 use tap::Pipe;
 
-pub const LIST_ACCOUNT_OWNED_OBJECTS_PATH: &str = "/accounts/:account/objects";
+pub struct ListAccountObjects;
 
-pub async fn list_account_owned_objects(
+impl ApiEndpoint<RestService> for ListAccountObjects {
+    fn method(&self) -> axum::http::Method {
+        axum::http::Method::GET
+    }
+
+    fn path(&self) -> &'static str {
+        "/accounts/{account}/objects"
+    }
+
+    fn register_schemas(&self, generator: &mut schemars::gen::SchemaGenerator) {
+        generator.subschema_for::<Object>();
+    }
+
+    fn handler(&self) -> crate::openapi::RouteHandler<RestService> {
+        RouteHandler::new(self.method(), list_account_objects)
+    }
+}
+
+async fn list_account_objects(
     Path(address): Path<Address>,
     Query(parameters): Query<ListAccountOwnedObjectsQueryParameters>,
     accept: AcceptFormat,
