@@ -69,6 +69,7 @@ const ENDPOINTS: &[&dyn ApiEndpoint<RestService>] = &[
     &accounts::ListAccountObjects,
     &objects::GetObject,
     &objects::GetObjectWithVersion,
+    &objects::ListDynamicFields,
     &checkpoints::ListCheckpoints,
     &checkpoints::GetCheckpoint,
     &checkpoints::GetCheckpointFull,
@@ -81,6 +82,7 @@ const ENDPOINTS: &[&dyn ApiEndpoint<RestService>] = &[
     &system::GetProtocolConfig,
     &system::GetGasInfo,
     &transactions::ExecuteTransaction,
+    &coins::GetCoinInfo,
 ];
 
 #[derive(Clone)]
@@ -144,14 +146,6 @@ impl RestService {
         api.register_endpoints(ENDPOINTS.to_owned());
 
         api.to_router()
-            .route(
-                coins::GET_COIN_INFO_PATH,
-                axum::routing::get(coins::get_coin_info),
-            )
-            .route(
-                objects::LIST_DYNAMIC_FIELDS_PATH,
-                axum::routing::get(objects::list_dynamic_fields),
-            )
             .with_state(self.clone())
             .layer(axum::middleware::map_response_with_state(
                 self,

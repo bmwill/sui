@@ -133,9 +133,25 @@ impl From<ObjectNotFoundError> for crate::RestError {
     }
 }
 
-pub const LIST_DYNAMIC_FIELDS_PATH: &str = "/objects/:object_id/dynamic-fields";
+pub struct ListDynamicFields;
 
-pub async fn list_dynamic_fields(
+impl ApiEndpoint<RestService> for ListDynamicFields {
+    fn method(&self) -> axum::http::Method {
+        axum::http::Method::GET
+    }
+
+    fn path(&self) -> &'static str {
+        "/objects/{object_id}/dynamic-fields"
+    }
+
+    fn register_schemas(&self, _generator: &mut schemars::gen::SchemaGenerator) {}
+
+    fn handler(&self) -> crate::openapi::RouteHandler<RestService> {
+        RouteHandler::new(self.method(), list_dynamic_fields)
+    }
+}
+
+async fn list_dynamic_fields(
     Path(parent): Path<ObjectId>,
     Query(parameters): Query<ListDynamicFieldsQueryParameters>,
     accept: AcceptFormat,
