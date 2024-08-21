@@ -12,7 +12,7 @@ mod worker_pool;
 
 use anyhow::Result;
 use async_trait::async_trait;
-pub use executor::{setup_single_workflow, IndexerExecutor, MAX_CHECKPOINTS_IN_PROGRESS};
+pub use executor::{setup_single_workflow, IndexerExecutor, MAX_CHECKPOINTS_IN_PROGRESS, setup_single_workflow_with_file_progress_store};
 pub use metrics::DataIngestionMetrics;
 pub use progress_store::{FileProgressStore, ProgressStore, ShimProgressStore};
 pub use reader::ReaderOptions;

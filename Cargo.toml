@@ -79,7 +79,7 @@ members = [
     "crates/mysten-service",
     "crates/mysten-util-mem",
     "crates/mysten-util-mem-derive",
-    "crates/prometheus-closure-metric",
+    "crates/prometheus-closure-metric", "crates/scan-experiment",
     "crates/shared-crypto",
     "crates/simulacrum",
     "crates/sui",
@@ -576,7 +576,7 @@ anemo-cli = { git = "https://github.com/mystenlabs/anemo.git", rev = "dbb5a074c2
 anemo-tower = { git = "https://github.com/mystenlabs/anemo.git", rev = "dbb5a074c2d25660525ab5d36d65ff0cb8051949" }
 
 # core-types with json format for REST api
-sui-sdk2 = { package = "sui-sdk", git = "https://github.com/mystenlabs/sui-rust-sdk.git", rev = "bd233b6879b917fb95e17f21927c198e7a60c924", features = ["hash", "serde", "schemars"] }
+sui-sdk2 = { package = "sui-sdk", git = "https://github.com/mystenlabs/sui-rust-sdk.git", rev = "59ba52a27de449ccf9c67ec01b32bce17f10c183", features = ["hash", "serde", "schemars"] }
 
 ### Workspace Members ###
 anemo-benchmark = { path = "crates/anemo-benchmark" }

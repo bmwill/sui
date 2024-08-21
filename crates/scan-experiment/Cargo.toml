@@ -1,0 +1,16 @@
+[package]
+name = "scan-experiment"
+edition = "2021"
+version.workspace = true
+
+[dependencies]
+telemetry-subscribers.workspace = true
+clap.workspace = true
+bcs.workspace = true
+sui-sdk2.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+sui-types.workspace = true
+sui-data-ingestion-core.workspace = true

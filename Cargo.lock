@@ -11365,6 +11365,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "scan-experiment"
+version = "1.32.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bcs",
+ "clap",
+ "sui-data-ingestion-core",
+ "sui-sdk 0.0.0",
+ "sui-types",
+ "telemetry-subscribers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14457,7 +14473,7 @@ dependencies = [
 [[package]]
 name = "sui-sdk"
 version = "0.0.0"
-source = "git+https://github.com/mystenlabs/sui-rust-sdk.git?rev=bd233b6879b917fb95e17f21927c198e7a60c924#bd233b6879b917fb95e17f21927c198e7a60c924"
+source = "git+https://github.com/mystenlabs/sui-rust-sdk.git?rev=59ba52a27de449ccf9c67ec01b32bce17f10c183#59ba52a27de449ccf9c67ec01b32bce17f10c183"
 dependencies = [
  "base64ct",
  "bcs",

@@ -6,7 +6,7 @@ use crate::progress_store::{
 };
 use crate::reader::CheckpointReader;
 use crate::worker_pool::WorkerPool;
-use crate::Worker;
+use crate::{Worker, FileProgressStore};
 use crate::{DataIngestionMetrics, ReaderOptions};
 use anyhow::Result;
 use futures::Future;
@@ -118,6 +118,35 @@ pub async fn setup_single_workflow<W: Worker + 'static>(
     let progress_store = ShimProgressStore(initial_checkpoint_number);
     let mut executor = IndexerExecutor::new(progress_store, 1, metrics);
     let worker_pool = WorkerPool::new(worker, "workflow".to_string(), concurrency);
+    executor.register(worker_pool).await?;
+    Ok((
+        executor.run(
+            tempfile::tempdir()?.into_path(),
+            Some(remote_store_url),
+            vec![],
+            reader_options.unwrap_or_default(),
+            exit_receiver,
+        ),
+        exit_sender,
+    ))
+}
+
+pub async fn setup_single_workflow_with_file_progress_store<W: Worker + 'static>(
+    worker: W,
+    workflow_name: String,
+    remote_store_url: String,
+    file_progress_store: String,
+    concurrency: usize,
+    reader_options: Option<ReaderOptions>,
+) -> Result<(
+    impl Future<Output = Result<ExecutorProgress>>,
+    oneshot::Sender<()>,
+)> {
+    let (exit_sender, exit_receiver) = oneshot::channel();
+    let metrics = DataIngestionMetrics::new(&Registry::new());
+    let progress_store = FileProgressStore::new(file_progress_store.into());
+    let mut executor = IndexerExecutor::new(progress_store, 1, metrics);
+    let worker_pool = WorkerPool::new(worker, workflow_name, concurrency);
     executor.register(worker_pool).await?;
     Ok((
         executor.run(
