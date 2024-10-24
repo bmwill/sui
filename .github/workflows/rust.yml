@@ -120,6 +120,7 @@ jobs:
         with:
           ref: ${{ github.event.inputs.sui_repo_ref || github.ref }}
       - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@protoc
       - name: Add postgres to PATH
         run: echo "/usr/lib/postgresql/14/bin" >> $GITHUB_PATH
       - name: Set Swap Space
@@ -153,6 +154,7 @@ jobs:
         with:
           ref: ${{ github.event.inputs.sui_repo_ref || github.ref }}
       - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@protoc
       - name: Add postgres to PATH
         run: echo "/usr/lib/postgresql/14/bin" >> $GITHUB_PATH
       - name: Set Swap Space
@@ -240,6 +242,7 @@ jobs:
         with:
           ref: ${{ github.event.inputs.sui_repo_ref || github.ref }}
       - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@protoc
       - name: Add postgres to PATH
         run: echo "/usr/lib/postgresql/14/bin" >> $GITHUB_PATH
       - name: Set Swap Space
