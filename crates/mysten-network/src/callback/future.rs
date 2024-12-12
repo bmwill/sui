@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::ResponseBody;
+use super::CallbackBody;
 use super::ResponseHandler;
 use http::Response;
 use pin_project_lite::pin_project;
@@ -29,7 +29,7 @@ where
     E: std::fmt::Display + 'static,
     ResponseHandlerT: ResponseHandler,
 {
-    type Output = Result<Response<ResponseBody<B, ResponseHandlerT>>, E>;
+    type Output = Result<Response<CallbackBody<B, ResponseHandlerT>>, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
@@ -42,7 +42,7 @@ where
                 handler.on_response(&head);
                 Ok(Response::from_parts(
                     head,
-                    ResponseBody {
+                    CallbackBody {
                         inner: body,
                         handler,
                     },

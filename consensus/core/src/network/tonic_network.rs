@@ -434,6 +434,9 @@ impl ChannelPool {
                     .make_span_with(DefaultMakeSpan::new().level(tracing::Level::TRACE))
                     .on_failure(DefaultOnFailure::new().level(tracing::Level::DEBUG)),
             )
+            .layer(tower_http::map_request_body::MapRequestBody::layer(
+                tonic::body::boxed,
+            ))
             .service(channel);
 
         let mut channels = self.channels.write();

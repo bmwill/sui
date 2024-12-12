@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{CallbackLayer, MakeCallbackHandler, ResponseBody, ResponseFuture};
+use super::{CallbackLayer, MakeCallbackHandler, CallbackBody, ResponseFuture};
 use http::{Request, Response};
 use std::task::{Context, Poll};
 use tower::Service;
@@ -55,7 +55,7 @@ impl<S, M> Callback<S, M> {
 impl<S, M, RequestBody, ResponseBodyT> Service<Request<RequestBody>> for Callback<S, M>
 where
     S: Service<
-        Request<RequestBody>,
+        Request<CallbackBody<RequestBody, ()>>,
         Response = Response<ResponseBodyT>,
         Error: std::fmt::Display + 'static,
     >,
@@ -63,7 +63,7 @@ where
     RequestBody: http_body::Body<Error: std::fmt::Display + 'static>,
     ResponseBodyT: http_body::Body<Error: std::fmt::Display + 'static>,
 {
-    type Response = Response<ResponseBody<ResponseBodyT, M::Handler>>;
+    type Response = Response<CallbackBody<ResponseBodyT, M::Handler>>;
     type Error = S::Error;
     type Future = ResponseFuture<S::Future, M::Handler>;
 
@@ -74,6 +74,10 @@ where
     fn call(&mut self, request: Request<RequestBody>) -> Self::Future {
         let (head, body) = request.into_parts();
         let handler = self.make_callback_handler.make_handler(&head);
+        let body = CallbackBody {
+            inner: body,
+            handler: (),
+        };
         let request = Request::from_parts(head, body);
 
         ResponseFuture {

@@ -9,7 +9,8 @@ mod layer;
 mod service;
 
 pub use self::{
-    body::ResponseBody, future::ResponseFuture, layer::CallbackLayer, service::Callback,
+    body::CallbackBody, body::ResponseBody, future::ResponseFuture, layer::CallbackLayer,
+    service::Callback,
 };
 
 pub trait MakeCallbackHandler {
@@ -34,4 +35,52 @@ pub trait ResponseHandler {
     fn on_end_of_stream(&mut self, _trailers: Option<&HeaderMap>) {
         // do nothing
     }
+}
+
+pub trait BodyHandler {
+    fn on_error<E>(&mut self, error: &E)
+    where
+        E: std::fmt::Display + 'static;
+
+    fn on_body_chunk<B>(&mut self, _chunk: &B)
+    where
+        B: bytes::Buf;
+
+    fn on_end_of_stream(&mut self, _trailers: Option<&HeaderMap>);
+}
+
+impl<T: ResponseHandler> BodyHandler for T {
+    fn on_error<E>(&mut self, error: &E)
+    where
+        E: std::fmt::Display + 'static,
+    {
+        ResponseHandler::on_error(self, error)
+    }
+
+    fn on_body_chunk<B>(&mut self, chunk: &B)
+    where
+        B: bytes::Buf,
+    {
+        ResponseHandler::on_body_chunk(self, chunk)
+    }
+
+    fn on_end_of_stream(&mut self, trailers: Option<&HeaderMap>) {
+        ResponseHandler::on_end_of_stream(self, trailers)
+    }
+}
+
+impl BodyHandler for () {
+    fn on_error<E>(&mut self, _error: &E)
+    where
+        E: std::fmt::Display + 'static,
+    {
+    }
+
+    fn on_body_chunk<B>(&mut self, _chunk: &B)
+    where
+        B: bytes::Buf,
+    {
+    }
+
+    fn on_end_of_stream(&mut self, _trailers: Option<&HeaderMap>) {}
 }
