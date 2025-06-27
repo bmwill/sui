@@ -925,6 +925,16 @@ impl RpcIndexStore {
                     // speedup when indexing
                     let mut options = typed_store::rocksdb::Options::default();
                     options.set_unordered_write(true);
+                    options.set_disable_auto_compactions(true);
+
+                    options.set_max_background_jobs(16);
+                    options.set_allow_concurrent_memtable_write(true);
+
+                    // Write buffer and compaction triggers
+                    options.set_write_buffer_size(512 * 1024 * 1024); // 512MB
+                    options.set_min_write_buffer_number_to_merge(1);
+                    options.set_max_write_buffer_number(8);
+
                     IndexStoreTables::open_with_options(&path, options)
                 };
 
@@ -1290,9 +1300,9 @@ impl LiveObjectIndexer for RpcLiveObjectIndexer<'_> {
                 .insert_batch(&self.tables.package_version, [(key, info)])?;
         }
 
-        // If the batch size grows to greater that 128MB then write out to the DB so that the
+        // If the batch size grows to greater that 1MB then write out to the DB so that the
         // data we need to hold in memory doesn't grown unbounded.
-        if self.batch.size_in_bytes() >= 1 << 27 {
+        if self.batch.size_in_bytes() >= 1 << 20 {
             std::mem::replace(&mut self.batch, self.tables.owner.batch()).write()?;
         }
 
