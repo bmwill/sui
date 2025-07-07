@@ -5,3 +5,4 @@ mod balance;
 mod get_coin_info;
 mod list_owned_objects;
 mod resolve;
+mod staking_rewards;
