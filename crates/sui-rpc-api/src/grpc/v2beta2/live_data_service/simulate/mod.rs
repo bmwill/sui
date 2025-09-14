@@ -15,13 +15,12 @@ use sui_rpc::proto::sui::rpc::v2beta2::Bcs;
 use sui_rpc::proto::sui::rpc::v2beta2::CommandOutput;
 use sui_rpc::proto::sui::rpc::v2beta2::CommandResult;
 use sui_rpc::proto::sui::rpc::v2beta2::ExecutedTransaction;
-use sui_rpc::proto::sui::rpc::v2beta2::Object;
 use sui_rpc::proto::sui::rpc::v2beta2::SimulateTransactionRequest;
 use sui_rpc::proto::sui::rpc::v2beta2::SimulateTransactionResponse;
 use sui_rpc::proto::sui::rpc::v2beta2::Transaction;
 use sui_rpc::proto::sui::rpc::v2beta2::TransactionEffects;
 use sui_rpc::proto::sui::rpc::v2beta2::TransactionEvents;
-use sui_types::balance_change::derive_balance_changes;
+use sui_types::balance_change::derive_balance_changes_2;
 use sui_types::base_types::ObjectID;
 use sui_types::base_types::ObjectRef;
 use sui_types::base_types::SuiAddress;
@@ -160,12 +159,12 @@ pub fn simulate_transaction(
     }
 
     let SimulateTransactionResult {
-        input_objects,
-        output_objects,
+        objects,
         events,
         effects,
         execution_result,
         mock_gas_id: _,
+        ..
     } = executor
         .simulate_transaction(transaction.clone(), checks)
         .map_err(anyhow::Error::from)?;
@@ -174,13 +173,10 @@ pub fn simulate_transaction(
         let mut message = ExecutedTransaction::default();
         let transaction = sui_sdk_types::Transaction::try_from(transaction)?;
 
-        let input_objects = input_objects.into_values().collect::<Vec<_>>();
-        let output_objects = output_objects.into_values().collect::<Vec<_>>();
-
         message.balance_changes = read_mask
             .contains(ExecutedTransaction::BALANCE_CHANGES_FIELD.name)
             .then(|| {
-                derive_balance_changes(&effects, &input_objects, &output_objects)
+                derive_balance_changes_2(&effects, &objects)
                     .into_iter()
                     .map(Into::into)
                     .collect()
@@ -201,11 +197,7 @@ pub fn simulate_transaction(
                                 continue;
                             };
 
-                            if let Some(object) = input_objects
-                                .iter()
-                                .chain(&output_objects)
-                                .find(|o| o.id() == object_id)
-                            {
+                            if let Some(object) = objects.iter().find(|o| o.id() == object_id) {
                                 changed_object.object_type = Some(match object.struct_tag() {
                                     Some(struct_tag) => struct_tag.to_canonical_string(true),
                                     None => "package".to_owned(),
@@ -224,8 +216,7 @@ pub fn simulate_transaction(
                                 continue;
                             };
 
-                            if let Some(object) = input_objects.iter().find(|o| o.id() == object_id)
-                            {
+                            if let Some(object) = objects.iter().find(|o| o.id() == object_id) {
                                 unchanged_consensus_object.object_type =
                                     Some(match object.struct_tag() {
                                         Some(struct_tag) => struct_tag.to_canonical_string(true),
@@ -255,26 +246,6 @@ pub fn simulate_transaction(
         message.transaction = submask
             .subtree(ExecutedTransaction::TRANSACTION_FIELD.name)
             .map(|mask| Transaction::merge_from(transaction, &mask));
-
-        message.input_objects = submask
-            .subtree(ExecutedTransaction::INPUT_OBJECTS_FIELD)
-            .map(|mask| {
-                input_objects
-                    .into_iter()
-                    .map(|o| Object::merge_from(o, &mask))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        message.output_objects = submask
-            .subtree(ExecutedTransaction::OUTPUT_OBJECTS_FIELD)
-            .map(|mask| {
-                output_objects
-                    .into_iter()
-                    .map(|o| Object::merge_from(o, &mask))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         Some(message)
     } else {
