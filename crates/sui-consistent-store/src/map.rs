@@ -160,6 +160,18 @@ impl<K, V> DbMap<K, V> {
             .cf_handle(&self.cf_name)
             .ok_or_else(|| Error::MissingColumnFamily(self.cf_name.clone()))
     }
+
+    /// The shared `Arc<Db>` this handle is bound to. Used by
+    /// `Batch` to look up the same column family the handle points
+    /// at.
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
+    /// The name of the column family this handle is bound to.
+    pub(crate) fn cf_name(&self) -> &str {
+        &self.cf_name
+    }
 }
 
 impl<K, V> DbMap<K, V>
