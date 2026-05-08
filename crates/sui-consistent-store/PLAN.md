@@ -24,8 +24,11 @@ file will be removed.
 - Forward, reverse, and prefix iteration over typed column families.
 - Zero-copy reads where possible, exposed through `bytes::Bytes` so that
   callers do not have to manage RocksDB lifetimes themselves.
-- Optional, opt-in filesystem-level checkpoints for backup and offline
-  use.
+- *(Future)* Optional, opt-in filesystem-level checkpoints for
+  backup and offline use; not implemented in v1 because the
+  existing `sui-indexer-alt-consistent-store` does not use them
+  either, and a real consumer can drive the design when it
+  surfaces.
 - A plain, hand-written schema model — schemas are ordinary Rust structs
   of typed `DbMap<K, V>` fields.
 - Dependency hygiene: only crates.io dependencies in this core crate; no
@@ -129,11 +132,16 @@ trade-offs:
   (`ouroboros::self_referencing`) so that the snapshot's `'_` lifetime
   can be tied to the same allocation.
 
-A separate `Db::create_checkpoint(path)` method exposes RocksDB's
-filesystem-level checkpoint mechanism. It is intended for backups and
-offline secondary databases. Filesystem checkpoints are durable and
-openable as standalone RocksDB instances; the in-memory snapshot
-mechanism is the primary tool for low-latency consistent reads.
+RocksDB also exposes a filesystem-level checkpoint mechanism via
+`rocksdb::checkpoint::Checkpoint`, which produces a hard-linked copy
+of the live SSTs that can be opened as a standalone read-only or
+secondary database. We considered exposing this as
+`Db::create_checkpoint(path)` but skipped it for v1: the existing
+`sui-indexer-alt-consistent-store` does not use it, and adding it
+without a real consumer would freeze a design (path layout,
+manifest handling, error semantics) we can shape better with one in
+hand. The crate stays focused on in-memory snapshots until a
+filesystem-checkpoint use case surfaces.
 
 ### 5. Crate split
 
@@ -307,14 +315,11 @@ crate.
 7. **In-memory snapshots.** The snapshot buffer, `take_snapshot`,
    `at_snapshot`, `snapshots_range`, and snapshot-bound reads and
    iterators.
-8. **Merge operators.** Typed `Batch::merge` and the supporting
-   plumbing on `DbMap`. Schema authors install merge operators via
-   the per-CF `rocksdb::Options` they return from
-   [`Schema::cfs`](crate::Schema::cfs) (already supported); this
-   commit closes the loop by exposing a typed entry point that
+8. **Merge operators.** Typed `Batch::merge`. Schema authors install
+   merge operators via the per-CF `rocksdb::Options` they return
+   from [`Schema::cfs`](crate::Schema::cfs) (already supported);
+   this commit closes the loop by exposing a typed entry point that
    actually triggers the operator.
-9. **Filesystem checkpoint.** `Db::create_checkpoint(path)` plus a
-   round-trip test.
 
 Within each step we will add module-level documentation and rustdoc
 with at least one worked example for every public-facing API.
