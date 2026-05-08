@@ -44,6 +44,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use rocksdb::DBPinnableSlice;
+use rocksdb::ReadOptions;
 
 use crate::Decode;
 use crate::Encode;
@@ -51,6 +52,9 @@ use crate::db::Db;
 use crate::encode_buf::with_encode_buf;
 use crate::error::Error;
 use crate::error::OpenError;
+use crate::iter::Iter;
+use crate::iter::RevIter;
+use crate::iter::next_prefix;
 
 /// A typed handle to a single column family on a [`Db`].
 ///
@@ -311,6 +315,80 @@ where
     }
 }
 
+impl<K, V> DbMap<K, V>
+where
+    K: Decode,
+    V: Decode,
+{
+    /// Iterate forward over all entries in the column family in
+    /// lexicographic key order.
+    ///
+    /// Decode failures are reported as a per-item `Err`; the
+    /// iterator stops yielding after the first error.
+    pub fn iter(&self) -> Result<Iter<'_, K, V>, Error> {
+        let cf = self.cf()?;
+        let mut raw = self
+            .db
+            .rocksdb()
+            .raw_iterator_cf_opt(&cf, ReadOptions::default());
+        raw.seek_to_first();
+        Ok(Iter::new(raw))
+    }
+
+    /// Iterate forward over the subset of entries whose keys, when
+    /// encoded, begin with `prefix`'s encoding.
+    ///
+    /// The prefix may be a different type than the full key, so long
+    /// as the schema's encoding choice makes the prefix's encoded
+    /// bytes a real byte prefix of every full-key encoding it should
+    /// match. The crate documents this contract but does not verify
+    /// it; see the [module-level docs](crate::iter) for an
+    /// explanation and a worked example.
+    pub fn iter_prefix(&self, prefix: &impl Encode) -> Result<Iter<'_, K, V>, Error> {
+        let cf = self.cf()?;
+        let prefix_bytes = prefix.encode()?;
+
+        let mut read_opts = ReadOptions::default();
+        if let Some(upper) = next_prefix(&prefix_bytes) {
+            read_opts.set_iterate_upper_bound(upper);
+        }
+        read_opts.set_iterate_lower_bound(prefix_bytes);
+
+        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, read_opts);
+        raw.seek_to_first();
+        Ok(Iter::new(raw))
+    }
+
+    /// Iterate in reverse lexicographic key order over all entries
+    /// in the column family.
+    pub fn iter_rev(&self) -> Result<RevIter<'_, K, V>, Error> {
+        let cf = self.cf()?;
+        let mut raw = self
+            .db
+            .rocksdb()
+            .raw_iterator_cf_opt(&cf, ReadOptions::default());
+        raw.seek_to_last();
+        Ok(RevIter::new(raw))
+    }
+
+    /// Iterate in reverse over the subset of entries whose keys,
+    /// when encoded, begin with `prefix`'s encoding.
+    pub fn iter_rev_prefix(&self, prefix: &impl Encode) -> Result<RevIter<'_, K, V>, Error> {
+        let cf = self.cf()?;
+        let prefix_bytes = prefix.encode()?;
+
+        let mut read_opts = ReadOptions::default();
+        if let Some(upper) = next_prefix(&prefix_bytes) {
+            read_opts.set_iterate_upper_bound(upper);
+        }
+        read_opts.set_iterate_lower_bound(prefix_bytes);
+
+        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, read_opts);
+        raw.seek_to_last();
+        Ok(RevIter::new(raw))
+    }
+}
+
 impl AsRef<[u8]> for PinnedOwner {
     fn as_ref(&self) -> &[u8] {
         &self.slice
@@ -484,5 +562,223 @@ mod tests {
         let keys: [U64Be; 0] = [];
         let results = schema.items.multi_get(keys.iter()).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn iter_yields_all_entries_in_order() {
+        let (_dir, db, schema) = open();
+        seed(&db, "items", &U64Be(3), &U64Be(30));
+        seed(&db, "items", &U64Be(1), &U64Be(10));
+        seed(&db, "items", &U64Be(2), &U64Be(20));
+        let collected: Vec<_> = schema.items.iter().unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            collected,
+            vec![
+                (U64Be(1), U64Be(10)),
+                (U64Be(2), U64Be(20)),
+                (U64Be(3), U64Be(30)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_on_empty_cf_yields_nothing() {
+        let (_dir, _db, schema) = open();
+        assert_eq!(schema.items.iter().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn iter_rev_yields_entries_in_reverse() {
+        let (_dir, db, schema) = open();
+        seed(&db, "items", &U64Be(1), &U64Be(10));
+        seed(&db, "items", &U64Be(2), &U64Be(20));
+        seed(&db, "items", &U64Be(3), &U64Be(30));
+        let collected: Vec<_> = schema
+            .items
+            .iter_rev()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            collected,
+            vec![
+                (U64Be(3), U64Be(30)),
+                (U64Be(2), U64Be(20)),
+                (U64Be(1), U64Be(10)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_rev_on_empty_cf_yields_nothing() {
+        let (_dir, _db, schema) = open();
+        assert_eq!(schema.items.iter_rev().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn iter_propagates_decode_errors_then_stops() {
+        let (_dir, db, schema) = open();
+        // Seed valid rows.
+        seed(&db, "items", &U64Be(1), &U64Be(10));
+        seed(&db, "items", &U64Be(2), &U64Be(20));
+        // Insert a corrupt row directly under a key that sorts in
+        // the middle: an 8-byte key that decodes fine, paired with a
+        // 4-byte value that does not.
+        let cf = db.cf_handle("items").unwrap();
+        let key_bytes = U64Be(3).encode().unwrap();
+        db.rocksdb().put_cf(&cf, key_bytes, [0u8; 4]).unwrap();
+        seed(&db, "items", &U64Be(4), &U64Be(40));
+
+        let mut iter = schema.items.iter().unwrap();
+        assert_eq!(iter.next().unwrap().unwrap(), (U64Be(1), U64Be(10)));
+        assert_eq!(iter.next().unwrap().unwrap(), (U64Be(2), U64Be(20)));
+        assert!(matches!(iter.next(), Some(Err(Error::Decode(_)))));
+        // Iterator must not yield further items after an error.
+        assert!(iter.next().is_none());
+    }
+
+    /// Compound key `(byte, u32 BE)` for prefix-iteration tests.
+    /// Used to demonstrate prefix iteration with a prefix type
+    /// distinct from the full key type.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
+    struct ByteAndU32(u8, u32);
+
+    impl Encode for ByteAndU32 {
+        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+            buf.push(self.0);
+            buf.extend_from_slice(&self.1.to_be_bytes());
+            Ok(())
+        }
+    }
+
+    impl Decode for ByteAndU32 {
+        fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+            if bytes.len() != 5 {
+                return Err(DecodeError::msg(format!(
+                    "expected 5 bytes for ByteAndU32, got {}",
+                    bytes.len(),
+                )));
+            }
+            let arr: [u8; 4] = bytes[1..].try_into().unwrap();
+            Ok(Self(bytes[0], u32::from_be_bytes(arr)))
+        }
+    }
+
+    /// Single-byte prefix used to filter `ByteAndU32` keys by their
+    /// first component.
+    #[derive(Debug, Clone, Copy)]
+    struct BytePrefix(u8);
+
+    impl Encode for BytePrefix {
+        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+            buf.push(self.0);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CompoundSchema {
+        rows: DbMap<ByteAndU32, U64Be>,
+    }
+
+    impl Schema for CompoundSchema {
+        fn cfs() -> Vec<(String, rocksdb::Options)> {
+            vec![(String::from("rows"), rocksdb::Options::default())]
+        }
+
+        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            Ok(Self {
+                rows: DbMap::new(db.clone(), "rows")?,
+            })
+        }
+    }
+
+    fn open_compound() -> (TempDir, Arc<Db>, CompoundSchema) {
+        let dir = TempDir::new().unwrap();
+        let (db, schema) = Db::open::<CompoundSchema>(dir.path(), DbOptions::default()).unwrap();
+        (dir, db, schema)
+    }
+
+    fn seed_compound(db: &Db, key: &ByteAndU32, value: &U64Be) {
+        let cf = db.cf_handle("rows").unwrap();
+        let k_bytes = key.encode().unwrap();
+        let v_bytes = value.encode().unwrap();
+        db.rocksdb().put_cf(&cf, k_bytes, v_bytes).unwrap();
+    }
+
+    #[test]
+    fn iter_prefix_with_distinct_prefix_type_filters_correctly() {
+        let (_dir, db, schema) = open_compound();
+        // Seed across three first-byte buckets.
+        for first in [1u8, 2, 3] {
+            for second in 0u32..3 {
+                seed_compound(&db, &ByteAndU32(first, second), &U64Be(0));
+            }
+        }
+        let collected: Vec<_> = schema
+            .rows
+            .iter_prefix(&BytePrefix(2))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(
+            collected,
+            vec![ByteAndU32(2, 0), ByteAndU32(2, 1), ByteAndU32(2, 2),],
+        );
+    }
+
+    #[test]
+    fn iter_rev_prefix_yields_matches_in_reverse() {
+        let (_dir, db, schema) = open_compound();
+        for second in 0u32..3 {
+            seed_compound(&db, &ByteAndU32(7, second), &U64Be(0));
+        }
+        // A neighbor bucket so we know the prefix bound holds.
+        seed_compound(&db, &ByteAndU32(8, 0), &U64Be(0));
+        let collected: Vec<_> = schema
+            .rows
+            .iter_rev_prefix(&BytePrefix(7))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(
+            collected,
+            vec![ByteAndU32(7, 2), ByteAndU32(7, 1), ByteAndU32(7, 0),],
+        );
+    }
+
+    #[test]
+    fn iter_prefix_yields_nothing_when_no_matches() {
+        let (_dir, db, schema) = open_compound();
+        seed_compound(&db, &ByteAndU32(1, 0), &U64Be(0));
+        seed_compound(&db, &ByteAndU32(3, 0), &U64Be(0));
+        let count = schema.rows.iter_prefix(&BytePrefix(2)).unwrap().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn iter_prefix_with_max_byte_prefix_iterates_to_end() {
+        let (_dir, db, schema) = open_compound();
+        // Seed entries with first byte = 0xFF so the prefix has no
+        // exclusive upper bound (no byte greater than 0xFF).
+        for second in 0u32..3 {
+            seed_compound(&db, &ByteAndU32(0xFF, second), &U64Be(0));
+        }
+        // Plus a non-matching entry to confirm the lower bound works.
+        seed_compound(&db, &ByteAndU32(0xFE, 0), &U64Be(0));
+        let collected: Vec<_> = schema
+            .rows
+            .iter_prefix(&BytePrefix(0xFF))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(
+            collected,
+            vec![
+                ByteAndU32(0xFF, 0),
+                ByteAndU32(0xFF, 1),
+                ByteAndU32(0xFF, 2),
+            ],
+        );
     }
 }
