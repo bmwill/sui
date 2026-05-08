@@ -101,6 +101,7 @@
 //! ```
 
 use std::fmt;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -113,6 +114,8 @@ use crate::db::SnapshotEntry;
 use crate::error::Error;
 use crate::iter::Iter;
 use crate::iter::RevIter;
+use crate::iter::prefix_to_byte_bounds;
+use crate::iter::range_to_byte_bounds;
 use crate::map::DbMap;
 
 /// A cheap-to-clone handle to a single snapshot of the database.
@@ -194,18 +197,23 @@ impl SnapshotHandle {
         map.multi_get_raw_with_opts(keys, &self.read_options())
     }
 
-    /// Forward iteration against this snapshot.
+    /// Forward iteration against this snapshot, bounded by `range`.
     ///
     /// The returned iterator borrows from `self`, so the snapshot
     /// handle must outlive the iterator. Cloning the handle before
     /// iterating gives a separately-owned alias if the caller needs
     /// to keep handles around for later use.
-    pub fn iter<'s, K, V>(&'s self, map: &'s DbMap<K, V>) -> Result<Iter<'s, K, V>, Error>
+    pub fn iter<'s, K, V>(
+        &'s self,
+        map: &'s DbMap<K, V>,
+        range: impl RangeBounds<K>,
+    ) -> Result<Iter<'s, K, V>, Error>
     where
-        K: Decode,
+        K: Encode + Decode,
         V: Decode,
     {
-        map.iter_with_opts(self.read_options())
+        let (lower, upper) = range_to_byte_bounds(&range)?;
+        map.iter_forward(lower, upper, self.read_options())
     }
 
     /// Forward iteration against this snapshot, restricted to keys
@@ -217,19 +225,25 @@ impl SnapshotHandle {
         prefix: &impl Encode,
     ) -> Result<Iter<'s, K, V>, Error>
     where
-        K: Decode,
+        K: Encode + Decode,
         V: Decode,
     {
-        map.iter_prefix_with_opts(prefix, self.read_options())
+        let (lower, upper) = prefix_to_byte_bounds(prefix)?;
+        map.iter_forward(lower, upper, self.read_options())
     }
 
-    /// Reverse iteration against this snapshot.
-    pub fn iter_rev<'s, K, V>(&'s self, map: &'s DbMap<K, V>) -> Result<RevIter<'s, K, V>, Error>
+    /// Reverse iteration against this snapshot, bounded by `range`.
+    pub fn iter_rev<'s, K, V>(
+        &'s self,
+        map: &'s DbMap<K, V>,
+        range: impl RangeBounds<K>,
+    ) -> Result<RevIter<'s, K, V>, Error>
     where
-        K: Decode,
+        K: Encode + Decode,
         V: Decode,
     {
-        map.iter_rev_with_opts(self.read_options())
+        let (lower, upper) = range_to_byte_bounds(&range)?;
+        map.iter_reverse(lower, upper, self.read_options())
     }
 
     /// Reverse iteration against this snapshot, restricted to keys
@@ -240,10 +254,11 @@ impl SnapshotHandle {
         prefix: &impl Encode,
     ) -> Result<RevIter<'s, K, V>, Error>
     where
-        K: Decode,
+        K: Encode + Decode,
         V: Decode,
     {
-        map.iter_rev_prefix_with_opts(prefix, self.read_options())
+        let (lower, upper) = prefix_to_byte_bounds(prefix)?;
+        map.iter_reverse(lower, upper, self.read_options())
     }
 }
 
@@ -493,7 +508,7 @@ mod tests {
 
         let snap = db.at_snapshot(1).unwrap();
         let collected: Vec<_> = snap
-            .iter(&schema.items)
+            .iter(&schema.items, ..)
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -512,7 +527,7 @@ mod tests {
 
         let snap = db.at_snapshot(1).unwrap();
         let collected: Vec<_> = snap
-            .iter_rev(&schema.items)
+            .iter_rev(&schema.items, ..)
             .unwrap()
             .map(Result::unwrap)
             .collect();
