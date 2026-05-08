@@ -20,6 +20,7 @@ pub mod iter;
 pub mod map;
 pub mod schema;
 pub mod snapshot;
+pub mod snapshot_view;
 
 pub use crate::batch::Batch;
 pub use crate::db::Db;
@@ -32,3 +33,4 @@ pub use crate::iter::RevIter;
 pub use crate::map::DbMap;
 pub use crate::schema::Schema;
 pub use crate::snapshot::SnapshotHandle;
+pub use crate::snapshot_view::SnapshotView;
