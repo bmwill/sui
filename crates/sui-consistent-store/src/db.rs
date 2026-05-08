@@ -8,22 +8,29 @@
 //! the database's lifetime, with the Drop on the last clone
 //! triggering RocksDB's own shutdown sequence (flush plus close).
 //!
-//! RocksDB is internally thread-safe, so [`Db`] does not impose any
-//! external locking in this version of the crate. The in-memory
-//! snapshot buffer (which will require an [`std::sync::RwLock`] over
-//! the buffer state and a self-referential wrapping for the snapshot
-//! lifetimes) lands in a later commit; the public API will not change
-//! when it does.
+//! `Db` also holds the in-memory snapshot buffer used to serve
+//! consistent reads at a given checkpoint. See [`take_snapshot`],
+//! [`at_snapshot`], and [`SnapshotHandle`](crate::SnapshotHandle).
+//!
+//! RocksDB is internally thread-safe; the only external locking the
+//! crate adds is a [`parking_lot::RwLock`] over the snapshot buffer.
+//!
+//! [`take_snapshot`]: Db::take_snapshot
+//! [`at_snapshot`]: Db::at_snapshot
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use rocksdb::BoundColumnFamily;
 
 use crate::batch::Batch;
 use crate::error::OpenError;
 use crate::schema::Schema;
+use crate::snapshot::SnapshotHandle;
 
 /// Configuration for opening a [`Db`].
 ///
@@ -44,6 +51,14 @@ use crate::schema::Schema;
 pub struct DbOptions {
     /// Underlying RocksDB options applied to the database itself.
     pub db_options: rocksdb::Options,
+
+    /// Maximum number of in-memory snapshots retained on the database
+    /// at any one time. When [`Db::take_snapshot`] is called and the
+    /// buffer is at capacity, the snapshot with the lowest checkpoint
+    /// number is evicted. Set high enough to retain the consistency
+    /// window the application requires; long-lived snapshots pressure
+    /// RocksDB compaction, so this is not free.
+    pub snapshot_capacity: usize,
 }
 
 /// An opened RocksDB database.
@@ -80,7 +95,35 @@ pub struct DbOptions {
 /// let (_db, _schema) = Db::open::<MySchema>(dir.path(), DbOptions::default()).unwrap();
 /// ```
 pub struct Db {
+    /// Snapshots are declared *before* `inner` so that, on `Db` drop,
+    /// every retained snapshot drops (and releases its borrow on
+    /// `inner`) before `inner` itself is freed.
+    snapshots: RwLock<BTreeMap<u64, Arc<SnapshotEntry>>>,
+    snapshot_capacity: usize,
     inner: rocksdb::DB,
+}
+
+/// Storage for a single snapshot. The contained [`rocksdb::Snapshot`]
+/// borrows from [`Db::inner`]; the borrow's lifetime is extended to
+/// `'static` via [`std::mem::transmute`] inside
+/// [`Db::take_snapshot`] so the snapshot can be stored in a long-lived
+/// map. Two invariants make this sound:
+///
+/// 1. `Db::inner` is declared after `Db::snapshots`, so `inner` is
+///    dropped only after every retained snapshot has dropped (and
+///    released its borrow).
+/// 2. Outstanding [`SnapshotHandle`]s co-own the same [`Arc<Db>`],
+///    so `Db` cannot drop while a handle exists. Field ordering
+///    inside `SnapshotHandle` ensures the `Arc<SnapshotEntry>` drops
+///    before the `Arc<Db>`.
+pub(crate) struct SnapshotEntry {
+    snapshot: rocksdb::Snapshot<'static>,
+}
+
+impl SnapshotEntry {
+    pub(crate) fn as_snapshot(&self) -> &rocksdb::Snapshot<'static> {
+        &self.snapshot
+    }
 }
 
 impl Default for DbOptions {
@@ -88,7 +131,10 @@ impl Default for DbOptions {
         let mut db_options = rocksdb::Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
-        Self { db_options }
+        Self {
+            db_options,
+            snapshot_capacity: 32,
+        }
     }
 }
 
@@ -124,7 +170,10 @@ impl Db {
         path: impl AsRef<Path>,
         opts: DbOptions,
     ) -> Result<(Arc<Self>, S), OpenError> {
-        let DbOptions { db_options } = opts;
+        let DbOptions {
+            db_options,
+            snapshot_capacity,
+        } = opts;
 
         let mut cfs = S::cfs();
         // RocksDB requires the default column family to be declared
@@ -142,7 +191,11 @@ impl Db {
         let path_str = path.as_ref().display().to_string();
         tracing::info!(path = %path_str, "opened consistent-store database");
 
-        let db = Arc::new(Self { inner });
+        let db = Arc::new(Self {
+            snapshots: RwLock::new(BTreeMap::new()),
+            snapshot_capacity,
+            inner,
+        });
         let schema = S::open(&db)?;
         Ok((db, schema))
     }
@@ -172,6 +225,75 @@ impl Db {
     /// [`Batch::commit`] to apply them atomically.
     pub fn batch(self: &Arc<Self>) -> Batch {
         Batch::new(self.clone())
+    }
+
+    /// Take a snapshot of the database state and store it under
+    /// `checkpoint`.
+    ///
+    /// Snapshots are point-in-time consistent views of the data; a
+    /// subsequent [`at_snapshot`](Self::at_snapshot) lookup at the
+    /// same `checkpoint` returns a handle that reads from this state
+    /// regardless of any writes that happen after this call returns.
+    ///
+    /// The snapshot is taken and inserted while holding the snapshot
+    /// buffer's write lock, so concurrent `take_snapshot` calls are
+    /// serialized. The snapshot's state is captured by RocksDB at
+    /// the [`rocksdb::DB::snapshot`] call, before the lock is taken;
+    /// callers who require a strict ordering between writes and the
+    /// snapshot's state should ensure no concurrent writers race
+    /// with this call.
+    ///
+    /// If a snapshot already exists at `checkpoint`, it is replaced.
+    /// If the buffer is at
+    /// [`DbOptions::snapshot_capacity`](crate::DbOptions::snapshot_capacity),
+    /// the snapshot with the lowest checkpoint number is evicted.
+    pub fn take_snapshot(&self, checkpoint: u64) {
+        let snapshot = self.inner.snapshot();
+        // SAFETY: `Snapshot::<'_, rocksdb::DB>::'_` is a borrow of
+        // `self.inner`. The transmute to `'static` is sound because
+        // (1) `Db::inner` is declared after `Db::snapshots`, so
+        // `inner` outlives every snapshot retained in the map; and
+        // (2) `SnapshotHandle`s co-own `Arc<Db>` and drop their
+        // `Arc<SnapshotEntry>` before their `Arc<Db>`, so no
+        // snapshot can survive a `Db` drop.
+        let snapshot: rocksdb::Snapshot<'static> = unsafe { std::mem::transmute(snapshot) };
+        let entry = Arc::new(SnapshotEntry { snapshot });
+
+        let mut snaps = self.snapshots.write();
+        snaps.insert(checkpoint, entry);
+        while snaps.len() > self.snapshot_capacity {
+            snaps.pop_first();
+        }
+    }
+
+    /// Look up the snapshot stored at `checkpoint`.
+    ///
+    /// Returns `None` if no snapshot exists at that checkpoint.
+    /// Cloning the returned [`SnapshotHandle`] is cheap; clones share
+    /// the same underlying snapshot.
+    pub fn at_snapshot(self: &Arc<Self>, checkpoint: u64) -> Option<SnapshotHandle> {
+        let snaps = self.snapshots.read();
+        let entry = snaps.get(&checkpoint)?.clone();
+        Some(SnapshotHandle::new(self.clone(), entry, checkpoint))
+    }
+
+    /// Returns the inclusive range of checkpoints covered by the
+    /// snapshot buffer, or `None` if the buffer is empty.
+    pub fn snapshot_range(&self) -> Option<RangeInclusive<u64>> {
+        let snaps = self.snapshots.read();
+        let lo = *snaps.keys().next()?;
+        let hi = *snaps.keys().next_back()?;
+        Some(lo..=hi)
+    }
+
+    /// Drop the snapshot at `checkpoint`. Returns `true` if a
+    /// snapshot was removed.
+    ///
+    /// Outstanding [`SnapshotHandle`]s for this checkpoint remain
+    /// usable until they themselves drop; only the buffer's
+    /// reference is released.
+    pub fn drop_snapshot(&self, checkpoint: u64) -> bool {
+        self.snapshots.write().remove(&checkpoint).is_some()
     }
 }
 
