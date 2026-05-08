@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use rocksdb::BoundColumnFamily;
 
+use crate::batch::Batch;
 use crate::error::OpenError;
 use crate::schema::Schema;
 
@@ -162,6 +163,15 @@ impl Db {
     /// on the database. Not part of the public API.
     pub(crate) fn rocksdb(&self) -> &rocksdb::DB {
         &self.inner
+    }
+
+    /// Construct an empty atomic write batch tied to this database.
+    ///
+    /// Stage operations against the returned [`Batch`] using
+    /// [`Batch::put`] and [`Batch::delete`], then call
+    /// [`Batch::commit`] to apply them atomically.
+    pub fn batch(self: &Arc<Self>) -> Batch {
+        Batch::new(self.clone())
     }
 }
 

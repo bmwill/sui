@@ -6,10 +6,11 @@
 //!
 //! See `PLAN.md` at the crate root for the design and the
 //! implementation roadmap. The crate is in active build-out: the
-//! encoding traits, the database wrapper, and typed point reads have
-//! landed; batched writes, iteration, and the in-memory snapshot
-//! model follow.
+//! encoding traits, the database wrapper, typed point reads, and
+//! atomic batched writes have landed; iteration and the in-memory
+//! snapshot model follow.
 
+pub mod batch;
 pub mod db;
 pub mod encode;
 mod encode_buf;
@@ -17,6 +18,7 @@ pub mod error;
 pub mod map;
 pub mod schema;
 
+pub use crate::batch::Batch;
 pub use crate::db::Db;
 pub use crate::db::DbOptions;
 pub use crate::encode::Decode;
