@@ -190,10 +190,21 @@ where
     /// read path so that block-cache hits avoid the extra heap
     /// allocation that `DB::get` would do.
     pub fn get(&self, key: &K) -> Result<Option<V>, Error> {
+        self.get_with_opts(key, &ReadOptions::default())
+    }
+
+    /// Internal helper that performs the read with caller-supplied
+    /// [`ReadOptions`]. Used by both [`Self::get`] (with default
+    /// options) and snapshot-bound reads (which pass options with a
+    /// snapshot set).
+    pub(crate) fn get_with_opts(&self, key: &K, opts: &ReadOptions) -> Result<Option<V>, Error> {
         let cf = self.cf()?;
         with_encode_buf(|buf| {
             key.encode_into(buf)?;
-            let pinned = self.db.rocksdb().get_pinned_cf(&cf, buf.as_slice())?;
+            let pinned = self
+                .db
+                .rocksdb()
+                .get_pinned_cf_opt(&cf, buf.as_slice(), opts)?;
             match pinned {
                 Some(slice) => Ok(Some(V::decode(&slice)?)),
                 None => Ok(None),
@@ -210,6 +221,18 @@ where
     /// failures and is reported alongside successful results in the
     /// returned vector.
     pub fn multi_get<'k, I>(&self, keys: I) -> Result<Vec<Result<Option<V>, Error>>, Error>
+    where
+        I: IntoIterator<Item = &'k K>,
+        K: 'k,
+    {
+        self.multi_get_with_opts(keys, &ReadOptions::default())
+    }
+
+    pub(crate) fn multi_get_with_opts<'k, I>(
+        &self,
+        keys: I,
+        opts: &ReadOptions,
+    ) -> Result<Vec<Result<Option<V>, Error>>, Error>
     where
         I: IntoIterator<Item = &'k K>,
         K: 'k,
@@ -234,7 +257,7 @@ where
             let raw_results = self
                 .db
                 .rocksdb()
-                .batched_multi_get_cf(&cf, key_slices, false);
+                .batched_multi_get_cf_opt(&cf, key_slices, false, opts);
 
             let decoded = raw_results
                 .into_iter()
@@ -262,10 +285,21 @@ where
     /// way, the `Bytes` co-owns the underlying [`Arc<Db>`] so it can
     /// outlive any borrow this method was called through.
     pub fn get_raw(&self, key: &K) -> Result<Option<Bytes>, Error> {
+        self.get_raw_with_opts(key, &ReadOptions::default())
+    }
+
+    pub(crate) fn get_raw_with_opts(
+        &self,
+        key: &K,
+        opts: &ReadOptions,
+    ) -> Result<Option<Bytes>, Error> {
         let cf = self.cf()?;
         with_encode_buf(|buf| {
             key.encode_into(buf)?;
-            let pinned = self.db.rocksdb().get_pinned_cf(&cf, buf.as_slice())?;
+            let pinned = self
+                .db
+                .rocksdb()
+                .get_pinned_cf_opt(&cf, buf.as_slice(), opts)?;
             Ok(pinned.map(|slice| pinned_to_bytes(self.db.clone(), slice)))
         })
     }
@@ -276,6 +310,18 @@ where
     /// The outer `Result` captures encoding failures; the inner
     /// `Result` captures per-key read failures.
     pub fn multi_get_raw<'k, I>(&self, keys: I) -> Result<Vec<Result<Option<Bytes>, Error>>, Error>
+    where
+        I: IntoIterator<Item = &'k K>,
+        K: 'k,
+    {
+        self.multi_get_raw_with_opts(keys, &ReadOptions::default())
+    }
+
+    pub(crate) fn multi_get_raw_with_opts<'k, I>(
+        &self,
+        keys: I,
+        opts: &ReadOptions,
+    ) -> Result<Vec<Result<Option<Bytes>, Error>>, Error>
     where
         I: IntoIterator<Item = &'k K>,
         K: 'k,
@@ -300,7 +346,7 @@ where
             let raw_results = self
                 .db
                 .rocksdb()
-                .batched_multi_get_cf(&cf, key_slices, false);
+                .batched_multi_get_cf_opt(&cf, key_slices, false, opts);
 
             let mapped = raw_results
                 .into_iter()
@@ -326,11 +372,12 @@ where
     /// Decode failures are reported as a per-item `Err`; the
     /// iterator stops yielding after the first error.
     pub fn iter(&self) -> Result<Iter<'_, K, V>, Error> {
+        self.iter_with_opts(ReadOptions::default())
+    }
+
+    pub(crate) fn iter_with_opts<'s>(&'s self, opts: ReadOptions) -> Result<Iter<'s, K, V>, Error> {
         let cf = self.cf()?;
-        let mut raw = self
-            .db
-            .rocksdb()
-            .raw_iterator_cf_opt(&cf, ReadOptions::default());
+        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
         raw.seek_to_first();
         Ok(Iter::new(raw))
     }
@@ -345,16 +392,21 @@ where
     /// it; see the [module-level docs](crate::iter) for an
     /// explanation and a worked example.
     pub fn iter_prefix(&self, prefix: &impl Encode) -> Result<Iter<'_, K, V>, Error> {
+        self.iter_prefix_with_opts(prefix, ReadOptions::default())
+    }
+
+    pub(crate) fn iter_prefix_with_opts<'s>(
+        &'s self,
+        prefix: &impl Encode,
+        mut opts: ReadOptions,
+    ) -> Result<Iter<'s, K, V>, Error> {
         let cf = self.cf()?;
         let prefix_bytes = prefix.encode()?;
-
-        let mut read_opts = ReadOptions::default();
         if let Some(upper) = next_prefix(&prefix_bytes) {
-            read_opts.set_iterate_upper_bound(upper);
+            opts.set_iterate_upper_bound(upper);
         }
-        read_opts.set_iterate_lower_bound(prefix_bytes);
-
-        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, read_opts);
+        opts.set_iterate_lower_bound(prefix_bytes);
+        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
         raw.seek_to_first();
         Ok(Iter::new(raw))
     }
@@ -362,11 +414,15 @@ where
     /// Iterate in reverse lexicographic key order over all entries
     /// in the column family.
     pub fn iter_rev(&self) -> Result<RevIter<'_, K, V>, Error> {
+        self.iter_rev_with_opts(ReadOptions::default())
+    }
+
+    pub(crate) fn iter_rev_with_opts<'s>(
+        &'s self,
+        opts: ReadOptions,
+    ) -> Result<RevIter<'s, K, V>, Error> {
         let cf = self.cf()?;
-        let mut raw = self
-            .db
-            .rocksdb()
-            .raw_iterator_cf_opt(&cf, ReadOptions::default());
+        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
         raw.seek_to_last();
         Ok(RevIter::new(raw))
     }
@@ -374,16 +430,21 @@ where
     /// Iterate in reverse over the subset of entries whose keys,
     /// when encoded, begin with `prefix`'s encoding.
     pub fn iter_rev_prefix(&self, prefix: &impl Encode) -> Result<RevIter<'_, K, V>, Error> {
+        self.iter_rev_prefix_with_opts(prefix, ReadOptions::default())
+    }
+
+    pub(crate) fn iter_rev_prefix_with_opts<'s>(
+        &'s self,
+        prefix: &impl Encode,
+        mut opts: ReadOptions,
+    ) -> Result<RevIter<'s, K, V>, Error> {
         let cf = self.cf()?;
         let prefix_bytes = prefix.encode()?;
-
-        let mut read_opts = ReadOptions::default();
         if let Some(upper) = next_prefix(&prefix_bytes) {
-            read_opts.set_iterate_upper_bound(upper);
+            opts.set_iterate_upper_bound(upper);
         }
-        read_opts.set_iterate_lower_bound(prefix_bytes);
-
-        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, read_opts);
+        opts.set_iterate_lower_bound(prefix_bytes);
+        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
         raw.seek_to_last();
         Ok(RevIter::new(raw))
     }

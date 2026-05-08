@@ -307,7 +307,13 @@ crate.
 7. **In-memory snapshots.** The snapshot buffer, `take_snapshot`,
    `at_snapshot`, `snapshots_range`, and snapshot-bound reads and
    iterators.
-8. **Filesystem checkpoint.** `Db::create_checkpoint(path)` plus a
+8. **Merge operators.** Typed `Batch::merge` and the supporting
+   plumbing on `DbMap`. Schema authors install merge operators via
+   the per-CF `rocksdb::Options` they return from
+   [`Schema::cfs`](crate::Schema::cfs) (already supported); this
+   commit closes the loop by exposing a typed entry point that
+   actually triggers the operator.
+9. **Filesystem checkpoint.** `Db::create_checkpoint(path)` plus a
    round-trip test.
 
 Within each step we will add module-level documentation and rustdoc
