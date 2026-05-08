@@ -303,6 +303,19 @@ impl Db {
         Some(lo..=hi)
     }
 
+    /// Flush all column families to disk, blocking until each
+    /// memtable has been written.
+    ///
+    /// Equivalent to RocksDB's `flush()` operation. Useful before a
+    /// graceful shutdown or before opening a [filesystem
+    /// checkpoint][rocksdb::checkpoint::Checkpoint] of the
+    /// database. Routine writes do not require this call; RocksDB
+    /// flushes automatically as memtables fill.
+    pub fn flush(&self) -> Result<(), OpenError> {
+        self.inner.flush()?;
+        Ok(())
+    }
+
     /// Drop the snapshot at `checkpoint`. Returns `true` if a
     /// snapshot was removed.
     ///
@@ -532,6 +545,13 @@ mod tests {
         let result = Db::open::<TestSchema>(&path, opts);
         let err = result.expect_err("open should fail when path is missing");
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn flush_succeeds_on_open_db() {
+        let dir = TempDir::new().unwrap();
+        let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+        db.flush().unwrap();
     }
 
     #[test]
