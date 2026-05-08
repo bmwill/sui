@@ -24,6 +24,7 @@ pub mod snapshot;
 pub use crate::batch::Batch;
 pub use crate::db::Db;
 pub use crate::db::DbOptions;
+pub use crate::db::RocksMetrics;
 pub use crate::encode::Decode;
 pub use crate::encode::Encode;
 pub use crate::iter::Iter;

@@ -312,6 +312,159 @@ impl Db {
     pub fn drop_snapshot(&self, checkpoint: u64) -> bool {
         self.snapshots.write().remove(&checkpoint).is_some()
     }
+
+    /// Read RocksDB's per-column-family runtime properties for
+    /// `cf_name`.
+    ///
+    /// Returns a [`RocksMetrics`] struct populated from RocksDB's
+    /// `property_int_value_cf` API. Fields default to `-1` when the
+    /// column family is not registered or RocksDB cannot report a
+    /// value (some properties depend on subsystems that are not
+    /// always active, for example blob-file totals on a CF without
+    /// blob storage configured).
+    pub fn cf_metrics(&self, cf_name: &str) -> RocksMetrics {
+        let Some(cf) = self.cf_handle(cf_name) else {
+            return RocksMetrics::default();
+        };
+        let read = |property: &str| -> i64 {
+            self.inner
+                .property_int_value_cf(&cf, property)
+                .ok()
+                .flatten()
+                .map(|v| v as i64)
+                .unwrap_or(METRICS_ERROR)
+        };
+        RocksMetrics {
+            block_cache_capacity: read("rocksdb.block-cache-capacity"),
+            block_cache_usage: read("rocksdb.block-cache-usage"),
+            block_cache_pinned_usage: read("rocksdb.block-cache-pinned-usage"),
+            current_size_active_mem_tables: read("rocksdb.cur-size-active-mem-table"),
+            size_all_mem_tables: read("rocksdb.size-all-mem-tables"),
+            num_immutable_mem_tables: read("rocksdb.num-immutable-mem-table"),
+            mem_table_flush_pending: read("rocksdb.mem-table-flush-pending"),
+            estimate_table_readers_mem: read("rocksdb.estimate-table-readers-mem"),
+            num_level0_files: read("rocksdb.num-files-at-level0"),
+            base_level: read("rocksdb.base-level"),
+            compaction_pending: read("rocksdb.compaction-pending"),
+            num_running_compactions: read("rocksdb.num-running-compactions"),
+            num_running_flushes: read("rocksdb.num-running-flushes"),
+            estimate_pending_compaction_bytes: read("rocksdb.estimate-pending-compaction-bytes"),
+            num_snapshots: read("rocksdb.num-snapshots"),
+            oldest_snapshot_time: read("rocksdb.oldest-snapshot-time"),
+            estimate_oldest_key_time: read("rocksdb.estimate-oldest-key-time"),
+            estimated_num_keys: read("rocksdb.estimate-num-keys"),
+            background_errors: read("rocksdb.background-errors"),
+            total_sst_files_size: read("rocksdb.total-sst-files-size"),
+            total_blob_files_size: read("rocksdb.total-blob-file-size"),
+            actual_delayed_write_rate: read("rocksdb.actual-delayed-write-rate"),
+            is_write_stopped: read("rocksdb.is-write-stopped"),
+        }
+    }
+}
+
+/// Sentinel value used in [`RocksMetrics`] when a property is
+/// unavailable: the column family is not registered, or RocksDB
+/// returned an error or an empty result for the property.
+const METRICS_ERROR: i64 = -1;
+
+/// Per-column-family runtime metrics read from RocksDB on demand.
+///
+/// Populated by [`Db::cf_metrics`]. Each field corresponds to a
+/// `rocksdb.*` integer property; fields hold [`METRICS_ERROR`]
+/// (`-1`) when the property cannot be read. The struct is plain
+/// data; consumers are expected to convert it into whatever their
+/// monitoring stack wants (Prometheus gauges, structured logs,
+/// etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RocksMetrics {
+    /// `rocksdb.block-cache-capacity` — configured size (bytes).
+    pub block_cache_capacity: i64,
+    /// `rocksdb.block-cache-usage` — current size (bytes).
+    pub block_cache_usage: i64,
+    /// `rocksdb.block-cache-pinned-usage` — bytes currently pinned
+    /// (held alive by outstanding readers).
+    pub block_cache_pinned_usage: i64,
+    /// `rocksdb.cur-size-active-mem-table` — active memtable bytes.
+    pub current_size_active_mem_tables: i64,
+    /// `rocksdb.size-all-mem-tables` — active plus immutable
+    /// memtable bytes.
+    pub size_all_mem_tables: i64,
+    /// `rocksdb.num-immutable-mem-table` — count of immutable
+    /// memtables waiting to be flushed.
+    pub num_immutable_mem_tables: i64,
+    /// `rocksdb.mem-table-flush-pending` — `1` if a flush is
+    /// pending, else `0`.
+    pub mem_table_flush_pending: i64,
+    /// `rocksdb.estimate-table-readers-mem` — approximate memory
+    /// used by table readers (excluding the block cache).
+    pub estimate_table_readers_mem: i64,
+    /// `rocksdb.num-files-at-level0` — number of level-0 SST files.
+    pub num_level0_files: i64,
+    /// `rocksdb.base-level` — RocksDB's current base level.
+    pub base_level: i64,
+    /// `rocksdb.compaction-pending` — `1` if compaction is pending.
+    pub compaction_pending: i64,
+    /// `rocksdb.num-running-compactions` — currently running
+    /// compactions.
+    pub num_running_compactions: i64,
+    /// `rocksdb.num-running-flushes` — currently running flushes.
+    pub num_running_flushes: i64,
+    /// `rocksdb.estimate-pending-compaction-bytes` — bytes the
+    /// compaction backlog will rewrite.
+    pub estimate_pending_compaction_bytes: i64,
+    /// `rocksdb.num-snapshots` — count of unreleased
+    /// `rocksdb::Snapshot` handles.
+    pub num_snapshots: i64,
+    /// `rocksdb.oldest-snapshot-time` — unix-time of the oldest
+    /// live snapshot.
+    pub oldest_snapshot_time: i64,
+    /// `rocksdb.estimate-oldest-key-time` — unix-time estimate of
+    /// the oldest live key.
+    pub estimate_oldest_key_time: i64,
+    /// `rocksdb.estimate-num-keys` — approximate live key count.
+    pub estimated_num_keys: i64,
+    /// `rocksdb.background-errors` — accumulated background errors.
+    pub background_errors: i64,
+    /// `rocksdb.total-sst-files-size` — bytes occupied by SST files.
+    pub total_sst_files_size: i64,
+    /// `rocksdb.total-blob-file-size` — bytes occupied by blob
+    /// files.
+    pub total_blob_files_size: i64,
+    /// `rocksdb.actual-delayed-write-rate` — current write-rate
+    /// throttling level (bytes/sec, `0` when not throttled).
+    pub actual_delayed_write_rate: i64,
+    /// `rocksdb.is-write-stopped` — `1` if writes are stopped.
+    pub is_write_stopped: i64,
+}
+
+impl Default for RocksMetrics {
+    fn default() -> Self {
+        Self {
+            block_cache_capacity: METRICS_ERROR,
+            block_cache_usage: METRICS_ERROR,
+            block_cache_pinned_usage: METRICS_ERROR,
+            current_size_active_mem_tables: METRICS_ERROR,
+            size_all_mem_tables: METRICS_ERROR,
+            num_immutable_mem_tables: METRICS_ERROR,
+            mem_table_flush_pending: METRICS_ERROR,
+            estimate_table_readers_mem: METRICS_ERROR,
+            num_level0_files: METRICS_ERROR,
+            base_level: METRICS_ERROR,
+            compaction_pending: METRICS_ERROR,
+            num_running_compactions: METRICS_ERROR,
+            num_running_flushes: METRICS_ERROR,
+            estimate_pending_compaction_bytes: METRICS_ERROR,
+            num_snapshots: METRICS_ERROR,
+            oldest_snapshot_time: METRICS_ERROR,
+            estimate_oldest_key_time: METRICS_ERROR,
+            estimated_num_keys: METRICS_ERROR,
+            background_errors: METRICS_ERROR,
+            total_sst_files_size: METRICS_ERROR,
+            total_blob_files_size: METRICS_ERROR,
+            actual_delayed_write_rate: METRICS_ERROR,
+            is_write_stopped: METRICS_ERROR,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +532,30 @@ mod tests {
         let result = Db::open::<TestSchema>(&path, opts);
         let err = result.expect_err("open should fail when path is missing");
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn cf_metrics_returns_default_for_unknown_cf() {
+        let dir = TempDir::new().unwrap();
+        let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+        let metrics = db.cf_metrics("not_in_schema");
+        // All sentinel values for an unknown CF.
+        assert_eq!(metrics, RocksMetrics::default());
+    }
+
+    #[test]
+    fn cf_metrics_reports_real_values_for_known_cf() {
+        let dir = TempDir::new().unwrap();
+        let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+        let metrics = db.cf_metrics("foo");
+        // We don't assert specific numbers (they depend on RocksDB
+        // internals), but a known CF should yield non-sentinel
+        // values for at least the always-available properties:
+        // block cache state and memtable sizes.
+        assert!(metrics.block_cache_capacity >= 0);
+        assert!(metrics.size_all_mem_tables >= 0);
+        assert!(metrics.num_immutable_mem_tables >= 0);
+        assert!(metrics.is_write_stopped >= 0);
     }
 
     #[test]
