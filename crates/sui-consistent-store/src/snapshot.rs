@@ -3,13 +3,15 @@
 
 //! Consistent reads against a captured snapshot.
 //!
-//! [`SnapshotHandle`] is a cheap-to-clone handle returned by
-//! [`Db::at_snapshot`](crate::Db::at_snapshot) that exposes the same
-//! read and iteration surface as [`DbMap`] but routes every call
-//! through a [`rocksdb::Snapshot`] captured at a specific checkpoint.
-//! Reads through the same handle (and through clones of it) all see
-//! the database state at the moment [`Db::take_snapshot`] was called,
-//! regardless of any writes that occur afterwards.
+//! [`SnapshotHandle`] is a cheap-to-clone token returned by
+//! [`Db::at_snapshot`](crate::Db::at_snapshot) (or
+//! [`Db::latest_snapshot`](crate::Db::latest_snapshot)). It is the
+//! borrow point used to construct snapshot-bound reads via
+//! [`DbMap::at`](crate::DbMap::at) (single CF) or
+//! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) (whole
+//! schema). The handle itself does not expose read methods — reads
+//! always go through a [`DbMap<_, _, Snapshot<'_>>`](crate::DbMap)
+//! produced by re-binding.
 //!
 //! # Lifetimes and ownership
 //!
@@ -20,11 +22,9 @@
 //! has been called for that checkpoint or the snapshot has been
 //! evicted from the buffer by capacity pressure.
 //!
-//! Iteration methods on a handle return iterators whose lifetime is
-//! tied to both the handle and the [`DbMap`] they iterate over,
-//! since the iterator's underlying [`rocksdb::ReadOptions`] holds a
-//! raw pointer to the snapshot. The handle must outlive any iterator
-//! it produces.
+//! Snapshot-bound [`DbMap`](crate::DbMap)s constructed from a handle
+//! borrow from it; the handle must outlive any such re-binding (and
+//! the iterators those re-bindings produce).
 //!
 //! # Examples
 //!
@@ -36,6 +36,8 @@
 //! use sui_consistent_store::DbOptions;
 //! use sui_consistent_store::Decode;
 //! use sui_consistent_store::Encode;
+//! use sui_consistent_store::Live;
+//! use sui_consistent_store::Reader;
 //! use sui_consistent_store::Schema;
 //! use sui_consistent_store::error::DecodeError;
 //! use sui_consistent_store::error::EncodeError;
@@ -60,11 +62,11 @@
 //!     }
 //! }
 //!
-//! struct MySchema {
-//!     items: DbMap<U64Be, U64Be>,
+//! struct MySchema<R: Reader = Live> {
+//!     items: DbMap<U64Be, U64Be, R>,
 //! }
 //!
-//! impl Schema for MySchema {
+//! impl Schema for MySchema<Live> {
 //!     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
 //!         vec![("items", base_options.clone())]
 //!     }
@@ -90,40 +92,30 @@
 //! batch.put(&schema.items, &U64Be(1), &U64Be(999)).unwrap();
 //! batch.commit().unwrap();
 //!
-//! // The snapshot still sees the pre-mutation value.
+//! // Re-bind the items map at the snapshot.
 //! let snap = db.at_snapshot(1).unwrap();
-//! assert_eq!(
-//!     snap.get(&schema.items, &U64Be(1)).unwrap(),
-//!     Some(U64Be(100))
-//! );
-//! // The current view sees the new value.
+//! let items_at_snap = schema.items.at(&snap);
+//! assert_eq!(items_at_snap.get(&U64Be(1)).unwrap(), Some(U64Be(100)));
+//! // The live binding sees the new value.
 //! assert_eq!(schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(999)));
 //! ```
 
 use std::fmt;
-use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use rocksdb::ReadOptions;
-
-use crate::Decode;
-use crate::Encode;
 use crate::db::Db;
 use crate::db::SnapshotEntry;
-use crate::error::Error;
-use crate::iter::Iter;
-use crate::iter::RevIter;
-use crate::iter::prefix_to_byte_bounds;
-use crate::iter::range_to_byte_bounds;
-use crate::map::DbMap;
-use crate::snapshot_view::SnapshotView;
 
-/// A cheap-to-clone handle to a single snapshot of the database.
+/// A cheap-to-clone token referencing a single snapshot of the
+/// database.
 ///
-/// Returned by [`Db::at_snapshot`](crate::Db::at_snapshot). Clones
-/// share the same underlying snapshot; cloning is an `Arc`
-/// increment and a small struct copy.
+/// Returned by [`Db::at_snapshot`](crate::Db::at_snapshot) and
+/// [`Db::latest_snapshot`](crate::Db::latest_snapshot). Pass a
+/// reference to a [`SnapshotHandle`] to
+/// [`DbMap::at`](crate::DbMap::at) or
+/// [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) to obtain
+/// snapshot-bound read handles. Clones share the same underlying
+/// snapshot; cloning is an `Arc` increment and a small struct copy.
 pub struct SnapshotHandle {
     // Field declaration order is load-bearing: `entry` must drop
     // before `_db` so that the contained `rocksdb::Snapshot`
@@ -148,148 +140,20 @@ impl SnapshotHandle {
         self.checkpoint
     }
 
-    /// Bind this snapshot to a [`DbMap`] so subsequent reads can
-    /// drop the map argument.
-    ///
-    /// The returned [`SnapshotView`] is `Copy` and exposes the same
-    /// read and iteration surface as `DbMap`.
-    pub fn view<'s, K, V>(&'s self, map: &'s DbMap<K, V>) -> SnapshotView<'s, K, V> {
-        SnapshotView::new(self, map)
+    /// The shared database handle this snapshot is taken against.
+    /// Used by the [`Reader`](crate::Reader) implementation for
+    /// [`Snapshot`](crate::Snapshot) to look up column-family
+    /// handles.
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        &self._db
     }
 
-    fn read_options(&self) -> ReadOptions {
-        let mut opts = ReadOptions::default();
-        opts.set_snapshot(self.entry.as_snapshot());
-        opts
-    }
-
-    /// Read and decode the value for `key` against this snapshot.
-    pub fn get<K, V>(&self, map: &DbMap<K, V>, key: &K) -> Result<Option<V>, Error>
-    where
-        K: Encode,
-        V: Decode,
-    {
-        map.get_with_opts(key, &self.read_options())
-    }
-
-    /// Read the raw bytes for `key` against this snapshot.
-    pub fn get_raw<K, V>(&self, map: &DbMap<K, V>, key: &K) -> Result<Option<Bytes>, Error>
-    where
-        K: Encode,
-    {
-        map.get_raw_with_opts(key, &self.read_options())
-    }
-
-    /// Batched read and decode against this snapshot.
-    pub fn multi_get<'k, K, V, I>(
-        &self,
-        map: &DbMap<K, V>,
-        keys: I,
-    ) -> Result<Vec<Result<Option<V>, Error>>, Error>
-    where
-        K: Encode + 'k,
-        V: Decode,
-        I: IntoIterator<Item = &'k K>,
-    {
-        map.multi_get_with_opts(keys, &self.read_options())
-    }
-
-    /// Batched raw-bytes read against this snapshot.
-    pub fn multi_get_raw<'k, K, V, I>(
-        &self,
-        map: &DbMap<K, V>,
-        keys: I,
-    ) -> Result<Vec<Result<Option<Bytes>, Error>>, Error>
-    where
-        K: Encode + 'k,
-        I: IntoIterator<Item = &'k K>,
-    {
-        map.multi_get_raw_with_opts(keys, &self.read_options())
-    }
-
-    /// Test whether `key` is present in `map` at this snapshot.
-    pub fn contains_key<K, V>(&self, map: &DbMap<K, V>, key: &K) -> Result<bool, Error>
-    where
-        K: Encode,
-    {
-        map.contains_key_with_opts(key, &self.read_options())
-    }
-
-    /// Batched counterpart to [`contains_key`](Self::contains_key).
-    pub fn multi_contains_keys<'k, K, V, I>(
-        &self,
-        map: &DbMap<K, V>,
-        keys: I,
-    ) -> Result<Vec<bool>, Error>
-    where
-        K: Encode + 'k,
-        I: IntoIterator<Item = &'k K>,
-    {
-        map.multi_contains_keys_with_opts(keys, &self.read_options())
-    }
-
-    /// Forward iteration against this snapshot, bounded by `range`.
-    ///
-    /// The returned iterator borrows from `self`, so the snapshot
-    /// handle must outlive the iterator. Cloning the handle before
-    /// iterating gives a separately-owned alias if the caller needs
-    /// to keep handles around for later use.
-    pub fn iter<'s, K, V>(
-        &'s self,
-        map: &'s DbMap<K, V>,
-        range: impl RangeBounds<K>,
-    ) -> Result<Iter<'s, K, V>, Error>
-    where
-        K: Encode + Decode,
-        V: Decode,
-    {
-        let (lower, upper) = range_to_byte_bounds(&range)?;
-        map.iter_forward(lower, upper, self.read_options())
-    }
-
-    /// Forward iteration against this snapshot, restricted to keys
-    /// whose encoding begins with `prefix`'s encoding. See
-    /// [`DbMap::iter_prefix`] for the prefix contract.
-    pub fn iter_prefix<'s, K, V>(
-        &'s self,
-        map: &'s DbMap<K, V>,
-        prefix: &impl Encode,
-    ) -> Result<Iter<'s, K, V>, Error>
-    where
-        K: Encode + Decode,
-        V: Decode,
-    {
-        let (lower, upper) = prefix_to_byte_bounds(prefix)?;
-        map.iter_forward(lower, upper, self.read_options())
-    }
-
-    /// Reverse iteration against this snapshot, bounded by `range`.
-    pub fn iter_rev<'s, K, V>(
-        &'s self,
-        map: &'s DbMap<K, V>,
-        range: impl RangeBounds<K>,
-    ) -> Result<RevIter<'s, K, V>, Error>
-    where
-        K: Encode + Decode,
-        V: Decode,
-    {
-        let (lower, upper) = range_to_byte_bounds(&range)?;
-        map.iter_reverse(lower, upper, self.read_options())
-    }
-
-    /// Reverse iteration against this snapshot, restricted to keys
-    /// whose encoding begins with `prefix`'s encoding.
-    pub fn iter_rev_prefix<'s, K, V>(
-        &'s self,
-        map: &'s DbMap<K, V>,
-        prefix: &impl Encode,
-    ) -> Result<RevIter<'s, K, V>, Error>
-    where
-        K: Encode + Decode,
-        V: Decode,
-    {
-        let (lower, upper) = prefix_to_byte_bounds(prefix)?;
-        map.iter_reverse(lower, upper, self.read_options())
+    /// The retained [`SnapshotEntry`] backing this handle. Used by
+    /// the [`Reader`](crate::Reader) implementation for
+    /// [`Snapshot`](crate::Snapshot) to install the snapshot pointer
+    /// on a fresh [`ReadOptions`](rocksdb::ReadOptions).
+    pub(crate) fn entry(&self) -> &Arc<SnapshotEntry> {
+        &self.entry
     }
 }
 
@@ -317,21 +181,27 @@ mod tests {
 
     use super::*;
     use crate::DbOptions;
+    use crate::Live;
+    use crate::Reader;
     use crate::Schema;
+    use crate::SchemaAtSnapshot;
+    use crate::Snapshot;
     use crate::error::DecodeError;
     use crate::error::EncodeError;
+    use crate::error::OpenError;
+    use crate::map::DbMap;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct U64Be(u64);
 
-    impl Encode for U64Be {
+    impl crate::Encode for U64Be {
         fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
             buf.extend_from_slice(&self.0.to_be_bytes());
             Ok(())
         }
     }
 
-    impl Decode for U64Be {
+    impl crate::Decode for U64Be {
         fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
             let arr: [u8; 8] = bytes
                 .try_into()
@@ -341,11 +211,11 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestSchema {
-        items: DbMap<U64Be, U64Be>,
+    struct TestSchema<R: Reader = Live> {
+        items: DbMap<U64Be, U64Be, R>,
     }
 
-    impl Schema for TestSchema {
+    impl Schema for TestSchema<Live> {
         fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
             vec![("items", base_options.clone())]
         }
@@ -357,7 +227,14 @@ mod tests {
         }
     }
 
-    use crate::error::OpenError;
+    impl SchemaAtSnapshot for TestSchema<Live> {
+        type At<'s> = TestSchema<Snapshot<'s>>;
+        fn at<'s>(&'s self, snap: &'s SnapshotHandle) -> Self::At<'s> {
+            TestSchema {
+                items: self.items.at(snap),
+            }
+        }
+    }
 
     fn open_with_capacity(capacity: usize) -> (TempDir, Arc<Db>, TestSchema) {
         let dir = TempDir::new().unwrap();
@@ -422,7 +299,7 @@ mod tests {
         put(&db, &schema, 1, 999);
         let latest = db.latest_snapshot().unwrap();
         assert_eq!(
-            latest.get(&schema.items, &U64Be(1)).unwrap(),
+            schema.items.at(&latest).get(&U64Be(1)).unwrap(),
             Some(U64Be(100)),
         );
     }
@@ -482,7 +359,7 @@ mod tests {
 
         let snap = db.at_snapshot(1).unwrap();
         assert_eq!(
-            snap.get(&schema.items, &U64Be(1)).unwrap(),
+            schema.items.at(&snap).get(&U64Be(1)).unwrap(),
             Some(U64Be(100)),
         );
         assert_eq!(schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(999)));
@@ -494,7 +371,7 @@ mod tests {
         db.take_snapshot(0);
         put(&db, &schema, 1, 100);
         let snap = db.at_snapshot(0).unwrap();
-        assert!(snap.get(&schema.items, &U64Be(1)).unwrap().is_none());
+        assert!(schema.items.at(&snap).get(&U64Be(1)).unwrap().is_none());
     }
 
     #[test]
@@ -504,8 +381,10 @@ mod tests {
         db.take_snapshot(1);
         put(&db, &schema, 1, 999);
         let snap = db.at_snapshot(1).unwrap();
-        let bytes = snap
-            .get_raw(&schema.items, &U64Be(1))
+        let bytes = schema
+            .items
+            .at(&snap)
+            .get_raw(&U64Be(1))
             .unwrap()
             .expect("value should exist in snapshot");
         assert_eq!(&bytes[..], &100u64.to_be_bytes());
@@ -521,7 +400,7 @@ mod tests {
         batch.delete(&schema.items, &U64Be(1)).unwrap();
         batch.commit().unwrap();
         let snap = db.at_snapshot(1).unwrap();
-        assert!(snap.contains_key(&schema.items, &U64Be(1)).unwrap());
+        assert!(schema.items.at(&snap).contains_key(&U64Be(1)).unwrap());
         assert!(!schema.items.contains_key(&U64Be(1)).unwrap());
     }
 
@@ -537,7 +416,7 @@ mod tests {
 
         let snap = db.at_snapshot(1).unwrap();
         let keys = [U64Be(1), U64Be(2), U64Be(3)];
-        let results = snap.multi_get(&schema.items, keys.iter()).unwrap();
+        let results = schema.items.at(&snap).multi_get(keys.iter()).unwrap();
         assert_eq!(results[0].as_ref().unwrap(), &Some(U64Be(10)));
         assert_eq!(results[1].as_ref().unwrap(), &None);
         assert_eq!(results[2].as_ref().unwrap(), &Some(U64Be(30)));
@@ -552,11 +431,8 @@ mod tests {
         put(&db, &schema, 2, 20);
 
         let snap = db.at_snapshot(1).unwrap();
-        let collected: Vec<_> = snap
-            .iter(&schema.items, ..)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        let snap_items = schema.items.at(&snap);
+        let collected: Vec<_> = snap_items.iter(..).unwrap().map(Result::unwrap).collect();
         assert_eq!(
             collected,
             vec![(U64Be(1), U64Be(10)), (U64Be(3), U64Be(30))],
@@ -571,8 +447,9 @@ mod tests {
         db.take_snapshot(1);
 
         let snap = db.at_snapshot(1).unwrap();
-        let collected: Vec<_> = snap
-            .iter_rev(&schema.items, ..)
+        let snap_items = schema.items.at(&snap);
+        let collected: Vec<_> = snap_items
+            .iter_rev(..)
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -594,8 +471,9 @@ mod tests {
         put(&db, &schema, 1, 999);
 
         let snap = db.at_snapshot(1).unwrap();
-        let collected: Vec<_> = snap
-            .iter_prefix(&schema.items, &U64Be(1))
+        let snap_items = schema.items.at(&snap);
+        let collected: Vec<_> = snap_items
+            .iter_prefix(&U64Be(1))
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -612,7 +490,7 @@ mod tests {
         assert!(db.drop_snapshot(1));
         assert!(db.at_snapshot(1).is_none());
         assert_eq!(
-            snap.get(&schema.items, &U64Be(1)).unwrap(),
+            schema.items.at(&snap).get(&U64Be(1)).unwrap(),
             Some(U64Be(100)),
         );
     }
@@ -628,11 +506,11 @@ mod tests {
         db.drop_snapshot(1);
         put(&db, &schema, 1, 999);
         assert_eq!(
-            snap_a.get(&schema.items, &U64Be(1)).unwrap(),
+            schema.items.at(&snap_a).get(&U64Be(1)).unwrap(),
             Some(U64Be(100)),
         );
         assert_eq!(
-            snap_b.get(&schema.items, &U64Be(1)).unwrap(),
+            schema.items.at(&snap_b).get(&U64Be(1)).unwrap(),
             Some(U64Be(100)),
         );
     }
@@ -645,11 +523,11 @@ mod tests {
         let snap = db.at_snapshot(1).unwrap();
         // Schema (and its DbMap) drops; the snapshot handle still
         // co-owns Arc<Db>, so the underlying database is alive.
-        // We re-open a temporary DbMap pointed at the same CF to
-        // exercise reads against the live Db.
+        // We re-open a temporary DbMap pointed at the same CF and
+        // re-bind it at the snapshot to exercise reads.
         let items: DbMap<U64Be, U64Be> = DbMap::new(db.clone(), "items").unwrap();
         drop(schema);
-        assert_eq!(snap.get(&items, &U64Be(1)).unwrap(), Some(U64Be(100)));
+        assert_eq!(items.at(&snap).get(&U64Be(1)).unwrap(), Some(U64Be(100)));
     }
 
     #[test]
@@ -663,8 +541,26 @@ mod tests {
         db.take_snapshot(1);
         let snap = db.at_snapshot(1).unwrap();
         assert_eq!(
-            snap.get(&schema.items, &U64Be(1)).unwrap(),
+            schema.items.at(&snap).get(&U64Be(1)).unwrap(),
             Some(U64Be(200)),
+        );
+    }
+
+    /// Demonstrates the whole-schema re-binding pattern via
+    /// `SchemaAtSnapshot::at`. The projected schema's reads see the
+    /// captured snapshot state for every CF.
+    #[test]
+    fn schema_at_snapshot_projects_all_fields() {
+        let (_dir, db, schema) = open();
+        put(&db, &schema, 1, 100);
+        db.take_snapshot(1);
+        put(&db, &schema, 1, 999);
+
+        let snap = db.at_snapshot(1).unwrap();
+        let snap_schema = schema.at(&snap);
+        assert_eq!(
+            snap_schema.items.get(&U64Be(1)).unwrap(),
+            Some(U64Be(100)),
         );
     }
 }

@@ -89,6 +89,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::Encode;
+use crate::Live;
 use crate::db::Db;
 use crate::encode_buf::with_encode_buf;
 use crate::error::Error;
@@ -126,7 +127,16 @@ impl Batch {
     /// batch's internal representation synchronously, so the
     /// scratch buffer can be reused for the next operation
     /// immediately.
-    pub fn put<K, V>(&mut self, map: &DbMap<K, V>, key: &K, value: &V) -> Result<&mut Self, Error>
+    ///
+    /// `map` is constrained to a [`Live`]-bound handle: writes always
+    /// go to the live tip, and snapshot-bound projections are
+    /// statically read-only.
+    pub fn put<K, V>(
+        &mut self,
+        map: &DbMap<K, V, Live>,
+        key: &K,
+        value: &V,
+    ) -> Result<&mut Self, Error>
     where
         K: Encode,
         V: Encode,
@@ -154,7 +164,9 @@ impl Batch {
     /// The key is encoded into a thread-local scratch buffer; RocksDB
     /// copies the bytes into the batch's internal representation
     /// before this method returns.
-    pub fn delete<K, V>(&mut self, map: &DbMap<K, V>, key: &K) -> Result<&mut Self, Error>
+    ///
+    /// `map` is constrained to a [`Live`]-bound handle.
+    pub fn delete<K, V>(&mut self, map: &DbMap<K, V, Live>, key: &K) -> Result<&mut Self, Error>
     where
         K: Encode,
     {
@@ -192,9 +204,11 @@ impl Batch {
     /// If the column family has no merge operator configured,
     /// RocksDB rejects the batch at [`commit`](Self::commit) time
     /// with a [`Error::Rocksdb`](crate::error::Error::Rocksdb).
+    ///
+    /// `map` is constrained to a [`Live`]-bound handle.
     pub fn merge<K, V>(
         &mut self,
-        map: &DbMap<K, V>,
+        map: &DbMap<K, V, Live>,
         key: &K,
         operand: &V,
     ) -> Result<&mut Self, Error>
