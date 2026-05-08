@@ -32,6 +32,9 @@
 //! use sui_consistent_store::Db;
 //! use sui_consistent_store::DbMap;
 //! use sui_consistent_store::DbOptions;
+//! use bytes::Buf;
+//! use bytes::BufMut;
+//!
 //! use sui_consistent_store::Decode;
 //! use sui_consistent_store::Encode;
 //! use sui_consistent_store::Schema;
@@ -43,18 +46,18 @@
 //! struct U64Be(u64);
 //!
 //! impl Encode for U64Be {
-//!     fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-//!         buf.extend_from_slice(&self.0.to_be_bytes());
+//!     fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+//!         buf.put_slice(&self.0.to_be_bytes());
 //!         Ok(())
 //!     }
 //! }
 //!
 //! impl Decode for U64Be {
-//!     fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-//!         let arr: [u8; 8] = bytes
-//!             .try_into()
-//!             .map_err(|_| DecodeError::msg("expected 8 bytes"))?;
-//!         Ok(Self(u64::from_be_bytes(arr)))
+//!     fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+//!         if buf.remaining() != 8 {
+//!             return Err(DecodeError::msg("expected 8 bytes"));
+//!         }
+//!         Ok(Self(buf.get_u64()))
 //!     }
 //! }
 //!
@@ -295,6 +298,8 @@ mod tests {
     use crate::DbOptions;
     use crate::Decode;
     use crate::Schema;
+    use bytes::BufMut;
+
     use crate::error::DecodeError;
     use crate::error::EncodeError;
     use crate::error::OpenError;
@@ -304,18 +309,18 @@ mod tests {
     struct U64Be(u64);
 
     impl Encode for U64Be {
-        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-            buf.extend_from_slice(&self.0.to_be_bytes());
+        fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_slice(&self.0.to_be_bytes());
             Ok(())
         }
     }
 
     impl Decode for U64Be {
-        fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-            let arr: [u8; 8] = bytes
-                .try_into()
-                .map_err(|_| DecodeError::msg("expected 8 bytes"))?;
-            Ok(Self(u64::from_be_bytes(arr)))
+        fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+            if buf.remaining() != 8 {
+                return Err(DecodeError::msg("expected 8 bytes"));
+            }
+            Ok(Self(buf.get_u64()))
         }
     }
 
@@ -326,13 +331,13 @@ mod tests {
     struct AlwaysFails;
 
     impl Encode for AlwaysFails {
-        fn encode_into(&self, _: &mut Vec<u8>) -> Result<(), EncodeError> {
+        fn encode_into<B: BufMut>(&self, _: &mut B) -> Result<(), EncodeError> {
             Err(EncodeError::msg("always fails"))
         }
     }
 
     impl Decode for AlwaysFails {
-        fn decode(_: &[u8]) -> Result<Self, DecodeError> {
+        fn decode<B: bytes::Buf>(_: &mut B) -> Result<Self, DecodeError> {
             Err(DecodeError::msg("never reached"))
         }
     }
