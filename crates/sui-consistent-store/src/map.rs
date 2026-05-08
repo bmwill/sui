@@ -121,7 +121,7 @@ use crate::iter::range_to_byte_bounds;
 #[derive(Debug)]
 pub struct DbMap<K, V> {
     db: Arc<Db>,
-    cf_name: String,
+    cf_name: Box<str>,
     _data: PhantomData<fn(K) -> V>,
 }
 
@@ -147,7 +147,7 @@ impl<K, V> DbMap<K, V> {
     /// missing column family is reported as an open-time error;
     /// subsequent operations report it as
     /// [`Error::MissingColumnFamily`](crate::error::Error::MissingColumnFamily).
-    pub fn new(db: Arc<Db>, cf_name: impl Into<String>) -> Result<Self, OpenError> {
+    pub fn new(db: Arc<Db>, cf_name: impl Into<Box<str>>) -> Result<Self, OpenError> {
         let cf_name = cf_name.into();
         if db.cf_handle(&cf_name).is_none() {
             return Err(OpenError::msg(format!(
@@ -164,7 +164,7 @@ impl<K, V> DbMap<K, V> {
     fn cf(&self) -> Result<Arc<rocksdb::BoundColumnFamily<'_>>, Error> {
         self.db
             .cf_handle(&self.cf_name)
-            .ok_or_else(|| Error::MissingColumnFamily(self.cf_name.clone()))
+            .ok_or_else(|| Error::MissingColumnFamily(self.cf_name.to_string()))
     }
 
     /// The shared `Arc<Db>` this handle is bound to. Used by
