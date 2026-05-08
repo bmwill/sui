@@ -19,6 +19,8 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
+use rocksdb::BoundColumnFamily;
+
 use crate::error::OpenError;
 use crate::schema::Schema;
 
@@ -143,6 +145,24 @@ impl Db {
         let schema = S::open(&db)?;
         Ok((db, schema))
     }
+
+    /// Look up a column family handle by name.
+    ///
+    /// Returns `None` if no column family with the given name was
+    /// registered when the database was opened. The returned handle
+    /// borrows from `self`; callers must not retain it beyond that
+    /// borrow.
+    pub(crate) fn cf_handle(&self, name: &str) -> Option<Arc<BoundColumnFamily<'_>>> {
+        self.inner.cf_handle(name)
+    }
+
+    /// Borrow the underlying RocksDB handle.
+    ///
+    /// Used by typed wrappers (`DbMap`) to call read and write methods
+    /// on the database. Not part of the public API.
+    pub(crate) fn rocksdb(&self) -> &rocksdb::DB {
+        &self.inner
+    }
 }
 
 #[cfg(test)]
@@ -174,25 +194,22 @@ mod tests {
     fn open_creates_database_with_schema_cfs() {
         let dir = TempDir::new().unwrap();
         let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
-        // Reach through to the underlying RocksDB to verify CF
-        // registration. A typed `Db::cf_handle` lookup helper lands
-        // alongside `DbMap` in a later commit.
-        assert!(db.inner.cf_handle("foo").is_some());
-        assert!(db.inner.cf_handle("bar").is_some());
+        assert!(db.cf_handle("foo").is_some());
+        assert!(db.cf_handle("bar").is_some());
     }
 
     #[test]
     fn open_registers_default_cf() {
         let dir = TempDir::new().unwrap();
         let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
-        assert!(db.inner.cf_handle("default").is_some());
+        assert!(db.cf_handle("default").is_some());
     }
 
     #[test]
     fn cf_handle_returns_none_for_unknown_cf() {
         let dir = TempDir::new().unwrap();
         let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
-        assert!(db.inner.cf_handle("not_in_schema").is_none());
+        assert!(db.cf_handle("not_in_schema").is_none());
     }
 
     #[test]
@@ -200,11 +217,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
-            assert!(db.inner.cf_handle("foo").is_some());
+            assert!(db.cf_handle("foo").is_some());
         }
         let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
-        assert!(db.inner.cf_handle("foo").is_some());
-        assert!(db.inner.cf_handle("bar").is_some());
+        assert!(db.cf_handle("foo").is_some());
+        assert!(db.cf_handle("bar").is_some());
     }
 
     #[test]
