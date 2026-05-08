@@ -3,15 +3,26 @@
 
 //! Atomic write batches.
 //!
-//! [`Batch`] accumulates put and delete operations across one or more
-//! column families and applies them atomically when [`Batch::commit`]
-//! is called. RocksDB guarantees that the operations in a single
-//! batch either all become visible to readers or none do.
+//! [`Batch`] accumulates put, delete, and merge operations across one
+//! or more column families and applies them atomically when
+//! [`Batch::commit`] is called. RocksDB guarantees that the
+//! operations in a single batch either all become visible to readers
+//! or none do.
 //!
 //! Batches are constructed from a [`Db`] via [`Db::batch`]. Each
 //! operation takes a [`DbMap`] handle whose key and value types are
 //! encoded into bytes using the crate's encoding traits before being
 //! handed to the underlying [`rocksdb::WriteBatch`].
+//!
+//! # Merge operations
+//!
+//! [`Batch::merge`] stages a merge operand against a key. The
+//! merge operator that combines the operand with any existing value
+//! is configured by the schema author on the column family's
+//! [`rocksdb::Options`] (returned from
+//! [`Schema::cfs`](crate::Schema::cfs)) at open time. RocksDB
+//! applies the operator lazily at read or compaction time; this
+//! crate simply forwards the bytes.
 //!
 //! # Examples
 //!
@@ -155,6 +166,53 @@ impl Batch {
         with_encode_buf(|buf| -> Result<(), Error> {
             key.encode_into(buf)?;
             self.inner.delete_cf(&cf, buf.as_slice());
+            Ok(())
+        })?;
+        Ok(self)
+    }
+
+    /// Stage a merge operand on the column family backing `map`.
+    ///
+    /// The encoded `operand` bytes are passed to the merge operator
+    /// the schema registered on this column family's
+    /// [`rocksdb::Options`] (via
+    /// [`set_merge_operator_associative`](rocksdb::Options::set_merge_operator_associative)
+    /// or
+    /// [`set_merge_operator`](rocksdb::Options::set_merge_operator))
+    /// at open time. The operator combines the operand with any
+    /// existing value at `key` lazily, at the next read or during
+    /// compaction; this method only stages the operand.
+    ///
+    /// `operand` is constrained to the column family's value type
+    /// `V`. Schemas whose merge semantics expect a different operand
+    /// type than the stored value should encode the operand into a
+    /// wrapper that round-trips through the same `Encode`
+    /// implementation (or split the column family).
+    ///
+    /// If the column family has no merge operator configured,
+    /// RocksDB rejects the batch at [`commit`](Self::commit) time
+    /// with a [`Error::Rocksdb`](crate::error::Error::Rocksdb).
+    pub fn merge<K, V>(
+        &mut self,
+        map: &DbMap<K, V>,
+        key: &K,
+        operand: &V,
+    ) -> Result<&mut Self, Error>
+    where
+        K: Encode,
+        V: Encode,
+    {
+        let cf = map
+            .db()
+            .cf_handle(map.cf_name())
+            .ok_or_else(|| Error::MissingColumnFamily(map.cf_name().to_string()))?;
+
+        with_encode_buf(|buf| -> Result<(), Error> {
+            key.encode_into(buf)?;
+            let k_end = buf.len();
+            operand.encode_into(buf)?;
+            let bytes = buf.as_slice();
+            self.inner.merge_cf(&cf, &bytes[..k_end], &bytes[k_end..]);
             Ok(())
         })?;
         Ok(self)
@@ -352,5 +410,137 @@ mod tests {
         let mut batch = db.batch();
         let err = batch.delete(&bad, &AlwaysFails).unwrap_err();
         assert!(matches!(err, Error::Encode(_)));
+    }
+
+    /// Associative merge operator that interprets each operand and
+    /// the existing value (if any) as eight big-endian bytes, sums
+    /// them with saturation, and writes the result back in the same
+    /// format. Operands and missing values that aren't exactly
+    /// eight bytes are skipped.
+    fn add_u64_merge_op(
+        _key: &[u8],
+        existing: Option<&[u8]>,
+        operands: &rocksdb::MergeOperands,
+    ) -> Option<Vec<u8>> {
+        let mut total: u64 = existing
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        for op in operands {
+            if let Ok(arr) = <[u8; 8]>::try_from(op) {
+                total = total.saturating_add(u64::from_be_bytes(arr));
+            }
+        }
+        Some(total.to_be_bytes().to_vec())
+    }
+
+    #[derive(Debug)]
+    struct MergeSchema {
+        counters: DbMap<U64Be, U64Be>,
+    }
+
+    impl Schema for MergeSchema {
+        fn cfs() -> Vec<(String, rocksdb::Options)> {
+            let mut counter_opts = rocksdb::Options::default();
+            counter_opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
+            vec![(String::from("counters"), counter_opts)]
+        }
+
+        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            Ok(Self {
+                counters: DbMap::new(db.clone(), "counters")?,
+            })
+        }
+    }
+
+    fn open_merge() -> (TempDir, Arc<Db>, MergeSchema) {
+        let dir = TempDir::new().unwrap();
+        let (db, schema) = Db::open::<MergeSchema>(dir.path(), DbOptions::default()).unwrap();
+        (dir, db, schema)
+    }
+
+    #[test]
+    fn merge_aggregates_via_registered_operator() {
+        let (_dir, db, schema) = open_merge();
+        let mut batch = db.batch();
+        batch
+            .merge(&schema.counters, &U64Be(1), &U64Be(10))
+            .unwrap();
+        batch
+            .merge(&schema.counters, &U64Be(1), &U64Be(20))
+            .unwrap();
+        batch.merge(&schema.counters, &U64Be(1), &U64Be(7)).unwrap();
+        batch.commit().unwrap();
+        assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(37)));
+    }
+
+    #[test]
+    fn merge_into_empty_key_starts_from_zero() {
+        let (_dir, db, schema) = open_merge();
+        let mut batch = db.batch();
+        batch
+            .merge(&schema.counters, &U64Be(1), &U64Be(42))
+            .unwrap();
+        batch.commit().unwrap();
+        assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(42)));
+    }
+
+    #[test]
+    fn merge_combines_with_prior_put() {
+        let (_dir, db, schema) = open_merge();
+        let mut batch = db.batch();
+        batch.put(&schema.counters, &U64Be(1), &U64Be(100)).unwrap();
+        batch.commit().unwrap();
+        let mut batch = db.batch();
+        batch
+            .merge(&schema.counters, &U64Be(1), &U64Be(50))
+            .unwrap();
+        batch.commit().unwrap();
+        assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(150)));
+    }
+
+    #[test]
+    fn merge_independent_keys_do_not_combine() {
+        let (_dir, db, schema) = open_merge();
+        let mut batch = db.batch();
+        batch
+            .merge(&schema.counters, &U64Be(1), &U64Be(10))
+            .unwrap();
+        batch
+            .merge(&schema.counters, &U64Be(2), &U64Be(20))
+            .unwrap();
+        batch.commit().unwrap();
+        assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
+        assert_eq!(schema.counters.get(&U64Be(2)).unwrap(), Some(U64Be(20)));
+    }
+
+    #[test]
+    fn merge_propagates_encode_error_for_key() {
+        let (_dir, db, _schema) = open_merge();
+        let bad: DbMap<AlwaysFails, U64Be> = DbMap::new(db.clone(), "counters").unwrap();
+        let mut batch = db.batch();
+        let err = batch.merge(&bad, &AlwaysFails, &U64Be(1)).unwrap_err();
+        assert!(matches!(err, Error::Encode(_)));
+    }
+
+    #[test]
+    fn merge_propagates_encode_error_for_operand() {
+        let (_dir, db, _schema) = open_merge();
+        let bad: DbMap<U64Be, AlwaysFails> = DbMap::new(db.clone(), "counters").unwrap();
+        let mut batch = db.batch();
+        let err = batch.merge(&bad, &U64Be(1), &AlwaysFails).unwrap_err();
+        assert!(matches!(err, Error::Encode(_)));
+    }
+
+    #[test]
+    fn merge_without_operator_errors_at_commit() {
+        // The default `items` CF in `TestSchema` does not have a
+        // merge operator. RocksDB rejects merges on it at write
+        // time.
+        let (_dir, db, schema) = open();
+        let mut batch = db.batch();
+        batch.merge(&schema.items, &U64Be(1), &U64Be(10)).unwrap();
+        let err = batch.commit().unwrap_err();
+        assert!(matches!(err, Error::Rocksdb(_)));
     }
 }
