@@ -227,6 +227,37 @@ impl Batch {
         self.db.rocksdb().write(self.inner)?;
         Ok(())
     }
+
+    /// Commit the staged operations atomically, with caller-supplied
+    /// [`rocksdb::WriteOptions`].
+    ///
+    /// Useful for tuning write durability and WAL behavior on a
+    /// per-batch basis (for example, disabling the WAL during a
+    /// bulk load, or forcing an `fsync` on a critical commit).
+    /// Defaults are appropriate for routine writes; consult the
+    /// RocksDB docs for trade-offs.
+    pub fn commit_opt(self, opts: rocksdb::WriteOptions) -> Result<(), Error> {
+        self.db.rocksdb().write_opt(self.inner, &opts)?;
+        Ok(())
+    }
+
+    /// Returns whether the batch has no staged operations.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns the number of staged operations.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns the size in bytes of the batch's serialized form.
+    ///
+    /// Useful for choosing when to flush a long-running batch
+    /// rather than risk an oversized commit.
+    pub fn size_in_bytes(&self) -> usize {
+        self.inner.size_in_bytes()
+    }
 }
 
 impl fmt::Debug for Batch {
@@ -355,6 +386,41 @@ mod tests {
     fn empty_batch_commits_without_error() {
         let (_dir, db, _schema) = open();
         db.batch().commit().unwrap();
+    }
+
+    #[test]
+    fn empty_batch_observability() {
+        let (_dir, db, _schema) = open();
+        let batch = db.batch();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        // The WriteBatch carries a small fixed header even when
+        // empty; what matters here is that adding operations grows
+        // the size. See `populated_batch_observability`.
+    }
+
+    #[test]
+    fn populated_batch_observability() {
+        let (_dir, db, schema) = open();
+        let empty_size = db.batch().size_in_bytes();
+        let mut batch = db.batch();
+        batch.put(&schema.items, &U64Be(1), &U64Be(10)).unwrap();
+        batch.put(&schema.items, &U64Be(2), &U64Be(20)).unwrap();
+        batch.delete(&schema.items, &U64Be(3)).unwrap();
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 3);
+        assert!(batch.size_in_bytes() > empty_size);
+    }
+
+    #[test]
+    fn commit_opt_respects_disable_wal_flag() {
+        let (_dir, db, schema) = open();
+        let mut batch = db.batch();
+        batch.put(&schema.items, &U64Be(1), &U64Be(10)).unwrap();
+        let mut wopts = rocksdb::WriteOptions::default();
+        wopts.disable_wal(true);
+        batch.commit_opt(wopts).unwrap();
+        assert_eq!(schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
     }
 
     #[test]
