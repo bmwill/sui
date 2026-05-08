@@ -117,6 +117,7 @@ use crate::iter::RevIter;
 use crate::iter::prefix_to_byte_bounds;
 use crate::iter::range_to_byte_bounds;
 use crate::map::DbMap;
+use crate::snapshot_view::SnapshotView;
 
 /// A cheap-to-clone handle to a single snapshot of the database.
 ///
@@ -145,6 +146,15 @@ impl SnapshotHandle {
     /// The checkpoint number this snapshot was taken at.
     pub fn checkpoint(&self) -> u64 {
         self.checkpoint
+    }
+
+    /// Bind this snapshot to a [`DbMap`] so subsequent reads can
+    /// drop the map argument.
+    ///
+    /// The returned [`SnapshotView`] is `Copy` and exposes the same
+    /// read and iteration surface as `DbMap`.
+    pub fn view<'s, K, V>(&'s self, map: &'s DbMap<K, V>) -> SnapshotView<'s, K, V> {
+        SnapshotView::new(self, map)
     }
 
     fn read_options(&self) -> ReadOptions {

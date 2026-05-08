@@ -140,6 +140,17 @@ struct PinnedOwner {
 }
 
 impl<K, V> DbMap<K, V> {
+    /// Pair this column-family handle with a [`SnapshotHandle`] to
+    /// produce a [`SnapshotView`] that reads through the snapshot
+    /// without taking the map as an argument on every call.
+    ///
+    /// Symmetric with
+    /// [`SnapshotHandle::view`](crate::SnapshotHandle::view); pick
+    /// whichever reads more naturally at the call site.
+    pub fn at<'s>(&'s self, snapshot: &'s crate::SnapshotHandle) -> crate::SnapshotView<'s, K, V> {
+        crate::SnapshotView::new(snapshot, self)
+    }
+
     /// Construct a typed handle for the column family named `cf_name`.
     ///
     /// Returns an [`OpenError`] if the named column family is not
