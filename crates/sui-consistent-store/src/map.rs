@@ -40,6 +40,7 @@
 
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -54,7 +55,8 @@ use crate::error::Error;
 use crate::error::OpenError;
 use crate::iter::Iter;
 use crate::iter::RevIter;
-use crate::iter::next_prefix;
+use crate::iter::prefix_to_byte_bounds;
+use crate::iter::range_to_byte_bounds;
 
 /// A typed handle to a single column family on a [`Db`].
 ///
@@ -363,23 +365,20 @@ where
 
 impl<K, V> DbMap<K, V>
 where
-    K: Decode,
+    K: Encode + Decode,
     V: Decode,
 {
-    /// Iterate forward over all entries in the column family in
-    /// lexicographic key order.
+    /// Iterate forward over the subset of entries whose keys fall
+    /// within `range`, in lexicographic key order.
     ///
-    /// Decode failures are reported as a per-item `Err`; the
-    /// iterator stops yielding after the first error.
-    pub fn iter(&self) -> Result<Iter<'_, K, V>, Error> {
-        self.iter_with_opts(ReadOptions::default())
-    }
-
-    pub(crate) fn iter_with_opts<'s>(&'s self, opts: ReadOptions) -> Result<Iter<'s, K, V>, Error> {
-        let cf = self.cf()?;
-        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
-        raw.seek_to_first();
-        Ok(Iter::new(raw))
+    /// Pass `..` for an unbounded scan, `start..end` for a half-open
+    /// range, `start..=end` for inclusive on both ends, or any other
+    /// [`RangeBounds<K>`] combination. Decode failures are reported
+    /// as a per-item `Err`; the iterator stops yielding after the
+    /// first error.
+    pub fn iter(&self, range: impl RangeBounds<K>) -> Result<Iter<'_, K, V>, Error> {
+        let (lower, upper) = range_to_byte_bounds(&range)?;
+        self.iter_forward(lower, upper, ReadOptions::default())
     }
 
     /// Iterate forward over the subset of entries whose keys, when
@@ -392,58 +391,61 @@ where
     /// it; see the [module-level docs](crate::iter) for an
     /// explanation and a worked example.
     pub fn iter_prefix(&self, prefix: &impl Encode) -> Result<Iter<'_, K, V>, Error> {
-        self.iter_prefix_with_opts(prefix, ReadOptions::default())
+        let (lower, upper) = prefix_to_byte_bounds(prefix)?;
+        self.iter_forward(lower, upper, ReadOptions::default())
     }
 
-    pub(crate) fn iter_prefix_with_opts<'s>(
-        &'s self,
-        prefix: &impl Encode,
-        mut opts: ReadOptions,
-    ) -> Result<Iter<'s, K, V>, Error> {
-        let cf = self.cf()?;
-        let prefix_bytes = prefix.encode()?;
-        if let Some(upper) = next_prefix(&prefix_bytes) {
-            opts.set_iterate_upper_bound(upper);
-        }
-        opts.set_iterate_lower_bound(prefix_bytes);
-        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
-        raw.seek_to_first();
-        Ok(Iter::new(raw))
-    }
-
-    /// Iterate in reverse lexicographic key order over all entries
-    /// in the column family.
-    pub fn iter_rev(&self) -> Result<RevIter<'_, K, V>, Error> {
-        self.iter_rev_with_opts(ReadOptions::default())
-    }
-
-    pub(crate) fn iter_rev_with_opts<'s>(
-        &'s self,
-        opts: ReadOptions,
-    ) -> Result<RevIter<'s, K, V>, Error> {
-        let cf = self.cf()?;
-        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
-        raw.seek_to_last();
-        Ok(RevIter::new(raw))
+    /// Iterate in reverse over the subset of entries whose keys fall
+    /// within `range`.
+    pub fn iter_rev(&self, range: impl RangeBounds<K>) -> Result<RevIter<'_, K, V>, Error> {
+        let (lower, upper) = range_to_byte_bounds(&range)?;
+        self.iter_reverse(lower, upper, ReadOptions::default())
     }
 
     /// Iterate in reverse over the subset of entries whose keys,
     /// when encoded, begin with `prefix`'s encoding.
     pub fn iter_rev_prefix(&self, prefix: &impl Encode) -> Result<RevIter<'_, K, V>, Error> {
-        self.iter_rev_prefix_with_opts(prefix, ReadOptions::default())
+        let (lower, upper) = prefix_to_byte_bounds(prefix)?;
+        self.iter_reverse(lower, upper, ReadOptions::default())
     }
 
-    pub(crate) fn iter_rev_prefix_with_opts<'s>(
+    /// Internal helper: forward iteration with caller-supplied byte
+    /// bounds and read options. All four public iteration methods
+    /// (and their snapshot-bound counterparts) funnel through here.
+    pub(crate) fn iter_forward<'s>(
         &'s self,
-        prefix: &impl Encode,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+        mut opts: ReadOptions,
+    ) -> Result<Iter<'s, K, V>, Error> {
+        if let Some(l) = lower {
+            opts.set_iterate_lower_bound(l);
+        }
+        if let Some(u) = upper {
+            opts.set_iterate_upper_bound(u);
+        }
+        let cf = self.cf()?;
+        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
+        raw.seek_to_first();
+        Ok(Iter::new(raw))
+    }
+
+    /// Internal helper: reverse iteration with caller-supplied byte
+    /// bounds and read options. The dual of
+    /// [`iter_forward`](Self::iter_forward).
+    pub(crate) fn iter_reverse<'s>(
+        &'s self,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
         mut opts: ReadOptions,
     ) -> Result<RevIter<'s, K, V>, Error> {
-        let cf = self.cf()?;
-        let prefix_bytes = prefix.encode()?;
-        if let Some(upper) = next_prefix(&prefix_bytes) {
-            opts.set_iterate_upper_bound(upper);
+        if let Some(l) = lower {
+            opts.set_iterate_lower_bound(l);
         }
-        opts.set_iterate_lower_bound(prefix_bytes);
+        if let Some(u) = upper {
+            opts.set_iterate_upper_bound(u);
+        }
+        let cf = self.cf()?;
         let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
         raw.seek_to_last();
         Ok(RevIter::new(raw))
@@ -631,7 +633,7 @@ mod tests {
         seed(&db, "items", &U64Be(3), &U64Be(30));
         seed(&db, "items", &U64Be(1), &U64Be(10));
         seed(&db, "items", &U64Be(2), &U64Be(20));
-        let collected: Vec<_> = schema.items.iter().unwrap().map(Result::unwrap).collect();
+        let collected: Vec<_> = schema.items.iter(..).unwrap().map(Result::unwrap).collect();
         assert_eq!(
             collected,
             vec![
@@ -645,7 +647,7 @@ mod tests {
     #[test]
     fn iter_on_empty_cf_yields_nothing() {
         let (_dir, _db, schema) = open();
-        assert_eq!(schema.items.iter().unwrap().count(), 0);
+        assert_eq!(schema.items.iter(..).unwrap().count(), 0);
     }
 
     #[test]
@@ -656,7 +658,7 @@ mod tests {
         seed(&db, "items", &U64Be(3), &U64Be(30));
         let collected: Vec<_> = schema
             .items
-            .iter_rev()
+            .iter_rev(..)
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -673,7 +675,7 @@ mod tests {
     #[test]
     fn iter_rev_on_empty_cf_yields_nothing() {
         let (_dir, _db, schema) = open();
-        assert_eq!(schema.items.iter_rev().unwrap().count(), 0);
+        assert_eq!(schema.items.iter_rev(..).unwrap().count(), 0);
     }
 
     #[test]
@@ -690,12 +692,127 @@ mod tests {
         db.rocksdb().put_cf(&cf, key_bytes, [0u8; 4]).unwrap();
         seed(&db, "items", &U64Be(4), &U64Be(40));
 
-        let mut iter = schema.items.iter().unwrap();
+        let mut iter = schema.items.iter(..).unwrap();
         assert_eq!(iter.next().unwrap().unwrap(), (U64Be(1), U64Be(10)));
         assert_eq!(iter.next().unwrap().unwrap(), (U64Be(2), U64Be(20)));
         assert!(matches!(iter.next(), Some(Err(Error::Decode(_)))));
         // Iterator must not yield further items after an error.
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_range_filters_by_typed_bounds() {
+        let (_dir, db, schema) = open();
+        for k in 1..=5 {
+            seed(&db, "items", &U64Be(k), &U64Be(k * 10));
+        }
+        let collected: Vec<_> = schema
+            .items
+            .iter(U64Be(2)..U64Be(5))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(collected, vec![U64Be(2), U64Be(3), U64Be(4)]);
+    }
+
+    #[test]
+    fn iter_range_inclusive_includes_end() {
+        let (_dir, db, schema) = open();
+        for k in 1..=5 {
+            seed(&db, "items", &U64Be(k), &U64Be(0));
+        }
+        let collected: Vec<_> = schema
+            .items
+            .iter(U64Be(2)..=U64Be(4))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(collected, vec![U64Be(2), U64Be(3), U64Be(4)]);
+    }
+
+    #[test]
+    fn iter_range_open_start_iterates_from_beginning() {
+        let (_dir, db, schema) = open();
+        for k in 1..=4 {
+            seed(&db, "items", &U64Be(k), &U64Be(0));
+        }
+        let collected: Vec<_> = schema
+            .items
+            .iter(..U64Be(3))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(collected, vec![U64Be(1), U64Be(2)]);
+    }
+
+    #[test]
+    fn iter_range_open_end_iterates_to_end() {
+        let (_dir, db, schema) = open();
+        for k in 1..=4 {
+            seed(&db, "items", &U64Be(k), &U64Be(0));
+        }
+        let collected: Vec<_> = schema
+            .items
+            .iter(U64Be(3)..)
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(collected, vec![U64Be(3), U64Be(4)]);
+    }
+
+    #[test]
+    fn iter_rev_range_filters_in_reverse() {
+        let (_dir, db, schema) = open();
+        for k in 1..=5 {
+            seed(&db, "items", &U64Be(k), &U64Be(0));
+        }
+        let collected: Vec<_> = schema
+            .items
+            .iter_rev(U64Be(2)..=U64Be(4))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(collected, vec![U64Be(4), U64Be(3), U64Be(2)]);
+    }
+
+    #[test]
+    fn iter_cursor_methods_expose_raw_state() {
+        let (_dir, db, schema) = open();
+        seed(&db, "items", &U64Be(1), &U64Be(10));
+        seed(&db, "items", &U64Be(2), &U64Be(20));
+        let mut iter = schema.items.iter(..).unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.raw_key().unwrap(), &1u64.to_be_bytes());
+        assert_eq!(iter.raw_value().unwrap(), &10u64.to_be_bytes());
+        // Step via the typed Iterator interface.
+        let _ = iter.next();
+        assert!(iter.valid());
+        assert_eq!(iter.raw_key().unwrap(), &2u64.to_be_bytes());
+    }
+
+    #[test]
+    fn iter_seek_repositions_cursor_to_byte_target() {
+        let (_dir, db, schema) = open();
+        seed(&db, "items", &U64Be(1), &U64Be(10));
+        seed(&db, "items", &U64Be(5), &U64Be(50));
+        seed(&db, "items", &U64Be(9), &U64Be(90));
+        let mut iter = schema.items.iter(..).unwrap();
+        // Seek to bytes for U64Be(5); next() should yield 5 then 9.
+        iter.seek(5u64.to_be_bytes());
+        let collected: Vec<_> = (&mut iter).map(|r| r.unwrap().0).collect();
+        assert_eq!(collected, vec![U64Be(5), U64Be(9)]);
+    }
+
+    #[test]
+    fn iter_skip_past_advances_past_prefix() {
+        let (_dir, db, schema) = open();
+        seed(&db, "items", &U64Be(1), &U64Be(10));
+        seed(&db, "items", &U64Be(5), &U64Be(50));
+        let mut iter = schema.items.iter(..).unwrap();
+        iter.skip_past(1u64.to_be_bytes());
+        // After skipping past key 1, only 5 remains.
+        let collected: Vec<_> = (&mut iter).map(|r| r.unwrap().0).collect();
+        assert_eq!(collected, vec![U64Be(5)]);
     }
 
     /// Compound key `(byte, u32 BE)` for prefix-iteration tests.
