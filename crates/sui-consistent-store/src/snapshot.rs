@@ -65,8 +65,8 @@
 //! }
 //!
 //! impl Schema for MySchema {
-//!     fn cfs() -> Vec<(String, rocksdb::Options)> {
-//!         vec![("items".to_string(), rocksdb::Options::default())]
+//!     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+//!         vec![("items", base_options.clone())]
 //!     }
 //!
 //!     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -300,8 +300,8 @@ mod tests {
     }
 
     impl Schema for TestSchema {
-        fn cfs() -> Vec<(String, rocksdb::Options)> {
-            vec![(String::from("items"), rocksdb::Options::default())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+            vec![("items", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -339,6 +339,46 @@ mod tests {
     fn at_snapshot_returns_none_when_no_snapshot_taken() {
         let (_dir, db, _schema) = open();
         assert!(db.at_snapshot(0).is_none());
+    }
+
+    #[test]
+    fn latest_snapshot_is_none_when_empty() {
+        let (_dir, db, _schema) = open();
+        assert!(db.latest_snapshot().is_none());
+    }
+
+    #[test]
+    fn latest_snapshot_returns_highest_checkpoint() {
+        let (_dir, db, _schema) = open();
+        db.take_snapshot(3);
+        db.take_snapshot(10);
+        db.take_snapshot(5);
+        let latest = db.latest_snapshot().expect("latest should exist");
+        assert_eq!(latest.checkpoint(), 10);
+    }
+
+    #[test]
+    fn latest_snapshot_after_eviction_reflects_remaining() {
+        let (_dir, db, _schema) = open_with_capacity(2);
+        db.take_snapshot(1);
+        db.take_snapshot(2);
+        db.take_snapshot(3);
+        // Capacity 2 evicts checkpoint 1; latest is now 3.
+        let latest = db.latest_snapshot().expect("latest should exist");
+        assert_eq!(latest.checkpoint(), 3);
+    }
+
+    #[test]
+    fn latest_snapshot_reads_pre_snapshot_state() {
+        let (_dir, db, schema) = open();
+        put(&db, &schema, 1, 100);
+        db.take_snapshot(1);
+        put(&db, &schema, 1, 999);
+        let latest = db.latest_snapshot().unwrap();
+        assert_eq!(
+            latest.get(&schema.items, &U64Be(1)).unwrap(),
+            Some(U64Be(100)),
+        );
     }
 
     #[test]

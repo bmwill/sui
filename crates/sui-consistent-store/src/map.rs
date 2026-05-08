@@ -100,8 +100,8 @@ use crate::iter::next_prefix;
 /// }
 ///
 /// impl Schema for MySchema {
-///     fn cfs() -> Vec<(String, rocksdb::Options)> {
-///         vec![("items".to_string(), rocksdb::Options::default())]
+///     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+///         vec![("items", base_options.clone())]
 ///     }
 ///
 ///     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -514,8 +514,8 @@ mod tests {
     }
 
     impl Schema for TestSchema {
-        fn cfs() -> Vec<(String, rocksdb::Options)> {
-            vec![(String::from("items"), rocksdb::Options::default())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+            vec![("items", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -743,8 +743,8 @@ mod tests {
     }
 
     impl Schema for CompoundSchema {
-        fn cfs() -> Vec<(String, rocksdb::Options)> {
-            vec![(String::from("rows"), rocksdb::Options::default())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+            vec![("rows", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {

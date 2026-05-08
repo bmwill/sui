@@ -63,8 +63,8 @@
 //! }
 //!
 //! impl Schema for MySchema {
-//!     fn cfs() -> Vec<(String, rocksdb::Options)> {
-//!         vec![("items".to_string(), rocksdb::Options::default())]
+//!     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+//!         vec![("items", base_options.clone())]
 //!     }
 //!
 //!     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -299,10 +299,10 @@ mod tests {
     }
 
     impl Schema for TestSchema {
-        fn cfs() -> Vec<(String, rocksdb::Options)> {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
             vec![
-                (String::from("items"), rocksdb::Options::default()),
-                (String::from("other"), rocksdb::Options::default()),
+                ("items", base_options.clone()),
+                ("other", base_options.clone()),
             ]
         }
 
@@ -440,10 +440,10 @@ mod tests {
     }
 
     impl Schema for MergeSchema {
-        fn cfs() -> Vec<(String, rocksdb::Options)> {
-            let mut counter_opts = rocksdb::Options::default();
+        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+            let mut counter_opts = base_options.clone();
             counter_opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
-            vec![(String::from("counters"), counter_opts)]
+            vec![("counters", counter_opts)]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {

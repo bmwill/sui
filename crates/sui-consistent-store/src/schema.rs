@@ -26,8 +26,8 @@
 //! }
 //!
 //! impl Schema for MySchema {
-//!     fn cfs() -> Vec<(String, rocksdb::Options)> {
-//!         vec![("my_cf".to_string(), rocksdb::Options::default())]
+//!     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+//!         vec![("my_cf", base_options.clone())]
 //!     }
 //!
 //!     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -52,18 +52,27 @@ use crate::error::OpenError;
 ///
 /// - [`cfs`](Self::cfs) returns the column families this schema
 ///   requires, with per-CF [`rocksdb::Options`]. It is called once at
-///   open time. The order of entries does not matter.
+///   open time, with the database-level base options as input. The
+///   order of entries does not matter.
 /// - [`open`](Self::open) constructs the schema struct against an
 ///   already-opened database. Each column family named by `cfs()` is
 ///   guaranteed to exist on the database before this is called.
 pub trait Schema: Sized {
     /// The column families this schema requires.
     ///
-    /// Each entry is a column-family name and its [`rocksdb::Options`]
-    /// applied at create time. The default column family (`"default"`)
-    /// is registered automatically by [`Db::open`] and need not be
-    /// included here, though including it is harmless.
-    fn cfs() -> Vec<(String, rocksdb::Options)>;
+    /// Each entry is a column-family name (a `&'static str` so the
+    /// schema's CF set is fixed at compile time) and its
+    /// [`rocksdb::Options`] applied at create time. `base_options` is
+    /// supplied by [`Db::open`] and is the database-level options
+    /// configured on [`DbOptions::db_options`](crate::DbOptions::db_options);
+    /// implementations typically clone it as the starting point for
+    /// each CF and layer per-CF tweaks (merge operators, compaction
+    /// filters, custom block sizes) on top.
+    ///
+    /// The default column family (`"default"`) is registered
+    /// automatically by [`Db::open`] and need not be included here,
+    /// though including it is harmless.
+    fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)>;
 
     /// Construct the schema struct against `db`.
     ///
