@@ -121,6 +121,57 @@ impl DecodeError {
     }
 }
 
+/// An error returned when opening a database.
+///
+/// Carries a free-form message and an optional source error. Most
+/// underlying failures (`rocksdb::Error`, schema construction errors,
+/// and so on) are exposed via the source chain.
+///
+/// # Examples
+///
+/// ```
+/// use sui_consistent_store::error::OpenError;
+///
+/// let e = OpenError::msg("database directory missing");
+/// assert_eq!(e.to_string(), "open failed: database directory missing");
+/// ```
+#[derive(Debug)]
+pub struct OpenError(Box<OpenErrorInner>);
+
+#[derive(Debug)]
+struct OpenErrorInner {
+    message: Cow<'static, str>,
+    source: Option<DynError>,
+}
+
+impl OpenError {
+    /// Construct an error from a message alone.
+    pub fn msg(message: impl Into<Cow<'static, str>>) -> Self {
+        Self(Box::new(OpenErrorInner {
+            message: message.into(),
+            source: None,
+        }))
+    }
+
+    /// Construct an error with a message and an underlying source.
+    ///
+    /// The source is exposed via [`std::error::Error::source`] so that
+    /// callers walking the error chain can recover the original
+    /// failure.
+    pub fn with_source(message: impl Into<Cow<'static, str>>, source: impl Into<DynError>) -> Self {
+        Self(Box::new(OpenErrorInner {
+            message: message.into(),
+            source: Some(source.into()),
+        }))
+    }
+}
+
+impl From<rocksdb::Error> for OpenError {
+    fn from(err: rocksdb::Error) -> Self {
+        Self::with_source("rocksdb operation failed", err)
+    }
+}
+
 impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "encode failed: {}", self.0.message)
@@ -130,6 +181,12 @@ impl fmt::Display for EncodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "decode failed: {}", self.0.message)
+    }
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "open failed: {}", self.0.message)
     }
 }
 
@@ -143,6 +200,15 @@ impl Error for EncodeError {
 }
 
 impl Error for DecodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.0
+            .source
+            .as_deref()
+            .map(|e| e as &(dyn Error + 'static))
+    }
+}
+
+impl Error for OpenError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.0
             .source
@@ -213,5 +279,27 @@ mod tests {
         let borrowed = DecodeError::msg("static");
         assert_eq!(owned.to_string(), "decode failed: owned");
         assert_eq!(borrowed.to_string(), "decode failed: static");
+    }
+
+    #[test]
+    fn open_error_size_is_one_pointer() {
+        assert_eq!(
+            std::mem::size_of::<OpenError>(),
+            std::mem::size_of::<usize>(),
+        );
+    }
+
+    #[test]
+    fn open_error_display() {
+        let e = OpenError::msg("missing path");
+        assert_eq!(e.to_string(), "open failed: missing path");
+    }
+
+    #[test]
+    fn open_error_source_chain() {
+        let inner = io::Error::other("disk full");
+        let e = OpenError::with_source("wrapper", inner);
+        let src = Error::source(&e).expect("source should be set");
+        assert_eq!(src.to_string(), "disk full");
     }
 }
