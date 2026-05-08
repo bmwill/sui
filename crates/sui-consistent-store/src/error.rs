@@ -8,11 +8,11 @@
 //! payload is allocated only when an error actually occurs.
 
 use std::borrow::Cow;
-use std::error::Error;
+use std::error::Error as StdError;
 use std::fmt;
 
 /// Type-erased dynamic error used as the source on error chains.
-type DynError = Box<dyn Error + Send + Sync + 'static>;
+type DynError = Box<dyn StdError + Send + Sync + 'static>;
 
 /// An error returned by [`Encode::encode_into`].
 ///
@@ -82,7 +82,7 @@ impl EncodeError {
     /// # Examples
     ///
     /// ```
-    /// use std::error::Error;
+    /// use std::error::Error as StdError;
     /// use std::io;
     ///
     /// use sui_consistent_store::error::EncodeError;
@@ -190,31 +190,67 @@ impl fmt::Display for OpenError {
     }
 }
 
-impl Error for EncodeError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl StdError for EncodeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         self.0
             .source
             .as_deref()
-            .map(|e| e as &(dyn Error + 'static))
+            .map(|e| e as &(dyn StdError + 'static))
     }
 }
 
-impl Error for DecodeError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl StdError for DecodeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         self.0
             .source
             .as_deref()
-            .map(|e| e as &(dyn Error + 'static))
+            .map(|e| e as &(dyn StdError + 'static))
     }
 }
 
-impl Error for OpenError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl StdError for OpenError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         self.0
             .source
             .as_deref()
-            .map(|e| e as &(dyn Error + 'static))
+            .map(|e| e as &(dyn StdError + 'static))
     }
+}
+
+/// Top-level error type returned by database operations.
+///
+/// This is the error type exposed by the read and write methods on
+/// typed column-family handles. Each variant wraps a more specific
+/// failure mode and can be matched on directly.
+///
+/// # Examples
+///
+/// ```
+/// use sui_consistent_store::error::DecodeError;
+/// use sui_consistent_store::error::Error;
+///
+/// let e: Error = DecodeError::msg("bad bytes").into();
+/// assert!(matches!(e, Error::Decode(_)));
+/// ```
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// A key or value could not be encoded.
+    #[error(transparent)]
+    Encode(#[from] EncodeError),
+
+    /// A value could not be decoded after a successful read.
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+
+    /// The underlying RocksDB operation failed.
+    #[error(transparent)]
+    Rocksdb(#[from] rocksdb::Error),
+
+    /// A column family expected by a typed handle is not registered
+    /// on the database. This indicates a programmer error in the
+    /// schema definition or in `DbMap` construction.
+    #[error("column family `{0}` is not registered")]
+    MissingColumnFamily(String),
 }
 
 #[cfg(test)]
@@ -255,7 +291,7 @@ mod tests {
     fn encode_error_source_chain() {
         let inner = io::Error::other("underlying");
         let e = EncodeError::with_source("wrapper", inner);
-        let src = Error::source(&e).expect("source should be set");
+        let src = StdError::source(&e).expect("source should be set");
         assert_eq!(src.to_string(), "underlying");
     }
 
@@ -263,14 +299,14 @@ mod tests {
     fn decode_error_source_chain() {
         let inner = io::Error::new(io::ErrorKind::InvalidData, "bad bytes");
         let e = DecodeError::with_source("wrapper", inner);
-        let src = Error::source(&e).expect("source should be set");
+        let src = StdError::source(&e).expect("source should be set");
         assert_eq!(src.to_string(), "bad bytes");
     }
 
     #[test]
     fn encode_error_no_source_when_msg_only() {
         let e = EncodeError::msg("alone");
-        assert!(Error::source(&e).is_none());
+        assert!(StdError::source(&e).is_none());
     }
 
     #[test]
@@ -299,7 +335,7 @@ mod tests {
     fn open_error_source_chain() {
         let inner = io::Error::other("disk full");
         let e = OpenError::with_source("wrapper", inner);
-        let src = Error::source(&e).expect("source should be set");
+        let src = StdError::source(&e).expect("source should be set");
         assert_eq!(src.to_string(), "disk full");
     }
 }

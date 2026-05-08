@@ -4,18 +4,22 @@
 //! Foundational, type-safe wrapper around RocksDB for Sui's on-disk
 //! indexes.
 //!
-//! See `PLAN.md` at the crate root for the design and the implementation
-//! roadmap. The crate is in active build-out; the encoding traits and
-//! the database wrapper land first, followed by typed column-family
-//! access, batched writes, iteration, and the in-memory snapshot model.
+//! See `PLAN.md` at the crate root for the design and the
+//! implementation roadmap. The crate is in active build-out: the
+//! encoding traits, the database wrapper, and typed point reads have
+//! landed; batched writes, iteration, and the in-memory snapshot
+//! model follow.
 
 pub mod db;
 pub mod encode;
+mod encode_buf;
 pub mod error;
+pub mod map;
 pub mod schema;
 
 pub use crate::db::Db;
 pub use crate::db::DbOptions;
 pub use crate::encode::Decode;
 pub use crate::encode::Encode;
+pub use crate::map::DbMap;
 pub use crate::schema::Schema;
