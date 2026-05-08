@@ -3,12 +3,24 @@
 
 //! Typed column-family handles.
 //!
-//! [`DbMap<K, V>`] is the primary read and write surface in the
+//! [`DbMap<K, V, R>`] is the primary read and write surface in the
 //! crate. Each instance is tied to a single column family on an
-//! [`Arc<Db>`] and to a key type and a value type that implement the
-//! crate's encoding traits. Schemas are typically structs of `DbMap`
-//! fields; see the [`Schema`](crate::Schema) trait for the
-//! construction pattern.
+//! [`Arc<Db>`] (carried by the reader), to a key type and a value
+//! type that implement the crate's encoding traits, and to a
+//! [`Reader`] that pins the consistency context.
+//!
+//! # The reader parameter
+//!
+//! `R` defaults to [`Live`], so today's call sites
+//! (`DbMap::new(db, "items")`, schemas opened via
+//! [`Db::open`](crate::Db::open)) work unchanged. To re-bind a map at
+//! a captured snapshot, call [`DbMap::at`]; for the whole-schema
+//! equivalent see
+//! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at).
+//!
+//! Schemas are typically structs of `DbMap` fields parameterized by
+//! `R`; see the [`Schema`](crate::Schema) trait for the construction
+//! pattern.
 //!
 //! # Reading
 //!
@@ -22,9 +34,9 @@
 //!   [`bytes::Bytes`]. The `Bytes` is backed zero-copy by the
 //!   RocksDB block cache where possible (cache hits) and by an
 //!   internal copy where not (memtable hits, merge results,
-//!   wide-column values). The handle co-owns the [`Arc<Db>`] so it
-//!   is sound to hold the `Bytes` past the borrow it was read
-//!   through.
+//!   wide-column values). The handle co-owns the [`Arc<Db>`] (via
+//!   the reader) so it is sound to hold the `Bytes` past the borrow
+//!   it was read through.
 //!
 //! Both methods have batched counterparts ([`DbMap::multi_get`] and
 //! [`DbMap::multi_get_raw`]) that issue a single RocksDB
@@ -45,7 +57,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use rocksdb::DBPinnableSlice;
-use rocksdb::ReadOptions;
 
 use crate::Decode;
 use crate::Encode;
@@ -57,11 +68,17 @@ use crate::iter::Iter;
 use crate::iter::RevIter;
 use crate::iter::prefix_to_byte_bounds;
 use crate::iter::range_to_byte_bounds;
+use crate::reader::Live;
+use crate::reader::Reader;
+use crate::reader::Snapshot;
+use crate::snapshot::SnapshotHandle;
 
-/// A typed handle to a single column family on a [`Db`].
+/// A typed handle to a single column family on a [`Db`], bound to a
+/// [`Reader`] that pins its consistency context.
 ///
-/// Construct one with [`DbMap::new`], typically inside a schema's
-/// [`Schema::open`](crate::Schema::open) implementation.
+/// Construct a live-tip handle with [`DbMap::new`], typically inside a
+/// schema's [`Schema::open`](crate::Schema::open) implementation. Re-bind
+/// at a snapshot via [`DbMap::at`].
 ///
 /// # Examples
 ///
@@ -73,6 +90,8 @@ use crate::iter::range_to_byte_bounds;
 /// use sui_consistent_store::DbOptions;
 /// use sui_consistent_store::Decode;
 /// use sui_consistent_store::Encode;
+/// use sui_consistent_store::Live;
+/// use sui_consistent_store::Reader;
 /// use sui_consistent_store::Schema;
 /// use sui_consistent_store::error::DecodeError;
 /// use sui_consistent_store::error::EncodeError;
@@ -97,11 +116,11 @@ use crate::iter::range_to_byte_bounds;
 ///     }
 /// }
 ///
-/// struct MySchema {
-///     items: DbMap<U64Be, U64Be>,
+/// struct MySchema<R: Reader = Live> {
+///     items: DbMap<U64Be, U64Be, R>,
 /// }
 ///
-/// impl Schema for MySchema {
+/// impl Schema for MySchema<Live> {
 ///     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
 ///         vec![("items", base_options.clone())]
 ///     }
@@ -119,8 +138,8 @@ use crate::iter::range_to_byte_bounds;
 /// assert!(schema.items.get(&U64Be(1)).unwrap().is_none());
 /// ```
 #[derive(Debug)]
-pub struct DbMap<K, V> {
-    db: Arc<Db>,
+pub struct DbMap<K, V, R: Reader = Live> {
+    reader: R,
     cf_name: Box<str>,
     _data: PhantomData<fn(K) -> V>,
 }
@@ -139,25 +158,20 @@ struct PinnedOwner {
     _db: Arc<Db>,
 }
 
-impl<K, V> DbMap<K, V> {
-    /// Pair this column-family handle with a [`SnapshotHandle`] to
-    /// produce a [`SnapshotView`] that reads through the snapshot
-    /// without taking the map as an argument on every call.
-    ///
-    /// Symmetric with
-    /// [`SnapshotHandle::view`](crate::SnapshotHandle::view); pick
-    /// whichever reads more naturally at the call site.
-    pub fn at<'s>(&'s self, snapshot: &'s crate::SnapshotHandle) -> crate::SnapshotView<'s, K, V> {
-        crate::SnapshotView::new(snapshot, self)
-    }
-
-    /// Construct a typed handle for the column family named `cf_name`.
+impl<K, V> DbMap<K, V, Live> {
+    /// Construct a typed handle for the column family named `cf_name`
+    /// at the database's live tip.
     ///
     /// Returns an [`OpenError`] if the named column family is not
     /// registered on `db`. Construction is the only place where a
     /// missing column family is reported as an open-time error;
     /// subsequent operations report it as
     /// [`Error::MissingColumnFamily`](crate::error::Error::MissingColumnFamily).
+    ///
+    /// To bind to a snapshot instead, construct via this method and
+    /// then call [`DbMap::at`] (or use
+    /// [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) for the
+    /// whole-schema equivalent).
     pub fn new(db: Arc<Db>, cf_name: impl Into<Box<str>>) -> Result<Self, OpenError> {
         let cf_name = cf_name.into();
         if db.cf_handle(&cf_name).is_none() {
@@ -166,14 +180,34 @@ impl<K, V> DbMap<K, V> {
             )));
         }
         Ok(Self {
-            db,
+            reader: Live::new(db),
             cf_name,
             _data: PhantomData,
         })
     }
+}
+
+impl<K, V, R: Reader> DbMap<K, V, R> {
+    /// Re-bind this handle at a captured snapshot.
+    ///
+    /// Returns a new [`DbMap`] whose reader is
+    /// [`Snapshot<'s>`](crate::Snapshot), so subsequent reads see
+    /// the database state at the snapshot's checkpoint regardless
+    /// of writes that occurred after [`Db::take_snapshot`](crate::Db::take_snapshot)
+    /// was called. The returned handle owns its column-family name
+    /// (a `Box<str>` clone) and borrows from `snap` for the snapshot
+    /// reader.
+    pub fn at<'s>(&self, snap: &'s SnapshotHandle) -> DbMap<K, V, Snapshot<'s>> {
+        DbMap {
+            reader: Snapshot::new(snap),
+            cf_name: self.cf_name.clone(),
+            _data: PhantomData,
+        }
+    }
 
     fn cf(&self) -> Result<Arc<rocksdb::BoundColumnFamily<'_>>, Error> {
-        self.db
+        self.reader
+            .db()
             .cf_handle(&self.cf_name)
             .ok_or_else(|| Error::MissingColumnFamily(self.cf_name.to_string()))
     }
@@ -182,7 +216,7 @@ impl<K, V> DbMap<K, V> {
     /// `Batch` to look up the same column family the handle points
     /// at.
     pub(crate) fn db(&self) -> &Arc<Db> {
-        &self.db
+        self.reader.db()
     }
 
     /// The name of the column family this handle is bound to.
@@ -191,7 +225,7 @@ impl<K, V> DbMap<K, V> {
     }
 }
 
-impl<K, V> DbMap<K, V>
+impl<K, V, R: Reader> DbMap<K, V, R>
 where
     K: Encode,
     V: Decode,
@@ -203,21 +237,15 @@ where
     /// read path so that block-cache hits avoid the extra heap
     /// allocation that `DB::get` would do.
     pub fn get(&self, key: &K) -> Result<Option<V>, Error> {
-        self.get_with_opts(key, &ReadOptions::default())
-    }
-
-    /// Internal helper that performs the read with caller-supplied
-    /// [`ReadOptions`]. Used by both [`Self::get`] (with default
-    /// options) and snapshot-bound reads (which pass options with a
-    /// snapshot set).
-    pub(crate) fn get_with_opts(&self, key: &K, opts: &ReadOptions) -> Result<Option<V>, Error> {
+        let opts = self.reader.read_options();
         let cf = self.cf()?;
         with_encode_buf(|buf| {
             key.encode_into(buf)?;
             let pinned = self
-                .db
+                .reader
+                .db()
                 .rocksdb()
-                .get_pinned_cf_opt(&cf, buf.as_slice(), opts)?;
+                .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
             match pinned {
                 Some(slice) => Ok(Some(V::decode(&slice)?)),
                 None => Ok(None),
@@ -238,19 +266,8 @@ where
         I: IntoIterator<Item = &'k K>,
         K: 'k,
     {
-        self.multi_get_with_opts(keys, &ReadOptions::default())
-    }
-
-    pub(crate) fn multi_get_with_opts<'k, I>(
-        &self,
-        keys: I,
-        opts: &ReadOptions,
-    ) -> Result<Vec<Result<Option<V>, Error>>, Error>
-    where
-        I: IntoIterator<Item = &'k K>,
-        K: 'k,
-    {
         let keys: Vec<&K> = keys.into_iter().collect();
+        let opts = self.reader.read_options();
         let cf = self.cf()?;
 
         with_encode_buf(|buf| {
@@ -268,9 +285,10 @@ where
                 .collect();
 
             let raw_results = self
-                .db
+                .reader
+                .db()
                 .rocksdb()
-                .batched_multi_get_cf_opt(&cf, key_slices, false, opts);
+                .batched_multi_get_cf_opt(&cf, key_slices, false, &opts);
 
             let decoded = raw_results
                 .into_iter()
@@ -285,7 +303,7 @@ where
     }
 }
 
-impl<K, V> DbMap<K, V>
+impl<K, V, R: Reader> DbMap<K, V, R>
 where
     K: Encode,
 {
@@ -298,22 +316,16 @@ where
     /// way, the `Bytes` co-owns the underlying [`Arc<Db>`] so it can
     /// outlive any borrow this method was called through.
     pub fn get_raw(&self, key: &K) -> Result<Option<Bytes>, Error> {
-        self.get_raw_with_opts(key, &ReadOptions::default())
-    }
-
-    pub(crate) fn get_raw_with_opts(
-        &self,
-        key: &K,
-        opts: &ReadOptions,
-    ) -> Result<Option<Bytes>, Error> {
+        let opts = self.reader.read_options();
         let cf = self.cf()?;
         with_encode_buf(|buf| {
             key.encode_into(buf)?;
             let pinned = self
-                .db
+                .reader
+                .db()
                 .rocksdb()
-                .get_pinned_cf_opt(&cf, buf.as_slice(), opts)?;
-            Ok(pinned.map(|slice| pinned_to_bytes(self.db.clone(), slice)))
+                .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
+            Ok(pinned.map(|slice| pinned_to_bytes(self.reader.db().clone(), slice)))
         })
     }
 
@@ -327,84 +339,8 @@ where
         I: IntoIterator<Item = &'k K>,
         K: 'k,
     {
-        self.multi_get_raw_with_opts(keys, &ReadOptions::default())
-    }
-
-    /// Test whether `key` is present in the column family.
-    ///
-    /// Returns `Ok(true)` if a value exists at `key`, `Ok(false)`
-    /// otherwise. Internally short-circuits via RocksDB's
-    /// `key_may_exist_cf` bloom-filter fast path: if RocksDB
-    /// definitively reports the key is absent we return `false`
-    /// without touching disk; otherwise we confirm with a pinned
-    /// read.
-    pub fn contains_key(&self, key: &K) -> Result<bool, Error> {
-        self.contains_key_with_opts(key, &ReadOptions::default())
-    }
-
-    pub(crate) fn contains_key_with_opts(
-        &self,
-        key: &K,
-        opts: &ReadOptions,
-    ) -> Result<bool, Error> {
-        let cf = self.cf()?;
-        with_encode_buf(|buf| -> Result<bool, Error> {
-            key.encode_into(buf)?;
-            // Bloom-filter fast path. A `false` here is definitive;
-            // a `true` is "may exist" and needs confirming.
-            if !self
-                .db
-                .rocksdb()
-                .key_may_exist_cf_opt(&cf, buf.as_slice(), opts)
-            {
-                return Ok(false);
-            }
-            let pinned = self
-                .db
-                .rocksdb()
-                .get_pinned_cf_opt(&cf, buf.as_slice(), opts)?;
-            Ok(pinned.is_some())
-        })
-    }
-
-    /// Batched counterpart to [`contains_key`](Self::contains_key).
-    ///
-    /// Issues one RocksDB `batched_multi_get_cf` for all the keys.
-    /// Per-key encoding errors abort the entire batch; per-key read
-    /// failures surface as the outer `Err`.
-    pub fn multi_contains_keys<'k, I>(&self, keys: I) -> Result<Vec<bool>, Error>
-    where
-        I: IntoIterator<Item = &'k K>,
-        K: 'k,
-    {
-        self.multi_contains_keys_with_opts(keys, &ReadOptions::default())
-    }
-
-    pub(crate) fn multi_contains_keys_with_opts<'k, I>(
-        &self,
-        keys: I,
-        opts: &ReadOptions,
-    ) -> Result<Vec<bool>, Error>
-    where
-        I: IntoIterator<Item = &'k K>,
-        K: 'k,
-    {
-        let raw = self.multi_get_raw_with_opts(keys, opts)?;
-        raw.into_iter()
-            .map(|r| r.map(|opt| opt.is_some()))
-            .collect()
-    }
-
-    pub(crate) fn multi_get_raw_with_opts<'k, I>(
-        &self,
-        keys: I,
-        opts: &ReadOptions,
-    ) -> Result<Vec<Result<Option<Bytes>, Error>>, Error>
-    where
-        I: IntoIterator<Item = &'k K>,
-        K: 'k,
-    {
         let keys: Vec<&K> = keys.into_iter().collect();
+        let opts = self.reader.read_options();
         let cf = self.cf()?;
 
         with_encode_buf(|buf| {
@@ -422,14 +358,15 @@ where
                 .collect();
 
             let raw_results = self
-                .db
+                .reader
+                .db()
                 .rocksdb()
-                .batched_multi_get_cf_opt(&cf, key_slices, false, opts);
+                .batched_multi_get_cf_opt(&cf, key_slices, false, &opts);
 
             let mapped = raw_results
                 .into_iter()
                 .map(|r| match r {
-                    Ok(Some(slice)) => Ok(Some(pinned_to_bytes(self.db.clone(), slice))),
+                    Ok(Some(slice)) => Ok(Some(pinned_to_bytes(self.reader.db().clone(), slice))),
                     Ok(None) => Ok(None),
                     Err(e) => Err(Error::Rocksdb(e)),
                 })
@@ -437,9 +374,57 @@ where
             Ok(mapped)
         })
     }
+
+    /// Test whether `key` is present in the column family.
+    ///
+    /// Returns `Ok(true)` if a value exists at `key`, `Ok(false)`
+    /// otherwise. Internally short-circuits via RocksDB's
+    /// `key_may_exist_cf` bloom-filter fast path: if RocksDB
+    /// definitively reports the key is absent we return `false`
+    /// without touching disk; otherwise we confirm with a pinned
+    /// read.
+    pub fn contains_key(&self, key: &K) -> Result<bool, Error> {
+        let opts = self.reader.read_options();
+        let cf = self.cf()?;
+        with_encode_buf(|buf| -> Result<bool, Error> {
+            key.encode_into(buf)?;
+            // Bloom-filter fast path. A `false` here is definitive;
+            // a `true` is "may exist" and needs confirming.
+            if !self
+                .reader
+                .db()
+                .rocksdb()
+                .key_may_exist_cf_opt(&cf, buf.as_slice(), &opts)
+            {
+                return Ok(false);
+            }
+            let pinned = self
+                .reader
+                .db()
+                .rocksdb()
+                .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
+            Ok(pinned.is_some())
+        })
+    }
+
+    /// Batched counterpart to [`contains_key`](Self::contains_key).
+    ///
+    /// Issues one RocksDB `batched_multi_get_cf` for all the keys.
+    /// Per-key encoding errors abort the entire batch; per-key read
+    /// failures surface as the outer `Err`.
+    pub fn multi_contains_keys<'k, I>(&self, keys: I) -> Result<Vec<bool>, Error>
+    where
+        I: IntoIterator<Item = &'k K>,
+        K: 'k,
+    {
+        let raw = self.multi_get_raw(keys)?;
+        raw.into_iter()
+            .map(|r| r.map(|opt| opt.is_some()))
+            .collect()
+    }
 }
 
-impl<K, V> DbMap<K, V>
+impl<K, V, R: Reader> DbMap<K, V, R>
 where
     K: Encode + Decode,
     V: Decode,
@@ -454,7 +439,7 @@ where
     /// first error.
     pub fn iter(&self, range: impl RangeBounds<K>) -> Result<Iter<'_, K, V>, Error> {
         let (lower, upper) = range_to_byte_bounds(&range)?;
-        self.iter_forward(lower, upper, ReadOptions::default())
+        self.iter_forward(lower, upper)
     }
 
     /// Iterate forward over the subset of entries whose keys, when
@@ -468,32 +453,32 @@ where
     /// explanation and a worked example.
     pub fn iter_prefix(&self, prefix: &impl Encode) -> Result<Iter<'_, K, V>, Error> {
         let (lower, upper) = prefix_to_byte_bounds(prefix)?;
-        self.iter_forward(lower, upper, ReadOptions::default())
+        self.iter_forward(lower, upper)
     }
 
     /// Iterate in reverse over the subset of entries whose keys fall
     /// within `range`.
     pub fn iter_rev(&self, range: impl RangeBounds<K>) -> Result<RevIter<'_, K, V>, Error> {
         let (lower, upper) = range_to_byte_bounds(&range)?;
-        self.iter_reverse(lower, upper, ReadOptions::default())
+        self.iter_reverse(lower, upper)
     }
 
     /// Iterate in reverse over the subset of entries whose keys,
     /// when encoded, begin with `prefix`'s encoding.
     pub fn iter_rev_prefix(&self, prefix: &impl Encode) -> Result<RevIter<'_, K, V>, Error> {
         let (lower, upper) = prefix_to_byte_bounds(prefix)?;
-        self.iter_reverse(lower, upper, ReadOptions::default())
+        self.iter_reverse(lower, upper)
     }
 
     /// Internal helper: forward iteration with caller-supplied byte
-    /// bounds and read options. All four public iteration methods
-    /// (and their snapshot-bound counterparts) funnel through here.
-    pub(crate) fn iter_forward<'s>(
+    /// bounds. Both range and prefix entry points funnel through
+    /// here.
+    fn iter_forward<'s>(
         &'s self,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
-        mut opts: ReadOptions,
     ) -> Result<Iter<'s, K, V>, Error> {
+        let mut opts = self.reader.read_options();
         if let Some(l) = lower {
             opts.set_iterate_lower_bound(l);
         }
@@ -501,20 +486,19 @@ where
             opts.set_iterate_upper_bound(u);
         }
         let cf = self.cf()?;
-        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
+        let mut raw = self.reader.db().rocksdb().raw_iterator_cf_opt(&cf, opts);
         raw.seek_to_first();
         Ok(Iter::new(raw))
     }
 
     /// Internal helper: reverse iteration with caller-supplied byte
-    /// bounds and read options. The dual of
-    /// [`iter_forward`](Self::iter_forward).
-    pub(crate) fn iter_reverse<'s>(
+    /// bounds. The dual of [`iter_forward`](Self::iter_forward).
+    fn iter_reverse<'s>(
         &'s self,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
-        mut opts: ReadOptions,
     ) -> Result<RevIter<'s, K, V>, Error> {
+        let mut opts = self.reader.read_options();
         if let Some(l) = lower {
             opts.set_iterate_lower_bound(l);
         }
@@ -522,7 +506,7 @@ where
             opts.set_iterate_upper_bound(u);
         }
         let cf = self.cf()?;
-        let mut raw = self.db.rocksdb().raw_iterator_cf_opt(&cf, opts);
+        let mut raw = self.reader.db().rocksdb().raw_iterator_cf_opt(&cf, opts);
         raw.seek_to_last();
         Ok(RevIter::new(raw))
     }
@@ -587,11 +571,11 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestSchema {
-        items: DbMap<U64Be, U64Be>,
+    struct TestSchema<R: Reader = Live> {
+        items: DbMap<U64Be, U64Be, R>,
     }
 
-    impl Schema for TestSchema {
+    impl Schema for TestSchema<Live> {
         fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
             vec![("items", base_options.clone())]
         }
@@ -954,11 +938,11 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct CompoundSchema {
-        rows: DbMap<ByteAndU32, U64Be>,
+    struct CompoundSchema<R: Reader = Live> {
+        rows: DbMap<ByteAndU32, U64Be, R>,
     }
 
-    impl Schema for CompoundSchema {
+    impl Schema for CompoundSchema<Live> {
         fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
             vec![("rows", base_options.clone())]
         }
