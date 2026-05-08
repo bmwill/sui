@@ -14,43 +14,52 @@
 //! - Explicit choice. The on-disk representation is a decision; binding
 //!   the encoding to the type forces the author to make it deliberately.
 //!
-//! # The append contract
+//! # The append contract is type-enforced
 //!
-//! [`Encode::encode_into`] **appends** to the supplied buffer rather
-//! than overwriting it. This lets call sites encode multiple values
-//! sequentially into a single buffer (recording offsets) and pass
-//! non-overlapping subslices to functions that need several byte
-//! strings live at once. Implementations that clear or truncate the
-//! buffer break this contract.
+//! [`Encode::encode_into`] takes `&mut impl BufMut`, which exposes
+//! only `put_*` methods (no `clear`, `truncate`, or rewind). Call
+//! sites can encode multiple values sequentially into one buffer
+//! (recording offsets) and pass non-overlapping subslices to
+//! functions that need several byte strings live at once.
+//! `Vec<u8>: BufMut`, so the thread-local scratch buffer continues
+//! to work; outside the `encode_into` call, the caller still has
+//! `Vec`-level methods like `as_slice` and `len`.
 //!
 //! # Owned vs. borrowed values
 //!
 //! Only owned decode is supported in this version of the crate. A
 //! borrowed-decode trait was scoped out and may return when a real
 //! schema needs zero-copy value views; the byte path is already
-//! reachable today via `DbMap::get_raw` (arriving in a later commit).
+//! reachable today via `DbMap::get_raw`.
+
+use bytes::Buf;
+use bytes::BufMut;
+use bytes::Bytes;
 
 use crate::error::DecodeError;
 use crate::error::EncodeError;
 
 /// Encode a value into bytes.
 ///
-/// Implementations append to the supplied buffer. Call sites may pass
-/// a non-empty buffer (for example, when encoding several values into
-/// the same allocation), and any prefix already present must be
-/// preserved.
+/// Implementations append to the supplied [`BufMut`]. Call sites may
+/// pass a buffer that already contains data (for example, when
+/// encoding several values into the same allocation); the
+/// `BufMut`-only API guarantees previously-written bytes cannot be
+/// overwritten or removed.
 ///
 /// # Examples
 ///
 /// ```
+/// use bytes::BufMut;
+///
 /// use sui_consistent_store::Encode;
 /// use sui_consistent_store::error::EncodeError;
 ///
 /// struct U64BeKey(u64);
 ///
 /// impl Encode for U64BeKey {
-///     fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-///         buf.extend_from_slice(&self.0.to_be_bytes());
+///     fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+///         buf.put_slice(&self.0.to_be_bytes());
 ///         Ok(())
 ///     }
 /// }
@@ -61,9 +70,9 @@ use crate::error::EncodeError;
 pub trait Encode {
     /// Append the encoded form of `self` to `buf`.
     ///
-    /// Implementations must not clear or truncate `buf`. They may grow
-    /// it and append; any bytes already present must remain unchanged.
-    fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError>;
+    /// `BufMut` exposes only `put_*` methods, so existing bytes in
+    /// `buf` cannot be modified or removed.
+    fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError>;
 
     /// Encode `self` into a freshly allocated `Vec<u8>`.
     ///
@@ -79,13 +88,18 @@ pub trait Encode {
 
 /// Decode a value from bytes.
 ///
-/// Implementations consume the entire byte slice. Trailing bytes that
-/// the decoder does not recognize are an error; callers that want to
-/// decode a prefix should not use this trait directly.
+/// Implementations consume bytes from the supplied [`Buf`]. The
+/// crate's call sites pass a buffer that contains exactly one
+/// value's bytes; implementations should consume them all and
+/// surface an error if leftover bytes remain in the buffer that
+/// the implementation does not recognize.
 ///
 /// # Examples
 ///
 /// ```
+/// use bytes::Buf;
+/// use bytes::BufMut;
+///
 /// use sui_consistent_store::Decode;
 /// use sui_consistent_store::Encode;
 /// use sui_consistent_store::error::DecodeError;
@@ -95,30 +109,73 @@ pub trait Encode {
 /// struct U64BeKey(u64);
 ///
 /// impl Encode for U64BeKey {
-///     fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-///         buf.extend_from_slice(&self.0.to_be_bytes());
+///     fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+///         buf.put_slice(&self.0.to_be_bytes());
 ///         Ok(())
 ///     }
 /// }
 ///
 /// impl Decode for U64BeKey {
-///     fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-///         let arr: [u8; 8] = bytes.try_into().map_err(|_| {
-///             DecodeError::msg(format!(
+///     fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+///         if buf.remaining() != 8 {
+///             return Err(DecodeError::msg(format!(
 ///                 "expected 8 bytes for U64BeKey, got {}",
-///                 bytes.len(),
-///             ))
-///         })?;
-///         Ok(U64BeKey(u64::from_be_bytes(arr)))
+///                 buf.remaining(),
+///             )));
+///         }
+///         Ok(U64BeKey(buf.get_u64()))
 ///     }
 /// }
 ///
 /// let bytes = U64BeKey(42).encode().unwrap();
-/// assert_eq!(U64BeKey::decode(&bytes).unwrap(), U64BeKey(42));
+/// assert_eq!(U64BeKey::decode(&mut &bytes[..]).unwrap(), U64BeKey(42));
 /// ```
 pub trait Decode: Sized {
-    /// Decode `bytes` into a value of `Self`.
-    fn decode(bytes: &[u8]) -> Result<Self, DecodeError>;
+    /// Decode a value from `buf`.
+    ///
+    /// `Buf` exposes only forward-consuming reads (no rewind). The
+    /// implementation reads as many bytes as it needs; the crate's
+    /// internal call sites supply a buffer containing exactly one
+    /// value's encoded bytes, so implementations should consume the
+    /// whole buffer and report an error otherwise.
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError>;
+}
+
+// Pass-through encoding for raw byte buffers. Useful for schemas
+// whose key or value is opaque bytes — for example, a CF storing
+// pre-serialized payloads from a higher layer.
+
+impl Encode for Vec<u8> {
+    fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+        buf.put_slice(self);
+        Ok(())
+    }
+}
+
+impl Decode for Vec<u8> {
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let mut out = Vec::with_capacity(buf.remaining());
+        while buf.has_remaining() {
+            let chunk = buf.chunk();
+            out.extend_from_slice(chunk);
+            let len = chunk.len();
+            buf.advance(len);
+        }
+        Ok(out)
+    }
+}
+
+impl Encode for Bytes {
+    fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+        buf.put_slice(self);
+        Ok(())
+    }
+}
+
+impl Decode for Bytes {
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        Ok(buf.copy_to_bytes(buf.remaining()))
+    }
 }
 
 #[cfg(test)]
@@ -131,21 +188,21 @@ mod tests {
     struct U64BeKey(u64);
 
     impl Encode for U64BeKey {
-        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-            buf.extend_from_slice(&self.0.to_be_bytes());
+        fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_slice(&self.0.to_be_bytes());
             Ok(())
         }
     }
 
     impl Decode for U64BeKey {
-        fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-            let arr: [u8; 8] = bytes.try_into().map_err(|_| {
-                DecodeError::msg(format!(
+        fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+            if buf.remaining() != 8 {
+                return Err(DecodeError::msg(format!(
                     "expected 8 bytes for U64BeKey, got {}",
-                    bytes.len(),
-                ))
-            })?;
-            Ok(U64BeKey(u64::from_be_bytes(arr)))
+                    buf.remaining(),
+                )));
+            }
+            Ok(U64BeKey(buf.get_u64()))
         }
     }
 
@@ -153,7 +210,7 @@ mod tests {
     fn round_trip() {
         let original = U64BeKey(0x0123_4567_89AB_CDEF);
         let bytes = original.encode().unwrap();
-        let decoded = U64BeKey::decode(&bytes).unwrap();
+        let decoded = U64BeKey::decode(&mut &bytes[..]).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -186,20 +243,20 @@ mod tests {
         let k_slice = &bytes[..k_end];
         let v_slice = &bytes[k_end..];
 
-        assert_eq!(U64BeKey::decode(k_slice).unwrap(), U64BeKey(1));
-        assert_eq!(U64BeKey::decode(v_slice).unwrap(), U64BeKey(2));
+        assert_eq!(U64BeKey::decode(&mut &*k_slice).unwrap(), U64BeKey(1));
+        assert_eq!(U64BeKey::decode(&mut &*v_slice).unwrap(), U64BeKey(2));
     }
 
     #[test]
     fn decode_short_bytes_errors() {
-        let err = U64BeKey::decode(&[0, 0, 0, 0]).unwrap_err();
+        let err = U64BeKey::decode(&mut &[0, 0, 0, 0][..]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("got 4"), "unexpected message: {msg}");
     }
 
     #[test]
     fn decode_long_bytes_errors() {
-        let err = U64BeKey::decode(&[0; 9]).unwrap_err();
+        let err = U64BeKey::decode(&mut &[0u8; 9][..]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("got 9"), "unexpected message: {msg}");
     }

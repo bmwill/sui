@@ -64,6 +64,7 @@ use crate::db::Db;
 use crate::encode_buf::with_encode_buf;
 use crate::error::Error;
 use crate::error::OpenError;
+use crate::iter::ByteBounds;
 use crate::iter::Iter;
 use crate::iter::RevIter;
 use crate::iter::prefix_to_byte_bounds;
@@ -85,6 +86,9 @@ use crate::snapshot::SnapshotHandle;
 /// ```
 /// use std::sync::Arc;
 ///
+/// use bytes::Buf;
+/// use bytes::BufMut;
+///
 /// use sui_consistent_store::Db;
 /// use sui_consistent_store::DbMap;
 /// use sui_consistent_store::DbOptions;
@@ -101,18 +105,18 @@ use crate::snapshot::SnapshotHandle;
 /// struct U64Be(u64);
 ///
 /// impl Encode for U64Be {
-///     fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-///         buf.extend_from_slice(&self.0.to_be_bytes());
+///     fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+///         buf.put_slice(&self.0.to_be_bytes());
 ///         Ok(())
 ///     }
 /// }
 ///
 /// impl Decode for U64Be {
-///     fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-///         let arr: [u8; 8] = bytes
-///             .try_into()
-///             .map_err(|_| DecodeError::msg("expected 8 bytes"))?;
-///         Ok(Self(u64::from_be_bytes(arr)))
+///     fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+///         if buf.remaining() != 8 {
+///             return Err(DecodeError::msg("expected 8 bytes"));
+///         }
+///         Ok(Self(buf.get_u64()))
 ///     }
 /// }
 ///
@@ -197,7 +201,20 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     /// was called. The returned handle owns its column-family name
     /// (a `Box<str>` clone) and borrows from `snap` for the snapshot
     /// reader.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `snap` was taken on a different [`Db`] than this
+    /// handle is bound to. Cross-`Db` re-binding is a programmer
+    /// error: the snapshot's column family is unrelated to this
+    /// handle's, and silently reading from the wrong CF (or hitting
+    /// a `MissingColumnFamily` error one read later) would mask the
+    /// underlying bug.
     pub fn at<'s>(&self, snap: &'s SnapshotHandle) -> DbMap<K, V, Snapshot<'s>> {
+        assert!(
+            Arc::ptr_eq(self.reader.db(), snap.db()),
+            "snapshot was taken on a different Db than this DbMap is bound to",
+        );
         DbMap {
             reader: Snapshot::new(snap),
             cf_name: self.cf_name.clone(),
@@ -247,7 +264,7 @@ where
                 .rocksdb()
                 .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
             match pinned {
-                Some(slice) => Ok(Some(V::decode(&slice)?)),
+                Some(slice) => Ok(Some(V::decode(&mut &slice[..])?)),
                 None => Ok(None),
             }
         })
@@ -266,40 +283,15 @@ where
         I: IntoIterator<Item = &'k K>,
         K: 'k,
     {
-        let keys: Vec<&K> = keys.into_iter().collect();
-        let opts = self.reader.read_options();
-        let cf = self.cf()?;
-
-        with_encode_buf(|buf| {
-            let mut offsets = Vec::with_capacity(keys.len() + 1);
-            offsets.push(0usize);
-            for key in &keys {
-                key.encode_into(buf)?;
-                offsets.push(buf.len());
-            }
-
-            let bytes = buf.as_slice();
-            let key_slices: Vec<&[u8]> = offsets
-                .windows(2)
-                .map(|window| &bytes[window[0]..window[1]])
-                .collect();
-
-            let raw_results = self
-                .reader
-                .db()
-                .rocksdb()
-                .batched_multi_get_cf_opt(&cf, key_slices, false, &opts);
-
-            let decoded = raw_results
-                .into_iter()
-                .map(|r| match r {
-                    Ok(Some(slice)) => V::decode(&slice).map(Some).map_err(Error::Decode),
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(Error::Rocksdb(e)),
-                })
-                .collect();
-            Ok(decoded)
-        })
+        Ok(self
+            .multi_get_pinned(keys)?
+            .into_iter()
+            .map(|r| match r {
+                Ok(Some(slice)) => V::decode(&mut &slice[..]).map(Some).map_err(Error::Decode),
+                Ok(None) => Ok(None),
+                Err(e) => Err(Error::Rocksdb(e)),
+            })
+            .collect())
     }
 }
 
@@ -339,6 +331,30 @@ where
         I: IntoIterator<Item = &'k K>,
         K: 'k,
     {
+        Ok(self
+            .multi_get_pinned(keys)?
+            .into_iter()
+            .map(|r| match r {
+                Ok(Some(slice)) => Ok(Some(pinned_to_bytes(self.reader.db().clone(), slice))),
+                Ok(None) => Ok(None),
+                Err(e) => Err(Error::Rocksdb(e)),
+            })
+            .collect())
+    }
+
+    /// Internal helper: encode `keys` and issue a single RocksDB
+    /// `batched_multi_get_cf`, returning the raw pinned-slice
+    /// results. Both [`multi_get`](Self::multi_get) and
+    /// [`multi_get_raw`](Self::multi_get_raw) funnel through here
+    /// and just differ in how they map each result.
+    fn multi_get_pinned<'k, 's, I>(
+        &'s self,
+        keys: I,
+    ) -> Result<Vec<Result<Option<DBPinnableSlice<'s>>, rocksdb::Error>>, Error>
+    where
+        I: IntoIterator<Item = &'k K>,
+        K: 'k,
+    {
         let keys: Vec<&K> = keys.into_iter().collect();
         let opts = self.reader.read_options();
         let cf = self.cf()?;
@@ -357,32 +373,31 @@ where
                 .map(|window| &bytes[window[0]..window[1]])
                 .collect();
 
-            let raw_results = self
+            Ok(self
                 .reader
                 .db()
                 .rocksdb()
-                .batched_multi_get_cf_opt(&cf, key_slices, false, &opts);
-
-            let mapped = raw_results
-                .into_iter()
-                .map(|r| match r {
-                    Ok(Some(slice)) => Ok(Some(pinned_to_bytes(self.reader.db().clone(), slice))),
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(Error::Rocksdb(e)),
-                })
-                .collect();
-            Ok(mapped)
+                .batched_multi_get_cf_opt(&cf, key_slices, false, &opts))
         })
     }
 
     /// Test whether `key` is present in the column family.
     ///
     /// Returns `Ok(true)` if a value exists at `key`, `Ok(false)`
-    /// otherwise. Internally short-circuits via RocksDB's
-    /// `key_may_exist_cf` bloom-filter fast path: if RocksDB
-    /// definitively reports the key is absent we return `false`
-    /// without touching disk; otherwise we confirm with a pinned
-    /// read.
+    /// otherwise. The implementation calls RocksDB's
+    /// `key_may_exist_cf` first; when that returns `false` (a
+    /// definitive negative answer), the call returns `Ok(false)`
+    /// without a pinned read. Otherwise it confirms with a pinned
+    /// `get_pinned_cf`.
+    ///
+    /// `key_may_exist_cf` is only useful when the column family has
+    /// a bloom filter configured on its
+    /// [`rocksdb::BlockBasedOptions`]; otherwise it always returns
+    /// `true` and `contains_key` does the same work as `get_raw`
+    /// plus an extra check. Schemas on hot
+    /// `contains_key` paths should set
+    /// [`set_bloom_filter`](rocksdb::BlockBasedOptions::set_bloom_filter)
+    /// on the CF's options.
     pub fn contains_key(&self, key: &K) -> Result<bool, Error> {
         let opts = self.reader.read_options();
         let cf = self.cf()?;
@@ -434,12 +449,13 @@ where
     ///
     /// Pass `..` for an unbounded scan, `start..end` for a half-open
     /// range, `start..=end` for inclusive on both ends, or any other
-    /// [`RangeBounds<K>`] combination. Decode failures are reported
+    /// [`RangeBounds<K>`] combination. To bound by a different type
+    /// (for example, a prefix-typed bound on a compound key), use
+    /// [`iter_with`](Self::iter_with). Decode failures are reported
     /// as a per-item `Err`; the iterator stops yielding after the
     /// first error.
     pub fn iter(&self, range: impl RangeBounds<K>) -> Result<Iter<'_, K, V>, Error> {
-        let (lower, upper) = range_to_byte_bounds(&range)?;
-        self.iter_forward(lower, upper)
+        self.iter_forward(range_to_byte_bounds(&range)?)
     }
 
     /// Iterate forward over the subset of entries whose keys, when
@@ -452,32 +468,64 @@ where
     /// it; see the [module-level docs](crate::iter) for an
     /// explanation and a worked example.
     pub fn iter_prefix(&self, prefix: &impl Encode) -> Result<Iter<'_, K, V>, Error> {
-        let (lower, upper) = prefix_to_byte_bounds(prefix)?;
-        self.iter_forward(lower, upper)
+        self.iter_forward(prefix_to_byte_bounds(prefix)?)
     }
 
     /// Iterate in reverse over the subset of entries whose keys fall
     /// within `range`.
     pub fn iter_rev(&self, range: impl RangeBounds<K>) -> Result<RevIter<'_, K, V>, Error> {
-        let (lower, upper) = range_to_byte_bounds(&range)?;
-        self.iter_reverse(lower, upper)
+        self.iter_reverse(range_to_byte_bounds(&range)?)
     }
 
     /// Iterate in reverse over the subset of entries whose keys,
     /// when encoded, begin with `prefix`'s encoding.
     pub fn iter_rev_prefix(&self, prefix: &impl Encode) -> Result<RevIter<'_, K, V>, Error> {
-        let (lower, upper) = prefix_to_byte_bounds(prefix)?;
-        self.iter_reverse(lower, upper)
+        self.iter_reverse(prefix_to_byte_bounds(prefix)?)
+    }
+
+    /// Iterate forward over entries whose keys, when encoded, fall
+    /// within the encoded bytes of `range`'s `J`-typed bounds.
+    ///
+    /// Like [`iter`](Self::iter), but parameterized over an
+    /// independent `J: Encode`. Useful when the schema's key type
+    /// is a compound (e.g. `(owner, type, id)`) and the caller
+    /// wants to bound the iteration by a prefix-typed value (e.g. an
+    /// `owner`-typed range). The schema's encoding must make `J`'s
+    /// encoded bytes well-ordered against `K`'s encoded keys; the
+    /// crate documents this contract but does not verify it.
+    ///
+    /// Use turbofish to disambiguate `J` when passing an unbounded
+    /// range: `map.iter_with::<MyPrefix>(..)`.
+    pub fn iter_with<J: Encode>(
+        &self,
+        range: impl RangeBounds<J>,
+    ) -> Result<Iter<'_, K, V>, Error> {
+        self.iter_forward(range_to_byte_bounds(&range)?)
+    }
+
+    /// Reverse counterpart to [`iter_with`](Self::iter_with).
+    pub fn iter_rev_with<J: Encode>(
+        &self,
+        range: impl RangeBounds<J>,
+    ) -> Result<RevIter<'_, K, V>, Error> {
+        self.iter_reverse(range_to_byte_bounds(&range)?)
     }
 
     /// Internal helper: forward iteration with caller-supplied byte
     /// bounds. Both range and prefix entry points funnel through
-    /// here.
-    fn iter_forward<'s>(
-        &'s self,
-        lower: Option<Vec<u8>>,
-        upper: Option<Vec<u8>>,
-    ) -> Result<Iter<'s, K, V>, Error> {
+    /// here. A [`ByteBounds::Empty`] short-circuits to an empty
+    /// iterator without touching RocksDB.
+    ///
+    /// `seek_to_first` honors `iterate_lower_bound` in modern
+    /// RocksDB, landing at the smallest key at or above the bound
+    /// — equivalent to `seek(lower)`. Calling `seek` explicitly
+    /// would require cloning the bound (RocksDB's
+    /// `set_iterate_lower_bound` consumes the `Vec<u8>`), so we
+    /// use the bound-aware `seek_to_first`.
+    fn iter_forward<'s>(&'s self, bounds: ByteBounds) -> Result<Iter<'s, K, V>, Error> {
+        let ByteBounds::Range(lower, upper) = bounds else {
+            return Ok(Iter::empty());
+        };
         let mut opts = self.reader.read_options();
         if let Some(l) = lower {
             opts.set_iterate_lower_bound(l);
@@ -493,11 +541,16 @@ where
 
     /// Internal helper: reverse iteration with caller-supplied byte
     /// bounds. The dual of [`iter_forward`](Self::iter_forward).
-    fn iter_reverse<'s>(
-        &'s self,
-        lower: Option<Vec<u8>>,
-        upper: Option<Vec<u8>>,
-    ) -> Result<RevIter<'s, K, V>, Error> {
+    ///
+    /// Symmetric to forward: `seek_to_last` honors
+    /// `iterate_upper_bound` in modern RocksDB, landing at the
+    /// largest key strictly less than the bound. Calling
+    /// `seek_for_prev` explicitly would require cloning the bound,
+    /// so we use the bound-aware `seek_to_last`.
+    fn iter_reverse<'s>(&'s self, bounds: ByteBounds) -> Result<RevIter<'s, K, V>, Error> {
+        let ByteBounds::Range(lower, upper) = bounds else {
+            return Ok(RevIter::empty());
+        };
         let mut opts = self.reader.read_options();
         if let Some(l) = lower {
             opts.set_iterate_lower_bound(l);
@@ -546,6 +599,8 @@ mod tests {
 
     use super::*;
     use crate::DbOptions;
+    use bytes::BufMut;
+
     use crate::Schema;
     use crate::error::DecodeError;
     use crate::error::EncodeError;
@@ -555,18 +610,18 @@ mod tests {
     struct U64Be(u64);
 
     impl Encode for U64Be {
-        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-            buf.extend_from_slice(&self.0.to_be_bytes());
+        fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_slice(&self.0.to_be_bytes());
             Ok(())
         }
     }
 
     impl Decode for U64Be {
-        fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-            let arr: [u8; 8] = bytes
-                .try_into()
-                .map_err(|_| DecodeError::msg("expected 8 bytes"))?;
-            Ok(Self(u64::from_be_bytes(arr)))
+        fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+            if buf.remaining() != 8 {
+                return Err(DecodeError::msg("expected 8 bytes"));
+            }
+            Ok(Self(buf.get_u64()))
         }
     }
 
@@ -844,6 +899,209 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "snapshot was taken on a different Db")]
+    fn at_panics_when_snapshot_is_from_a_different_db() {
+        let (_dir_a, db_a, schema_a) = open();
+        let (_dir_b, db_b, _schema_b) = open();
+        // Snapshot is taken on db_b, but we re-bind a DbMap from db_a.
+        // Should panic to surface the misuse.
+        db_b.take_snapshot(1);
+        let snap_b = db_b.at_snapshot(1).unwrap();
+        // db_a in scope so the assert message is meaningful, even
+        // though we don't directly use it.
+        let _ = &db_a;
+        let _ = schema_a.items.at(&snap_b);
+    }
+
+    /// Forward-iter boundary sweep, mirroring
+    /// [`open_with_odd_keys`] / `collect_rev` for the forward
+    /// direction. The data is keys 1, 3, 5, 7, 9 so each bound can
+    /// be probed for exact vs inexact match.
+    fn collect_fwd<R: std::ops::RangeBounds<U64Be>>(
+        schema: &TestSchema,
+        range: R,
+    ) -> Vec<(U64Be, U64Be)> {
+        schema
+            .items
+            .iter(range)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn iter_inclusive_lowerbound_exact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // 5.. yields 5, 7, 9.
+        assert_eq!(
+            collect_fwd(&schema, U64Be(5)..),
+            vec![
+                (U64Be(5), U64Be(50)),
+                (U64Be(7), U64Be(70)),
+                (U64Be(9), U64Be(90)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_inclusive_lowerbound_inexact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // 4.. on data without 4: same as 5..
+        assert_eq!(
+            collect_fwd(&schema, U64Be(4)..),
+            vec![
+                (U64Be(5), U64Be(50)),
+                (U64Be(7), U64Be(70)),
+                (U64Be(9), U64Be(90)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_exclusive_lowerbound_exact_match() {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // (Excluded(5), Unbounded) excludes 5 itself.
+        assert_eq!(
+            collect_fwd(&schema, (Excluded(U64Be(5)), Unbounded)),
+            vec![(U64Be(7), U64Be(70)), (U64Be(9), U64Be(90))],
+        );
+    }
+
+    #[test]
+    fn iter_exclusive_lowerbound_inexact_match() {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // (Excluded(4), Unbounded): 4 is not in data, so equivalent to 5..
+        assert_eq!(
+            collect_fwd(&schema, (Excluded(U64Be(4)), Unbounded)),
+            vec![
+                (U64Be(5), U64Be(50)),
+                (U64Be(7), U64Be(70)),
+                (U64Be(9), U64Be(90)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_lowerbound_past_data_yields_nothing() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        assert!(collect_fwd(&schema, U64Be(100)..).is_empty());
+    }
+
+    #[test]
+    fn iter_inclusive_upperbound_exact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..=5 on data including 5: yields 1, 3, 5.
+        assert_eq!(
+            collect_fwd(&schema, ..=U64Be(5)),
+            vec![
+                (U64Be(1), U64Be(10)),
+                (U64Be(3), U64Be(30)),
+                (U64Be(5), U64Be(50)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_inclusive_upperbound_inexact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..=6 on data without 6: same as ..=5.
+        assert_eq!(
+            collect_fwd(&schema, ..=U64Be(6)),
+            vec![
+                (U64Be(1), U64Be(10)),
+                (U64Be(3), U64Be(30)),
+                (U64Be(5), U64Be(50)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_exclusive_upperbound_exact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..5 excludes 5 itself.
+        assert_eq!(
+            collect_fwd(&schema, ..U64Be(5)),
+            vec![(U64Be(1), U64Be(10)), (U64Be(3), U64Be(30))],
+        );
+    }
+
+    #[test]
+    fn iter_exclusive_upperbound_inexact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..6 on data without 6: same as ..=5.
+        assert_eq!(
+            collect_fwd(&schema, ..U64Be(6)),
+            vec![
+                (U64Be(1), U64Be(10)),
+                (U64Be(3), U64Be(30)),
+                (U64Be(5), U64Be(50)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_vacuous_exclusive_upperbound_yields_nothing() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..0 has no key strictly less than 0 by encoding.
+        assert!(collect_fwd(&schema, ..U64Be(0)).is_empty());
+    }
+
+    #[test]
+    fn iter_single_point_inclusive_range() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // 5..=5 yields exactly 5.
+        assert_eq!(
+            collect_fwd(&schema, U64Be(5)..=U64Be(5)),
+            vec![(U64Be(5), U64Be(50))],
+        );
+    }
+
+    #[test]
+    fn iter_non_overlapping_range_yields_nothing() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        assert!(collect_fwd(&schema, U64Be(100)..=U64Be(200)).is_empty());
+    }
+
+    #[test]
+    fn iter_with_keys_far_past_upperbound() {
+        // Forward symmetric to iter_rev_with_keys_far_past_upperbound.
+        let (_dir, db, schema) = open();
+        for k in 1..=1000 {
+            seed(&db, "items", &U64Be(k), &U64Be(k));
+        }
+        let collected: Vec<_> = schema
+            .items
+            .iter(..=U64Be(5))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(
+            collected,
+            vec![U64Be(1), U64Be(2), U64Be(3), U64Be(4), U64Be(5)],
+        );
+    }
+
+    #[test]
+    fn iter_with_excluded_max_lower_bound_yields_nothing() {
+        let (_dir, db, schema) = open();
+        for k in 1..=5 {
+            seed(&db, "items", &U64Be(k), &U64Be(0));
+        }
+        // (Excluded(MAX), Unbounded): no key satisfies > MAX. Now
+        // short-circuits to an empty iterator instead of silently
+        // widening to "no lower bound."
+        let collected: Vec<_> = schema
+            .items
+            .iter((std::ops::Bound::Excluded(U64Be(u64::MAX)), std::ops::Bound::Unbounded))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert!(collected.is_empty());
+    }
+
+    #[test]
     fn iter_rev_range_filters_in_reverse() {
         let (_dir, db, schema) = open();
         for k in 1..=5 {
@@ -856,6 +1114,195 @@ mod tests {
             .map(|r| r.unwrap().0)
             .collect();
         assert_eq!(collected, vec![U64Be(4), U64Be(3), U64Be(2)]);
+    }
+
+    // Boundary-case sweep tests below use a small fixed dataset
+    // (odd keys 1,3,5,7,9) so each bound can be probed for "exact
+    // match" (bound is in the data) vs "inexact match" (bound falls
+    // between keys). Mirrors alt-consistent-store's coverage.
+    fn open_with_odd_keys() -> (TempDir, Arc<Db>, TestSchema) {
+        let (dir, db, schema) = open();
+        for k in (1..=9u64).step_by(2) {
+            seed(&db, "items", &U64Be(k), &U64Be(k * 10));
+        }
+        (dir, db, schema)
+    }
+
+    fn collect_rev<R: std::ops::RangeBounds<U64Be>>(
+        schema: &TestSchema,
+        range: R,
+    ) -> Vec<(U64Be, U64Be)> {
+        schema
+            .items
+            .iter_rev(range)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn iter_rev_inclusive_lowerbound_exact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // 5..  includes 5, 7, 9 in reverse.
+        assert_eq!(
+            collect_rev(&schema, U64Be(5)..),
+            vec![
+                (U64Be(9), U64Be(90)),
+                (U64Be(7), U64Be(70)),
+                (U64Be(5), U64Be(50)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_rev_inclusive_lowerbound_inexact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // 4.. on data without 4: same as 5..
+        assert_eq!(
+            collect_rev(&schema, U64Be(4)..),
+            vec![
+                (U64Be(9), U64Be(90)),
+                (U64Be(7), U64Be(70)),
+                (U64Be(5), U64Be(50)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_rev_exclusive_lowerbound_exact_match() {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // (Excluded(5), Unbounded) excludes 5 itself.
+        assert_eq!(
+            collect_rev(&schema, (Excluded(U64Be(5)), Unbounded)),
+            vec![(U64Be(9), U64Be(90)), (U64Be(7), U64Be(70))],
+        );
+    }
+
+    #[test]
+    fn iter_rev_exclusive_lowerbound_inexact_match() {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // (Excluded(4), Unbounded): 4 is not in data, so equivalent to 5..
+        assert_eq!(
+            collect_rev(&schema, (Excluded(U64Be(4)), Unbounded)),
+            vec![
+                (U64Be(9), U64Be(90)),
+                (U64Be(7), U64Be(70)),
+                (U64Be(5), U64Be(50)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_rev_lowerbound_past_data_yields_nothing() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        assert!(collect_rev(&schema, U64Be(100)..).is_empty());
+    }
+
+    #[test]
+    fn iter_rev_excluded_max_lowerbound_yields_nothing() {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // Symmetric to the forward-iter version: provably empty.
+        assert!(collect_rev(&schema, (Excluded(U64Be(u64::MAX)), Unbounded)).is_empty());
+    }
+
+    #[test]
+    fn iter_rev_inclusive_upperbound_exact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..=5 on data including 5: yields 5, 3, 1.
+        assert_eq!(
+            collect_rev(&schema, ..=U64Be(5)),
+            vec![
+                (U64Be(5), U64Be(50)),
+                (U64Be(3), U64Be(30)),
+                (U64Be(1), U64Be(10)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_rev_inclusive_upperbound_inexact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..=6 on data without 6: same as ..=5.
+        assert_eq!(
+            collect_rev(&schema, ..=U64Be(6)),
+            vec![
+                (U64Be(5), U64Be(50)),
+                (U64Be(3), U64Be(30)),
+                (U64Be(1), U64Be(10)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_rev_exclusive_upperbound_exact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..5 excludes 5 itself.
+        assert_eq!(
+            collect_rev(&schema, ..U64Be(5)),
+            vec![(U64Be(3), U64Be(30)), (U64Be(1), U64Be(10))],
+        );
+    }
+
+    #[test]
+    fn iter_rev_exclusive_upperbound_inexact_match() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..6 on data without 6: same as ..=5.
+        assert_eq!(
+            collect_rev(&schema, ..U64Be(6)),
+            vec![
+                (U64Be(5), U64Be(50)),
+                (U64Be(3), U64Be(30)),
+                (U64Be(1), U64Be(10)),
+            ],
+        );
+    }
+
+    #[test]
+    fn iter_rev_vacuous_exclusive_upperbound_yields_nothing() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // ..0 has no key strictly less than 0 by encoding.
+        assert!(collect_rev(&schema, ..U64Be(0)).is_empty());
+    }
+
+    #[test]
+    fn iter_rev_with_keys_far_past_upperbound() {
+        // Stress-tests seek_for_prev / iterate_upper_bound: data has
+        // many keys past the upper bound; iteration must not start at
+        // the literal last key.
+        let (_dir, db, schema) = open();
+        for k in 1..=1000 {
+            seed(&db, "items", &U64Be(k), &U64Be(k));
+        }
+        let collected: Vec<_> = schema
+            .items
+            .iter_rev(..=U64Be(5))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(
+            collected,
+            vec![U64Be(5), U64Be(4), U64Be(3), U64Be(2), U64Be(1)],
+        );
+    }
+
+    #[test]
+    fn iter_rev_single_point_inclusive_range() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // 5..=5 yields exactly 5.
+        assert_eq!(
+            collect_rev(&schema, U64Be(5)..=U64Be(5)),
+            vec![(U64Be(5), U64Be(50))],
+        );
+    }
+
+    #[test]
+    fn iter_rev_non_overlapping_range_yields_nothing() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // Data is 1..10 odds; 100..200 doesn't overlap.
+        assert!(collect_rev(&schema, U64Be(100)..=U64Be(200)).is_empty());
     }
 
     #[test]
@@ -898,6 +1345,85 @@ mod tests {
         assert_eq!(collected, vec![U64Be(5)]);
     }
 
+    #[test]
+    fn iter_seek_inside_bounded_range_respects_lower_bound() {
+        // Mirrors alt's "underflow" case: with a bounded forward
+        // iter, seek to a key below the lower bound should land on
+        // (or after) the lower bound, not below it.
+        let (_dir, db, schema) = open();
+        for k in 0..=10u64 {
+            seed(&db, "items", &U64Be(k), &U64Be(k));
+        }
+        let mut iter = schema.items.iter(U64Be(4)..U64Be(8)).unwrap();
+        iter.seek(1u64.to_be_bytes());
+        let (k, _) = iter.next().unwrap().unwrap();
+        assert_eq!(k, U64Be(4));
+    }
+
+    #[test]
+    fn iter_seek_past_upper_bound_yields_nothing() {
+        // Mirrors alt's "overflow" case.
+        let (_dir, db, schema) = open();
+        for k in 0..=10u64 {
+            seed(&db, "items", &U64Be(k), &U64Be(k));
+        }
+        let mut iter = schema.items.iter(U64Be(4)..U64Be(8)).unwrap();
+        iter.seek(8u64.to_be_bytes());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn iter_rev_cursor_methods_expose_raw_state() {
+        let (_dir, db, schema) = open();
+        seed(&db, "items", &U64Be(1), &U64Be(10));
+        seed(&db, "items", &U64Be(2), &U64Be(20));
+        let mut iter = schema.items.iter_rev(..).unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.raw_key().unwrap(), &2u64.to_be_bytes());
+        assert_eq!(iter.raw_value().unwrap(), &20u64.to_be_bytes());
+        let _ = iter.next();
+        assert!(iter.valid());
+        assert_eq!(iter.raw_key().unwrap(), &1u64.to_be_bytes());
+    }
+
+    #[test]
+    fn iter_rev_seek_repositions_to_largest_key_at_or_below() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // Seek to 6 (not in data); should land on 5.
+        let mut iter = schema.items.iter_rev(..).unwrap();
+        iter.seek(6u64.to_be_bytes());
+        let collected: Vec<_> = (&mut iter).map(|r| r.unwrap().0).collect();
+        assert_eq!(collected, vec![U64Be(5), U64Be(3), U64Be(1)]);
+    }
+
+    #[test]
+    fn iter_rev_seek_to_exact_key_yields_that_key_first() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        let mut iter = schema.items.iter_rev(..).unwrap();
+        iter.seek(5u64.to_be_bytes());
+        let (k, _) = iter.next().unwrap().unwrap();
+        assert_eq!(k, U64Be(5));
+    }
+
+    #[test]
+    fn iter_rev_skip_past_advances_past_prefix() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        // skip_past in reverse: the cursor lands on the largest key
+        // strictly less than the prefix.
+        let mut iter = schema.items.iter_rev(..).unwrap();
+        iter.skip_past(6u64.to_be_bytes());
+        let collected: Vec<_> = (&mut iter).map(|r| r.unwrap().0).collect();
+        assert_eq!(collected, vec![U64Be(5), U64Be(3), U64Be(1)]);
+    }
+
+    #[test]
+    fn iter_rev_skip_past_below_data_yields_nothing() {
+        let (_dir, _db, schema) = open_with_odd_keys();
+        let mut iter = schema.items.iter_rev(..).unwrap();
+        iter.skip_past(0u64.to_be_bytes());
+        assert!(iter.next().is_none());
+    }
+
     /// Compound key `(byte, u32 BE)` for prefix-iteration tests.
     /// Used to demonstrate prefix iteration with a prefix type
     /// distinct from the full key type.
@@ -905,23 +1431,22 @@ mod tests {
     struct ByteAndU32(u8, u32);
 
     impl Encode for ByteAndU32 {
-        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-            buf.push(self.0);
-            buf.extend_from_slice(&self.1.to_be_bytes());
+        fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_u8(self.0);
+            buf.put_slice(&self.1.to_be_bytes());
             Ok(())
         }
     }
 
     impl Decode for ByteAndU32 {
-        fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-            if bytes.len() != 5 {
+        fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+            if buf.remaining() != 5 {
                 return Err(DecodeError::msg(format!(
                     "expected 5 bytes for ByteAndU32, got {}",
-                    bytes.len(),
+                    buf.remaining(),
                 )));
             }
-            let arr: [u8; 4] = bytes[1..].try_into().unwrap();
-            Ok(Self(bytes[0], u32::from_be_bytes(arr)))
+            Ok(Self(buf.get_u8(), buf.get_u32()))
         }
     }
 
@@ -931,8 +1456,8 @@ mod tests {
     struct BytePrefix(u8);
 
     impl Encode for BytePrefix {
-        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-            buf.push(self.0);
+        fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_u8(self.0);
             Ok(())
         }
     }
@@ -1015,6 +1540,29 @@ mod tests {
         seed_compound(&db, &ByteAndU32(3, 0), &U64Be(0));
         let count = schema.rows.iter_prefix(&BytePrefix(2)).unwrap().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn iter_with_bounds_a_prefix_typed_range_on_compound_keys() {
+        let (_dir, db, schema) = open_compound();
+        // Seed three first-byte buckets, three second-component each.
+        for first in [1u8, 2, 3] {
+            for second in 0u32..3 {
+                seed_compound(&db, &ByteAndU32(first, second), &U64Be(0));
+            }
+        }
+        // Bound by `BytePrefix(2)..BytePrefix(3)` — J = BytePrefix,
+        // K = ByteAndU32. Should yield the bucket starting with 2.
+        let collected: Vec<_> = schema
+            .rows
+            .iter_with(BytePrefix(2)..BytePrefix(3))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(
+            collected,
+            vec![ByteAndU32(2, 0), ByteAndU32(2, 1), ByteAndU32(2, 2)],
+        );
     }
 
     #[test]

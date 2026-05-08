@@ -14423,7 +14423,6 @@ name = "sui-consistent-store"
 version = "1.72.0"
 dependencies = [
  "bytes",
- "ouroboros 0.17.2",
  "parking_lot 0.12.3",
  "rocksdb",
  "tempfile",

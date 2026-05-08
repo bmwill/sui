@@ -84,6 +84,17 @@ impl<'d, K, V> Iter<'d, K, V> {
         }
     }
 
+    /// An iterator that yields nothing. Used by callers that
+    /// determine, before issuing any RocksDB call, that the requested
+    /// range is provably empty (for example, an `Excluded(MAX)` lower
+    /// bound).
+    pub(crate) fn empty() -> Self {
+        Self {
+            inner: None,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Move the cursor to the first key greater than or equal to
     /// `probe`.
     ///
@@ -134,6 +145,14 @@ impl<'d, K, V> RevIter<'d, K, V> {
     pub(crate) fn new(inner: DBRawIterator<'d>) -> Self {
         Self {
             inner: Some(inner),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// An iterator that yields nothing. See [`Iter::empty`].
+    pub(crate) fn empty() -> Self {
+        Self {
+            inner: None,
             _phantom: PhantomData,
         }
     }
@@ -227,29 +246,59 @@ pub(crate) fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Encoded byte bounds for an iterator: `(lower_inclusive,
-/// upper_exclusive)`. Either side may be `None` to leave that side
-/// unbounded.
-pub(crate) type ByteBounds = (Option<Vec<u8>>, Option<Vec<u8>>);
+/// Encoded byte bounds for an iterator.
+///
+/// `Empty` means the requested range is provably empty (no key can
+/// match) — produced today by an `Excluded(k)` lower bound whose
+/// encoded `k` is non-empty all-`0xFF` (no successor exists). Callers
+/// short-circuit to an empty iterator on this variant.
+///
+/// `Range(lower, upper)` is the usual half-open
+/// `[lower, upper)` byte interval; either side may be `None` to leave
+/// that side unbounded.
+pub(crate) enum ByteBounds {
+    Empty,
+    Range(Option<Vec<u8>>, Option<Vec<u8>>),
+}
 
-/// Convert a typed [`RangeBounds<K>`] into encoded byte bounds
+/// Convert a typed [`RangeBounds<J>`] into encoded byte bounds
 /// suitable for RocksDB's `iterate_lower_bound` and
 /// `iterate_upper_bound` (lower inclusive, upper exclusive).
 ///
 /// `Excluded(start)` for the lower bound is implemented by encoding
-/// `start` and taking its lex successor. If `start` encodes to all
-/// `0xFF` bytes (no successor exists), the lower bound is dropped;
-/// the resulting iteration is a superset of the user's requested
-/// range. Schemas should avoid `Excluded` lower bounds unless the
-/// encoding is known not to hit this edge case.
-pub(crate) fn range_to_byte_bounds<K, R>(range: &R) -> Result<ByteBounds, EncodeError>
+/// `start` and taking its lex successor. If `start` encodes to a
+/// non-empty all-`0xFF` byte string the successor does not exist in
+/// the same byte length; the result is reported as
+/// [`ByteBounds::Empty`] so iteration yields nothing. (For empty
+/// encodings, where `next_prefix` also returns `None`, the bound is
+/// silently dropped — `Excluded([])` is degenerate input.)
+///
+/// `Included(end)` for the upper bound takes the lex successor as
+/// the exclusive upper. If `end` encodes to all-`0xFF` (no
+/// successor), the upper bound is dropped — for fixed-length
+/// encodings this is exact; variable-length encodings may iterate
+/// extra rows whose encoded keys extend the all-`0xFF` prefix.
+pub(crate) fn range_to_byte_bounds<J, R>(range: &R) -> Result<ByteBounds, EncodeError>
 where
-    K: Encode,
-    R: RangeBounds<K>,
+    J: Encode,
+    R: RangeBounds<J>,
 {
     let lower = match range.start_bound() {
         Bound::Included(k) => Some(k.encode()?),
-        Bound::Excluded(k) => next_prefix(&k.encode()?),
+        Bound::Excluded(k) => {
+            let encoded = k.encode()?;
+            match next_prefix(&encoded) {
+                Some(succ) => Some(succ),
+                // Empty encoding has no successor but the bound is
+                // degenerate; drop it rather than declaring the
+                // whole range empty.
+                None if encoded.is_empty() => None,
+                // Non-empty all-0xFF: provably no key satisfies the
+                // bound (assuming fixed-length encoding); short-
+                // circuit to an empty iteration.
+                None => return Ok(ByteBounds::Empty),
+            }
+        }
         Bound::Unbounded => None,
     };
     let upper = match range.end_bound() {
@@ -257,20 +306,20 @@ where
         Bound::Included(k) => next_prefix(&k.encode()?),
         Bound::Unbounded => None,
     };
-    Ok((lower, upper))
+    Ok(ByteBounds::Range(lower, upper))
 }
 
 /// Convert a typed prefix into encoded byte bounds.
 ///
 /// Lower bound is the encoded prefix; upper bound is the prefix's
-/// lex successor (or `None` if the prefix is all `0xFF`).
+/// lex successor (or `None` if the prefix is empty or all `0xFF`).
 pub(crate) fn prefix_to_byte_bounds<P>(prefix: &P) -> Result<ByteBounds, EncodeError>
 where
     P: Encode,
 {
     let lower_bytes = prefix.encode()?;
     let upper = next_prefix(&lower_bytes);
-    Ok((Some(lower_bytes), upper))
+    Ok(ByteBounds::Range(Some(lower_bytes), upper))
 }
 
 /// Shared `next` body for both directions. `forward = true` advances
@@ -293,10 +342,17 @@ where
         return err.map(|e| Err(Error::Rocksdb(e)));
     }
 
-    let key_bytes = inner.key()?;
-    let value_bytes = inner.value()?;
+    // The iterator reports valid, so key/value must be present;
+    // surface a defensive error rather than silently terminating if
+    // RocksDB ever violates this invariant.
+    let (Some(key_bytes), Some(value_bytes)) = (inner.key(), inner.value()) else {
+        *slot = None;
+        return Some(Err(Error::Internal(
+            "raw iterator returned None for key or value while marked valid",
+        )));
+    };
 
-    let item = match (K::decode(key_bytes), V::decode(value_bytes)) {
+    let item = match (K::decode(&mut &key_bytes[..]), V::decode(&mut &value_bytes[..])) {
         (Ok(k), Ok(v)) => Ok((k, v)),
         (Err(e), _) | (_, Err(e)) => {
             *slot = None;
@@ -347,29 +403,38 @@ mod tests {
     struct U64Be(u64);
 
     impl Encode for U64Be {
-        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-            buf.extend_from_slice(&self.0.to_be_bytes());
+        fn encode_into<B: bytes::BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_slice(&self.0.to_be_bytes());
             Ok(())
+        }
+    }
+
+    /// Destructure the `Range` variant for assertions; panics if
+    /// `Empty` (the test-side equivalent of `unwrap`).
+    fn range(b: ByteBounds) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        match b {
+            ByteBounds::Range(lo, hi) => (lo, hi),
+            ByteBounds::Empty => panic!("expected ByteBounds::Range, got Empty"),
         }
     }
 
     #[test]
     fn range_to_byte_bounds_full_range() {
-        let (lo, hi) = range_to_byte_bounds::<U64Be, _>(&(..)).unwrap();
+        let (lo, hi) = range(range_to_byte_bounds::<U64Be, _>(&(..)).unwrap());
         assert!(lo.is_none());
         assert!(hi.is_none());
     }
 
     #[test]
     fn range_to_byte_bounds_inclusive_to_exclusive() {
-        let (lo, hi) = range_to_byte_bounds(&(U64Be(1)..U64Be(5))).unwrap();
+        let (lo, hi) = range(range_to_byte_bounds(&(U64Be(1)..U64Be(5))).unwrap());
         assert_eq!(lo.unwrap(), &1u64.to_be_bytes());
         assert_eq!(hi.unwrap(), &5u64.to_be_bytes());
     }
 
     #[test]
     fn range_to_byte_bounds_inclusive_to_inclusive() {
-        let (lo, hi) = range_to_byte_bounds(&(U64Be(1)..=U64Be(5))).unwrap();
+        let (lo, hi) = range(range_to_byte_bounds(&(U64Be(1)..=U64Be(5))).unwrap());
         assert_eq!(lo.unwrap(), &1u64.to_be_bytes());
         // 5 inclusive becomes lex successor of encoded 5.
         assert_eq!(hi.unwrap(), &6u64.to_be_bytes());
@@ -377,21 +442,31 @@ mod tests {
 
     #[test]
     fn range_to_byte_bounds_from() {
-        let (lo, hi) = range_to_byte_bounds(&(U64Be(7)..)).unwrap();
+        let (lo, hi) = range(range_to_byte_bounds(&(U64Be(7)..)).unwrap());
         assert_eq!(lo.unwrap(), &7u64.to_be_bytes());
         assert!(hi.is_none());
     }
 
     #[test]
     fn range_to_byte_bounds_to() {
-        let (lo, hi) = range_to_byte_bounds(&(..U64Be(7))).unwrap();
+        let (lo, hi) = range(range_to_byte_bounds(&(..U64Be(7))).unwrap());
         assert!(lo.is_none());
         assert_eq!(hi.unwrap(), &7u64.to_be_bytes());
     }
 
     #[test]
+    fn range_to_byte_bounds_excluded_max_lower_is_empty() {
+        // (Excluded(MAX), Unbounded) — no key > MAX in fixed-length
+        // encodings. Previously silently widened to "no lower
+        // bound"; now reports as Empty so iteration yields nothing.
+        let bounds =
+            range_to_byte_bounds(&(Bound::Excluded(U64Be(u64::MAX)), Bound::Unbounded)).unwrap();
+        assert!(matches!(bounds, ByteBounds::Empty));
+    }
+
+    #[test]
     fn prefix_to_byte_bounds_returns_lower_and_successor() {
-        let (lo, hi) = prefix_to_byte_bounds(&U64Be(42)).unwrap();
+        let (lo, hi) = range(prefix_to_byte_bounds(&U64Be(42)).unwrap());
         assert_eq!(lo.unwrap(), &42u64.to_be_bytes());
         assert_eq!(hi.unwrap(), &43u64.to_be_bytes());
     }

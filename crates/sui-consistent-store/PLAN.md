@@ -83,36 +83,30 @@ top of `bincode` 2.x or `serde`. The shape:
 
 ```rust
 pub trait Encode {
-    fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError>;
+    fn encode_into<B: bytes::BufMut>(&self, buf: &mut B) -> Result<(), EncodeError>;
 }
 
 pub trait Decode: Sized {
     fn decode(bytes: &[u8]) -> Result<Self, DecodeError>;
 }
-
-pub trait DecodeBorrowed<'a>: Sized {
-    fn decode_borrowed(bytes: &'a [u8]) -> Result<Self, DecodeError>;
-}
 ```
 
 Encode is fallible. Some encodings (for instance, tuple-style fixed-int
 encodings applied to types not statically known to fit) can fail; the
-cost of returning `Result` is negligible.
+cost of returning `Result` is negligible. The `BufMut` parameter is
+load-bearing: it exposes only `put_*` methods, so the append-only
+contract is enforced by the type system rather than by trust.
 
-`EncodeError` and `DecodeError` are crate-defined enums via `thiserror`,
-not `anyhow::Error`, so callers can match on failure modes if they want
-to. Codec implementations carry context as
-`Box<dyn std::error::Error + Send + Sync>` payloads where appropriate.
+`EncodeError` and `DecodeError` are crate-defined boxed-inner structs
+that carry a free-form message and an optional source error; the
+top-level `Error` enum has variants for each plus `Rocksdb`,
+`MissingColumnFamily`, and a defensive `Internal` for invariant
+violations.
 
-`DecodeBorrowed<'a>` is a separate trait so a schema can supply distinct
-borrowed and owned types when zero-copy decode is desired (for example,
-`Owner` with `Encode + Decode`, and `OwnerRef<'a>` with
-`DecodeBorrowed<'a>`). There is no relationship enforced between owned
-and borrowed forms; a schema may have one, the other, or both.
-
-The encoding API may switch from `&mut Vec<u8>` to `bytes::BufMut`
-during the initial build-out if a concrete need arises; the choice of
-`Vec` is to minimize moving parts up front.
+A `DecodeBorrowed<'a>` trait was scoped out of the v1 surface; the
+zero-copy path is reachable today through `DbMap::get_raw` returning
+`bytes::Bytes`. We can revisit if a schema has a real need for typed
+borrowed views.
 
 ### 4. In-memory snapshot model
 
@@ -127,10 +121,14 @@ trade-offs:
 - A small, bounded number of long-lived snapshots is fine; many or
   unbounded growth pressures compaction.
 - The `Db`'s public methods take `&self` and synchronize with a
-  `parking_lot::RwLock` on the snapshot buffer; the underlying RocksDB
-  handle is shared via an internal self-referential struct
-  (`ouroboros::self_referencing`) so that the snapshot's `'_` lifetime
-  can be tied to the same allocation.
+  `parking_lot::RwLock` on the snapshot buffer. Snapshots'
+  `rocksdb::Snapshot<'_>` borrows are extended to `'static` via
+  `mem::transmute`; soundness rests on field declaration order
+  (the `RwLock<BTreeMap<…, Arc<SnapshotEntry>>>` is declared *before*
+  `inner: rocksdb::DB`, so every retained snapshot drops before the
+  DB) and on `SnapshotHandle` field order (entry before the co-owned
+  `Arc<Db>`). Both `unsafe` sites carry safety comments deriving the
+  argument from these invariants.
 
 RocksDB also exposes a filesystem-level checkpoint mechanism via
 `rocksdb::checkpoint::Checkpoint`, which produces a hard-linked copy
@@ -198,21 +196,31 @@ pins can drive `block_cache.pinned-usage` past
 `block_cache.capacity()`. We will document this on `get_raw` and
 recommend short scopes for the returned `Bytes`.
 
-### 7. Hand-written schemas
+### 7. Hand-written schemas, parameterized by reader
 
-A schema is a struct of `DbMap<K, V>` fields, opened against an
-`Arc<Db>`:
+A schema is a struct of `DbMap<K, V, R>` fields, parameterized by a
+[`Reader`](crate::Reader) (defaulted to [`Live`](crate::Live)). Two
+trait impls per schema:
 
 ```rust
 pub trait Schema: Sized {
-    fn cfs() -> Vec<(String, rocksdb::Options)>;
+    fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)>;
     fn open(db: &Arc<Db>) -> Result<Self, OpenError>;
+}
+
+pub trait SchemaAtSnapshot {
+    type At<'s> where Self: 's;
+    fn at<'s>(&'s self, snap: &'s SnapshotHandle) -> Self::At<'s>;
 }
 ```
 
-This matches today's `sui-indexer-alt-consistent-store` style. We will
-revisit a `#[derive(Schema)]` macro only if the hand-written form
-becomes painful at scale.
+`Schema` is implemented for `MySchema<Live>` and supplies the column
+families and the live constructor. `SchemaAtSnapshot` is the
+companion that re-binds each field via [`DbMap::at`](crate::DbMap::at)
+and produces `MySchema<Snapshot<'s>>`. Authors who never read at a
+snapshot can skip the `SchemaAtSnapshot` impl. We will revisit a
+`#[derive(Schema)]` macro only if the hand-written form becomes
+painful at scale.
 
 ### 8. Documented prefix iteration, no static safety
 
@@ -250,42 +258,60 @@ example.
 ### Type sketch
 
 ```rust
-pub struct Db { /* RwLock<Inner> with self-referential rocksdb::DB. */ }
+pub struct Db { /* RwLock<BTreeMap<u64, Arc<SnapshotEntry>>> + rocksdb::DB. */ }
 
-pub struct DbMap<K, V> {
-    db: Arc<Db>,
-    cf: String,
+pub trait Reader: private::Sealed {
+    fn db(&self) -> &Arc<Db>;
+    fn read_options(&self) -> rocksdb::ReadOptions;
+}
+pub struct Live { db: Arc<Db> }
+pub struct Snapshot<'s> { handle: &'s SnapshotHandle }
+
+pub struct DbMap<K, V, R: Reader = Live> {
+    reader: R,
+    cf_name: Box<str>,
     _data: PhantomData<fn(K) -> V>,
 }
 
-impl<K: Encode + Decode, V: Encode + Decode> DbMap<K, V> {
-    pub fn get(&self, key: &K) -> Result<Option<V>>;
-    pub fn get_raw(&self, key: &K) -> Result<Option<Bytes>>;
-    pub fn multi_get<'k>(
-        &self,
-        keys: impl IntoIterator<Item = &'k K>,
-    ) -> Result<Vec<Result<Option<V>>>>
-    where
-        K: 'k;
-    pub fn iter(&self) -> Iter<'_, K, V>;
-    pub fn iter_prefix(&self, prefix: &impl Encode) -> Iter<'_, K, V>;
-    pub fn iter_rev(&self) -> RevIter<'_, K, V>;
-    /* Analogous snapshot-bound variants. */
+impl<K, V> DbMap<K, V, Live> {
+    pub fn new(db: Arc<Db>, cf_name: impl Into<Box<str>>) -> Result<Self, OpenError>;
 }
 
-pub struct Batch<'d> { /* Wraps rocksdb::WriteBatch + db handle. */ }
+impl<K, V, R: Reader> DbMap<K, V, R> {
+    /// Re-bind at a captured snapshot.
+    pub fn at<'s>(&self, snap: &'s SnapshotHandle) -> DbMap<K, V, Snapshot<'s>>;
 
-impl<'d> Batch<'d> {
+    /// Reads route through `self.reader.read_options()` and `db()`.
+    pub fn get(&self, key: &K) -> Result<Option<V>> where K: Encode, V: Decode;
+    pub fn get_raw(&self, key: &K) -> Result<Option<Bytes>> where K: Encode;
+    pub fn multi_get<'k, I>(&self, keys: I) -> Result<Vec<Result<Option<V>>>>
+    where K: Encode + 'k, V: Decode, I: IntoIterator<Item = &'k K>;
+    pub fn iter(&self, range: impl RangeBounds<K>) -> Result<Iter<'_, K, V>>;
+    pub fn iter_prefix(&self, prefix: &impl Encode) -> Result<Iter<'_, K, V>>;
+    pub fn iter_rev(&self, range: impl RangeBounds<K>) -> Result<RevIter<'_, K, V>>;
+    pub fn contains_key(&self, key: &K) -> Result<bool> where K: Encode;
+}
+
+pub struct Batch { /* Wraps rocksdb::WriteBatch + Arc<Db>. */ }
+
+impl Batch {
+    /// Live-only: snapshot-bound projections are statically read-only.
     pub fn put<K: Encode, V: Encode>(
         &mut self,
-        map: &DbMap<K, V>,
+        map: &DbMap<K, V, Live>,
         key: &K,
         value: &V,
     ) -> Result<&mut Self>;
     pub fn delete<K: Encode, V>(
         &mut self,
-        map: &DbMap<K, V>,
+        map: &DbMap<K, V, Live>,
         key: &K,
+    ) -> Result<&mut Self>;
+    pub fn merge<K: Encode, V: Encode>(
+        &mut self,
+        map: &DbMap<K, V, Live>,
+        key: &K,
+        operand: &V,
     ) -> Result<&mut Self>;
     pub fn commit(self) -> Result<()>;
 }
@@ -339,20 +365,16 @@ with at least one worked example for every public-facing API.
 
 ## Open questions and future work
 
-- Whether to switch the encoding trait's buffer parameter to
-  `bytes::BufMut` once we see how callers use it.
 - Whether `DbMap::get_raw` needs a complementary borrowed-decode
   helper (`DbMap::get_borrowed::<R: DecodeBorrowed<'_>>`) or whether
   byte-returning plus caller-side decode is good enough in practice.
 - Concurrent (out-of-order) framework store integration. Deferred to
   the framework crate; not part of this crate's surface.
-- `merge_cf` support. Today's `rpc_index` uses RocksDB merge operators
-  for balance deltas. We will add typed `Batch::merge` once a consumer
-  needs it.
 - Compaction filters and column-family-specific options. The
   `Schema::cfs()` method returns full `rocksdb::Options` per column
   family, so this is consumer-driven; we may add convenience builders
   later.
-- Metrics. Today's `typed-store` and `consistent-store` track per-CF
-  read and write metrics; we will revisit once the basic API
-  stabilizes.
+- Metrics. Per-CF runtime metrics land via `Db::cf_metrics`
+  returning a populated `RocksMetrics`; consumers map this into
+  Prometheus or similar. We will revisit if patterns emerge that
+  warrant a richer surface.

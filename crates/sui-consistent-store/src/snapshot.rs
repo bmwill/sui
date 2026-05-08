@@ -31,6 +31,9 @@
 //! ```
 //! use std::sync::Arc;
 //!
+//! use bytes::Buf;
+//! use bytes::BufMut;
+//!
 //! use sui_consistent_store::Db;
 //! use sui_consistent_store::DbMap;
 //! use sui_consistent_store::DbOptions;
@@ -47,18 +50,18 @@
 //! struct U64Be(u64);
 //!
 //! impl Encode for U64Be {
-//!     fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-//!         buf.extend_from_slice(&self.0.to_be_bytes());
+//!     fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+//!         buf.put_slice(&self.0.to_be_bytes());
 //!         Ok(())
 //!     }
 //! }
 //!
 //! impl Decode for U64Be {
-//!     fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-//!         let arr: [u8; 8] = bytes
-//!             .try_into()
-//!             .map_err(|_| DecodeError::msg("expected 8 bytes"))?;
-//!         Ok(Self(u64::from_be_bytes(arr)))
+//!     fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+//!         if buf.remaining() != 8 {
+//!             return Err(DecodeError::msg("expected 8 bytes"));
+//!         }
+//!         Ok(Self(buf.get_u64()))
 //!     }
 //! }
 //!
@@ -187,6 +190,8 @@ mod tests {
     use crate::SchemaAtSnapshot;
     use crate::Snapshot;
     use crate::error::DecodeError;
+    use bytes::BufMut;
+
     use crate::error::EncodeError;
     use crate::error::OpenError;
     use crate::map::DbMap;
@@ -195,18 +200,18 @@ mod tests {
     struct U64Be(u64);
 
     impl crate::Encode for U64Be {
-        fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-            buf.extend_from_slice(&self.0.to_be_bytes());
+        fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_slice(&self.0.to_be_bytes());
             Ok(())
         }
     }
 
     impl crate::Decode for U64Be {
-        fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-            let arr: [u8; 8] = bytes
-                .try_into()
-                .map_err(|_| DecodeError::msg("expected 8 bytes"))?;
-            Ok(Self(u64::from_be_bytes(arr)))
+        fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+            if buf.remaining() != 8 {
+                return Err(DecodeError::msg("expected 8 bytes"));
+            }
+            Ok(Self(buf.get_u64()))
         }
     }
 
@@ -239,7 +244,8 @@ mod tests {
     fn open_with_capacity(capacity: usize) -> (TempDir, Arc<Db>, TestSchema) {
         let dir = TempDir::new().unwrap();
         let opts = DbOptions {
-            snapshot_capacity: capacity,
+            snapshot_capacity: std::num::NonZeroUsize::new(capacity)
+                .expect("test capacity must be > 0"),
             ..DbOptions::default()
         };
         let (db, schema) = Db::open::<TestSchema>(dir.path(), opts).unwrap();
@@ -544,6 +550,56 @@ mod tests {
             schema.items.at(&snap).get(&U64Be(1)).unwrap(),
             Some(U64Be(200)),
         );
+    }
+
+    #[test]
+    fn snapshot_handle_keeps_underlying_snapshot_alive_through_eviction() {
+        // Mirrors alt's test_iteration_snapshot_keepalive. A handle
+        // (here standing in for an iterator built from the handle)
+        // co-owns the SnapshotEntry; capacity-based eviction of the
+        // buffer must not break reads through the handle.
+        let (_dir, db, schema) = open_with_capacity(2);
+        put(&db, &schema, 1, 100);
+        db.take_snapshot(1);
+        // Hold a handle (and through it, an Arc<SnapshotEntry>).
+        let snap = db.at_snapshot(1).unwrap();
+        // Push two more snapshots so checkpoint 1 evicts.
+        db.take_snapshot(2);
+        db.take_snapshot(3);
+        assert!(db.at_snapshot(1).is_none(), "snapshot 1 should evict");
+        // Reads through the held handle still work.
+        assert_eq!(
+            schema.items.at(&snap).get(&U64Be(1)).unwrap(),
+            Some(U64Be(100)),
+        );
+    }
+
+    #[test]
+    fn iterator_keeps_snapshot_alive_through_eviction() {
+        // Stronger version of the above: an active Iter built from
+        // the snapshot survives buffer eviction. The Iter borrows
+        // from the snapshot-bound DbMap, which borrows from the
+        // SnapshotHandle, which holds an Arc<SnapshotEntry>.
+        let (_dir, db, schema) = open_with_capacity(2);
+        put(&db, &schema, 1, 10);
+        put(&db, &schema, 2, 20);
+        put(&db, &schema, 3, 30);
+        db.take_snapshot(1);
+
+        let snap = db.at_snapshot(1).unwrap();
+        let snap_items = schema.items.at(&snap);
+        let mut iter = snap_items.iter(..).unwrap();
+        // Consume one element.
+        assert_eq!(iter.next().unwrap().unwrap(), (U64Be(1), U64Be(10)));
+
+        // Force eviction of snapshot 1.
+        db.take_snapshot(2);
+        db.take_snapshot(3);
+        assert!(db.at_snapshot(1).is_none());
+
+        // The iterator continues to yield the snapshot's data.
+        let rest: Vec<_> = (&mut iter).map(Result::unwrap).collect();
+        assert_eq!(rest, vec![(U64Be(2), U64Be(20)), (U64Be(3), U64Be(30))]);
     }
 
     /// Demonstrates the whole-schema re-binding pattern via

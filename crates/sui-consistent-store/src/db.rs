@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use parking_lot::RwLock;
 use rocksdb::BoundColumnFamily;
 
 use crate::batch::Batch;
+use crate::error::Error;
 use crate::error::OpenError;
 use crate::schema::Schema;
 use crate::snapshot::SnapshotHandle;
@@ -58,7 +60,11 @@ pub struct DbOptions {
     /// number is evicted. Set high enough to retain the consistency
     /// window the application requires; long-lived snapshots pressure
     /// RocksDB compaction, so this is not free.
-    pub snapshot_capacity: usize,
+    ///
+    /// Capacity is a [`NonZeroUsize`] so a zero buffer (which would
+    /// silently drop every snapshot the moment it was taken) is
+    /// structurally impossible.
+    pub snapshot_capacity: NonZeroUsize,
 }
 
 /// An opened RocksDB database.
@@ -99,7 +105,7 @@ pub struct Db {
     /// every retained snapshot drops (and releases its borrow on
     /// `inner`) before `inner` itself is freed.
     snapshots: RwLock<BTreeMap<u64, Arc<SnapshotEntry>>>,
-    snapshot_capacity: usize,
+    snapshot_capacity: NonZeroUsize,
     inner: rocksdb::DB,
 }
 
@@ -133,7 +139,7 @@ impl Default for DbOptions {
         db_options.create_missing_column_families(true);
         Self {
             db_options,
-            snapshot_capacity: 32,
+            snapshot_capacity: NonZeroUsize::new(32).expect("32 != 0"),
         }
     }
 }
@@ -235,19 +241,26 @@ impl Db {
     /// same `checkpoint` returns a handle that reads from this state
     /// regardless of any writes that happen after this call returns.
     ///
-    /// The snapshot is taken and inserted while holding the snapshot
-    /// buffer's write lock, so concurrent `take_snapshot` calls are
-    /// serialized. The snapshot's state is captured by RocksDB at
-    /// the [`rocksdb::DB::snapshot`] call, before the lock is taken;
-    /// callers who require a strict ordering between writes and the
-    /// snapshot's state should ensure no concurrent writers race
-    /// with this call.
+    /// Both the snapshot capture and the buffer insertion happen
+    /// while holding the snapshot buffer's write lock, so concurrent
+    /// `take_snapshot` calls are fully serialized: the snapshot's
+    /// observed state and its order in the buffer are committed
+    /// together. Callers who require a strict ordering between
+    /// writes and the snapshot's state still need to fence external
+    /// writers themselves; this method only ensures internal
+    /// consistency between competing `take_snapshot` callers.
     ///
     /// If a snapshot already exists at `checkpoint`, it is replaced.
     /// If the buffer is at
     /// [`DbOptions::snapshot_capacity`](crate::DbOptions::snapshot_capacity),
     /// the snapshot with the lowest checkpoint number is evicted.
     pub fn take_snapshot(&self, checkpoint: u64) {
+        // The rocksdb snapshot is captured *inside* the lock so that
+        // two concurrent `take_snapshot(N)` calls cannot land in
+        // checkpoint-N → older-state order: with the capture outside
+        // the lock, a thread that captures earlier may insert later
+        // and overwrite a fresher snapshot.
+        let mut snaps = self.snapshots.write();
         let snapshot = self.inner.snapshot();
         // SAFETY: `Snapshot::<'_, rocksdb::DB>::'_` is a borrow of
         // `self.inner`. The transmute to `'static` is sound because
@@ -259,9 +272,8 @@ impl Db {
         let snapshot: rocksdb::Snapshot<'static> = unsafe { std::mem::transmute(snapshot) };
         let entry = Arc::new(SnapshotEntry { snapshot });
 
-        let mut snaps = self.snapshots.write();
         snaps.insert(checkpoint, entry);
-        while snaps.len() > self.snapshot_capacity {
+        while snaps.len() > self.snapshot_capacity.get() {
             snaps.pop_first();
         }
     }
@@ -311,7 +323,7 @@ impl Db {
     /// checkpoint][rocksdb::checkpoint::Checkpoint] of the
     /// database. Routine writes do not require this call; RocksDB
     /// flushes automatically as memtables fill.
-    pub fn flush(&self) -> Result<(), OpenError> {
+    pub fn flush(&self) -> Result<(), Error> {
         self.inner.flush()?;
         Ok(())
     }
@@ -324,6 +336,24 @@ impl Db {
     /// reference is released.
     pub fn drop_snapshot(&self, checkpoint: u64) -> bool {
         self.snapshots.write().remove(&checkpoint).is_some()
+    }
+
+    /// Drop a column family at runtime.
+    ///
+    /// Returns an [`Error`] if the column family does not exist or
+    /// the underlying RocksDB call fails. After a successful drop,
+    /// any outstanding [`DbMap`](crate::DbMap) handle that targeted
+    /// the dropped CF will fail subsequent operations with
+    /// [`Error::MissingColumnFamily`].
+    ///
+    /// The caller is responsible for ensuring no other thread is
+    /// concurrently issuing reads or writes against the CF being
+    /// dropped — a concurrent operation is technically synchronized
+    /// by RocksDB but may surface as a `MissingColumnFamily` error
+    /// at an unpredictable moment.
+    pub fn drop_cf(&self, cf_name: &str) -> Result<(), Error> {
+        self.inner.drop_cf(cf_name)?;
+        Ok(())
     }
 
     /// Read RocksDB's per-column-family runtime properties for
@@ -585,5 +615,112 @@ mod tests {
         let result = Db::open::<TestSchema>(dir.path(), DbOptions::default());
         let err = result.expect_err("second open of the same path should fail");
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn drop_cf_removes_the_cf_at_runtime() {
+        let dir = TempDir::new().unwrap();
+        let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+        assert!(db.cf_handle("foo").is_some());
+        db.drop_cf("foo").unwrap();
+        assert!(db.cf_handle("foo").is_none());
+    }
+
+    #[test]
+    fn drop_cf_unknown_cf_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+        let err = db.drop_cf("not_in_schema").unwrap_err();
+        assert!(matches!(err, Error::Rocksdb(_)));
+    }
+
+    #[test]
+    fn data_persists_across_db_close_and_reopen() {
+        // Mirrors alt's test_persistence (minus the framework's
+        // watermark concerns). Writes through Batch survive a Db
+        // drop and a fresh open at the same path; in-memory
+        // snapshots do not (the buffer starts empty after reopen).
+        use crate::DbMap;
+        use crate::Encode;
+        use crate::error::DecodeError;
+        use crate::error::EncodeError;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct U64Be(u64);
+
+        impl Encode for U64Be {
+            fn encode_into<B: bytes::BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+                buf.put_slice(&self.0.to_be_bytes());
+                Ok(())
+            }
+        }
+
+        impl crate::Decode for U64Be {
+            fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+                if buf.remaining() != 8 {
+                    return Err(DecodeError::msg("expected 8 bytes"));
+                }
+                Ok(Self(buf.get_u64()))
+            }
+        }
+
+        #[derive(Debug)]
+        struct PersistSchema {
+            items: DbMap<U64Be, U64Be>,
+        }
+
+        impl Schema for PersistSchema {
+            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+                vec![("items", base_options.clone())]
+            }
+
+            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+                Ok(Self {
+                    items: DbMap::new(db.clone(), "items")?,
+                })
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        {
+            let (db, schema) = Db::open::<PersistSchema>(dir.path(), DbOptions::default()).unwrap();
+            let mut batch = db.batch();
+            batch
+                .put(&schema.items, &U64Be(42), &U64Be(43))
+                .unwrap();
+            batch.commit().unwrap();
+            // Live-tip read confirms before close.
+            assert_eq!(schema.items.get(&U64Be(42)).unwrap(), Some(U64Be(43)));
+        }
+        // Drop everything, then reopen at the same path.
+        let (_db2, schema2) =
+            Db::open::<PersistSchema>(dir.path(), DbOptions::default()).unwrap();
+        assert_eq!(schema2.items.get(&U64Be(42)).unwrap(), Some(U64Be(43)));
+    }
+
+    #[test]
+    fn dbmap_reads_fail_with_missing_cf_after_drop_cf() {
+        use crate::DbMap;
+        use crate::Encode;
+        use crate::error::EncodeError;
+
+        struct Bytes;
+        impl Encode for Bytes {
+            fn encode_into<B: bytes::BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+                buf.put_slice(b"k");
+                Ok(())
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+        let map: DbMap<Bytes, Vec<u8>> = DbMap::new(db.clone(), "foo").unwrap();
+
+        // Dropping the CF underneath an existing handle: subsequent
+        // reads surface MissingColumnFamily rather than panicking or
+        // succeeding silently.
+        db.drop_cf("foo").unwrap();
+        let err = map.get(&Bytes).unwrap_err();
+        assert!(matches!(err, Error::MissingColumnFamily(_)));
     }
 }

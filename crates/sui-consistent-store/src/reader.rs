@@ -54,14 +54,15 @@ use crate::snapshot::SnapshotHandle;
 /// [`set_snapshot`](ReadOptions::set_snapshot) pointed at the
 /// captured snapshot.
 ///
-/// # Sealed-by-convention
+/// # Sealed
 ///
 /// The crate ships exactly two implementations, [`Live`] and
-/// [`Snapshot`]. The trait is technically open, but downstream
-/// implementations are not supported: every consumer's read path
-/// makes assumptions about the two known reader shapes, and a
-/// custom reader could break the snapshot-borrow lifetime story.
-pub trait Reader {
+/// [`Snapshot`]. The trait is sealed via a private supertrait so
+/// downstream code cannot add a third — a custom reader could
+/// return [`ReadOptions`] referencing a snapshot pointer not
+/// co-owned through the [`Arc<Db>`] story, leading to UB inside
+/// RocksDB.
+pub trait Reader: private::Sealed {
     /// The shared database handle the column family lives on.
     fn db(&self) -> &Arc<Db>;
 
@@ -72,6 +73,12 @@ pub trait Reader {
     /// many reads in a tight loop pay one fresh allocation per call,
     /// which matches RocksDB's expected pattern.
     fn read_options(&self) -> ReadOptions;
+}
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for super::Live {}
+    impl Sealed for super::Snapshot<'_> {}
 }
 
 /// Reader bound to the database's live tip.

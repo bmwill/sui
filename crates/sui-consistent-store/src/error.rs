@@ -221,7 +221,9 @@ impl StdError for OpenError {
 ///
 /// This is the error type exposed by the read and write methods on
 /// typed column-family handles. Each variant wraps a more specific
-/// failure mode and can be matched on directly.
+/// failure mode and can be matched on directly. Marked
+/// `#[non_exhaustive]` so future variants are added without a
+/// breaking change for callers.
 ///
 /// # Examples
 ///
@@ -233,6 +235,7 @@ impl StdError for OpenError {
 /// assert!(matches!(e, Error::Decode(_)));
 /// ```
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A key or value could not be encoded.
     #[error(transparent)]
@@ -251,6 +254,14 @@ pub enum Error {
     /// schema definition or in `DbMap` construction.
     #[error("column family `{0}` is not registered")]
     MissingColumnFamily(String),
+
+    /// A defensive invariant was violated by an underlying RocksDB
+    /// component (for example, a raw iterator that reports `valid`
+    /// but yields `None` for its current key or value). This should
+    /// not occur in practice; if it does, the operation is aborted
+    /// and the error is surfaced rather than silently swallowed.
+    #[error("internal invariant violated: {0}")]
+    Internal(&'static str),
 }
 
 #[cfg(test)]
