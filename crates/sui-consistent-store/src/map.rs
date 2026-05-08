@@ -319,6 +319,71 @@ where
         self.multi_get_raw_with_opts(keys, &ReadOptions::default())
     }
 
+    /// Test whether `key` is present in the column family.
+    ///
+    /// Returns `Ok(true)` if a value exists at `key`, `Ok(false)`
+    /// otherwise. Internally short-circuits via RocksDB's
+    /// `key_may_exist_cf` bloom-filter fast path: if RocksDB
+    /// definitively reports the key is absent we return `false`
+    /// without touching disk; otherwise we confirm with a pinned
+    /// read.
+    pub fn contains_key(&self, key: &K) -> Result<bool, Error> {
+        self.contains_key_with_opts(key, &ReadOptions::default())
+    }
+
+    pub(crate) fn contains_key_with_opts(
+        &self,
+        key: &K,
+        opts: &ReadOptions,
+    ) -> Result<bool, Error> {
+        let cf = self.cf()?;
+        with_encode_buf(|buf| -> Result<bool, Error> {
+            key.encode_into(buf)?;
+            // Bloom-filter fast path. A `false` here is definitive;
+            // a `true` is "may exist" and needs confirming.
+            if !self
+                .db
+                .rocksdb()
+                .key_may_exist_cf_opt(&cf, buf.as_slice(), opts)
+            {
+                return Ok(false);
+            }
+            let pinned = self
+                .db
+                .rocksdb()
+                .get_pinned_cf_opt(&cf, buf.as_slice(), opts)?;
+            Ok(pinned.is_some())
+        })
+    }
+
+    /// Batched counterpart to [`contains_key`](Self::contains_key).
+    ///
+    /// Issues one RocksDB `batched_multi_get_cf` for all the keys.
+    /// Per-key encoding errors abort the entire batch; per-key read
+    /// failures surface as the outer `Err`.
+    pub fn multi_contains_keys<'k, I>(&self, keys: I) -> Result<Vec<bool>, Error>
+    where
+        I: IntoIterator<Item = &'k K>,
+        K: 'k,
+    {
+        self.multi_contains_keys_with_opts(keys, &ReadOptions::default())
+    }
+
+    pub(crate) fn multi_contains_keys_with_opts<'k, I>(
+        &self,
+        keys: I,
+        opts: &ReadOptions,
+    ) -> Result<Vec<bool>, Error>
+    where
+        I: IntoIterator<Item = &'k K>,
+        K: 'k,
+    {
+        let raw = self.multi_get_raw_with_opts(keys, opts)?;
+        raw.into_iter()
+            .map(|r| r.map(|opt| opt.is_some()))
+            .collect()
+    }
+
     pub(crate) fn multi_get_raw_with_opts<'k, I>(
         &self,
         keys: I,
@@ -625,6 +690,29 @@ mod tests {
         let keys: [U64Be; 0] = [];
         let results = schema.items.multi_get(keys.iter()).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn contains_key_returns_true_for_existing() {
+        let (_dir, db, schema) = open();
+        seed(&db, "items", &U64Be(7), &U64Be(700));
+        assert!(schema.items.contains_key(&U64Be(7)).unwrap());
+    }
+
+    #[test]
+    fn contains_key_returns_false_for_missing() {
+        let (_dir, _db, schema) = open();
+        assert!(!schema.items.contains_key(&U64Be(99)).unwrap());
+    }
+
+    #[test]
+    fn multi_contains_keys_reports_per_key() {
+        let (_dir, db, schema) = open();
+        seed(&db, "items", &U64Be(1), &U64Be(0));
+        seed(&db, "items", &U64Be(3), &U64Be(0));
+        let keys = [U64Be(1), U64Be(2), U64Be(3)];
+        let results = schema.items.multi_contains_keys(keys.iter()).unwrap();
+        assert_eq!(results, vec![true, false, true]);
     }
 
     #[test]

@@ -197,6 +197,27 @@ impl SnapshotHandle {
         map.multi_get_raw_with_opts(keys, &self.read_options())
     }
 
+    /// Test whether `key` is present in `map` at this snapshot.
+    pub fn contains_key<K, V>(&self, map: &DbMap<K, V>, key: &K) -> Result<bool, Error>
+    where
+        K: Encode,
+    {
+        map.contains_key_with_opts(key, &self.read_options())
+    }
+
+    /// Batched counterpart to [`contains_key`](Self::contains_key).
+    pub fn multi_contains_keys<'k, K, V, I>(
+        &self,
+        map: &DbMap<K, V>,
+        keys: I,
+    ) -> Result<Vec<bool>, Error>
+    where
+        K: Encode + 'k,
+        I: IntoIterator<Item = &'k K>,
+    {
+        map.multi_contains_keys_with_opts(keys, &self.read_options())
+    }
+
     /// Forward iteration against this snapshot, bounded by `range`.
     ///
     /// The returned iterator borrows from `self`, so the snapshot
@@ -478,6 +499,20 @@ mod tests {
             .unwrap()
             .expect("value should exist in snapshot");
         assert_eq!(&bytes[..], &100u64.to_be_bytes());
+    }
+
+    #[test]
+    fn snapshot_contains_key_reflects_pre_snapshot_state() {
+        let (_dir, db, schema) = open();
+        put(&db, &schema, 1, 100);
+        db.take_snapshot(1);
+        // Mutation after snapshot must not affect snapshot's view.
+        let mut batch = db.batch();
+        batch.delete(&schema.items, &U64Be(1)).unwrap();
+        batch.commit().unwrap();
+        let snap = db.at_snapshot(1).unwrap();
+        assert!(snap.contains_key(&schema.items, &U64Be(1)).unwrap());
+        assert!(!schema.items.contains_key(&U64Be(1)).unwrap());
     }
 
     #[test]
