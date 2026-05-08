@@ -82,8 +82,8 @@ pub struct DbOptions {
 /// }
 ///
 /// impl Schema for MySchema {
-///     fn cfs() -> Vec<(String, rocksdb::Options)> {
-///         vec![("my_cf".to_string(), rocksdb::Options::default())]
+///     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+///         vec![("my_cf", base_options.clone())]
 ///     }
 ///
 ///     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -175,12 +175,12 @@ impl Db {
             snapshot_capacity,
         } = opts;
 
-        let mut cfs = S::cfs();
+        let mut cfs = S::cfs(&db_options);
         // RocksDB requires the default column family to be declared
         // when opening with `open_cf_descriptors`. Register it
         // automatically so schemas don't have to.
-        if !cfs.iter().any(|(name, _)| name == "default") {
-            cfs.push((String::from("default"), rocksdb::Options::default()));
+        if !cfs.iter().any(|(name, _)| *name == "default") {
+            cfs.push(("default", db_options.clone()));
         }
 
         let descriptors = cfs
@@ -277,6 +277,23 @@ impl Db {
         Some(SnapshotHandle::new(self.clone(), entry, checkpoint))
     }
 
+    /// Look up the snapshot with the highest checkpoint number in
+    /// the buffer.
+    ///
+    /// Returns `None` if no snapshots have been taken (or all have
+    /// been evicted or dropped). Equivalent to
+    /// [`at_snapshot`](Self::at_snapshot) called with the upper
+    /// bound of [`snapshot_range`](Self::snapshot_range).
+    pub fn latest_snapshot(self: &Arc<Self>) -> Option<SnapshotHandle> {
+        let snaps = self.snapshots.read();
+        let (checkpoint, entry) = snaps.iter().next_back()?;
+        Some(SnapshotHandle::new(
+            self.clone(),
+            entry.clone(),
+            *checkpoint,
+        ))
+    }
+
     /// Returns the inclusive range of checkpoints covered by the
     /// snapshot buffer, or `None` if the buffer is empty.
     pub fn snapshot_range(&self) -> Option<RangeInclusive<u64>> {
@@ -310,11 +327,8 @@ mod tests {
     }
 
     impl Schema for TestSchema {
-        fn cfs() -> Vec<(String, rocksdb::Options)> {
-            vec![
-                (String::from("foo"), rocksdb::Options::default()),
-                (String::from("bar"), rocksdb::Options::default()),
-            ]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+            vec![("foo", base_options.clone()), ("bar", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
