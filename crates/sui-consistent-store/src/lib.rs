@@ -24,7 +24,9 @@ pub mod restore_runner;
 pub mod restore_state;
 pub mod schema;
 pub mod snapshot;
+pub mod snapshot_format;
 pub mod sst_writer;
+pub mod storage;
 
 pub use crate::batch::Batch;
 pub use crate::db::Db;
