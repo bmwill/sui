@@ -21,6 +21,7 @@ pub mod map;
 pub mod reader;
 pub mod schema;
 pub mod snapshot;
+pub mod sst_writer;
 
 pub use crate::batch::Batch;
 pub use crate::db::Db;
@@ -37,3 +38,4 @@ pub use crate::reader::Snapshot;
 pub use crate::schema::Schema;
 pub use crate::schema::SchemaAtSnapshot;
 pub use crate::snapshot::SnapshotHandle;
+pub use crate::sst_writer::SstWriter;
