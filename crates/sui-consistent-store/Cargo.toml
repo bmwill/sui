@@ -7,9 +7,11 @@ publish = false
 edition = "2024"
 
 [dependencies]
+anyhow.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
 rocksdb = { version = "0.22.0", default-features = false, features = ["snappy", "lz4", "zstd", "zlib", "multi-threaded-cf"] }
+sui-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

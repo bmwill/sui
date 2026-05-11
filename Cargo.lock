@@ -14454,9 +14454,11 @@ dependencies = [
 name = "sui-consistent-store"
 version = "1.72.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "parking_lot 0.12.3",
  "rocksdb",
+ "sui-types",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
