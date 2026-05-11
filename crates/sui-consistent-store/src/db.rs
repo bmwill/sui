@@ -245,6 +245,25 @@ impl Db {
         Batch::new(self.clone())
     }
 
+    /// Construct an empty shard-backed [`Batch`] tied to this
+    /// database, suitable for restore-time bulk loads.
+    ///
+    /// A shard-backed batch records operations into per-CF sorted
+    /// in-memory buffers rather than a [`rocksdb::WriteBatch`].
+    /// Once populated, drain it into one SST per CF via
+    /// [`Batch::finalize_into_ssts`] and atomically ingest the
+    /// resulting files via
+    /// [`Db::ingest_files_cf`](Self::ingest_files_cf).
+    ///
+    /// The shard backing enforces at most one operation per key
+    /// per CF — the invariant SST files require. Pipelines should
+    /// fold by key in their accumulator before calling
+    /// [`commit`](crate::Pipeline::commit) against a shard-backed
+    /// batch.
+    pub fn shard_batch(self: &Arc<Self>) -> Batch {
+        Batch::new_shard(self.clone())
+    }
+
     /// Take a snapshot of the database state and store it under
     /// `checkpoint`.
     ///

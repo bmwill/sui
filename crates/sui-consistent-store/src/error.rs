@@ -262,6 +262,22 @@ pub enum Error {
     /// and the error is surfaced rather than silently swallowed.
     #[error("internal invariant violated: {0}")]
     Internal(&'static str),
+
+    /// A shard-backed [`Batch`](crate::Batch) received more than one
+    /// operation for the same key in the same column family.
+    /// Shard-backed batches finalize into a single SST per CF, and
+    /// SST files reject duplicate consecutive keys, so the pipeline
+    /// must fold by key in its accumulator before emitting writes.
+    /// Surface as an explicit error rather than a panic so the
+    /// driver can attribute the failure to a pipeline.
+    #[error("shard batch: duplicate op for key in cf `{cf}` ({key_len} bytes)")]
+    DuplicateShardOp {
+        /// The column-family name on which the duplicate landed.
+        cf: String,
+        /// Length of the encoded key, useful for distinguishing
+        /// collisions when keys are otherwise opaque in logs.
+        key_len: usize,
+    },
 }
 
 #[cfg(test)]
