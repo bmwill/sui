@@ -1643,5 +1643,90 @@ mod tests {
             let snap_items = schema.items.at(&snap);
             assert_eq!(snap_items.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
         }
+
+        // The next two tests pin the cross-SST merge story that the
+        // restore design depends on. Multiple shards (modeled as
+        // separate SST files) may each emit a merge entry for the
+        // same key — at most one per shard, since `SstFileWriter`
+        // rejects duplicate consecutive keys — and after ingest the
+        // merge operator must combine them into the correct
+        // aggregate value. This is the foundation that makes the
+        // restore-via-SST design correct for merge-coalescing
+        // schemas like `balances` (one merge per (owner, type) key
+        // per shard, many shards across the live object set).
+
+        #[test]
+        fn cross_sst_merges_combine_via_operator_after_ingest() {
+            // Three SSTs, each contributing one merge for the same
+            // key plus one merge for a shard-local key. After
+            // ingesting all three, reads must combine all three
+            // shared-key merges via the operator while keeping the
+            // shard-local keys independent.
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<MergeIngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let p1 = sst_dir.path().join("shard1.sst");
+            let p2 = sst_dir.path().join("shard2.sst");
+            let p3 = sst_dir.path().join("shard3.sst");
+            // (key=1 is the shared key; keys 10/11/12 are per-shard.)
+            build_merge_sst(&p1, &[(1, 10), (10, 1000)]);
+            build_merge_sst(&p2, &[(1, 20), (11, 1100)]);
+            build_merge_sst(&p3, &[(1, 30), (12, 1200)]);
+
+            // Ingest one at a time (the realistic restore flow:
+            // shards finalize independently, each triggers its own
+            // ingest). Each call lands the SST at the bottom level
+            // because the key ranges of these three files overlap
+            // only at the shared key.
+            db.ingest_files_cf("counters", vec![p1]).unwrap();
+            db.ingest_files_cf("counters", vec![p2]).unwrap();
+            db.ingest_files_cf("counters", vec![p3]).unwrap();
+
+            // Shared key: operator sums all three merge operands.
+            assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(60)));
+            // Per-shard keys: each survives with its sole operand.
+            assert_eq!(schema.counters.get(&U64Be(10)).unwrap(), Some(U64Be(1000)));
+            assert_eq!(schema.counters.get(&U64Be(11)).unwrap(), Some(U64Be(1100)));
+            assert_eq!(schema.counters.get(&U64Be(12)).unwrap(), Some(U64Be(1200)));
+
+            // The merge must continue to apply correctly after a
+            // manual compaction (which folds the merge entries into
+            // the base value). This pins the post-compaction behavior
+            // so a future restore is not surprised by a deferred
+            // application of the operator.
+            let cf = db.cf_handle("counters").unwrap();
+            db.rocksdb()
+                .compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+            assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(60)));
+            assert_eq!(schema.counters.get(&U64Be(10)).unwrap(), Some(U64Be(1000)));
+        }
+
+        #[test]
+        fn cross_sst_merges_combine_when_ingested_together() {
+            // Same shape as the previous test, but all three SSTs
+            // are passed to a single `ingest_files_cf` call.
+            // RocksDB places each file individually based on its
+            // own key range, so the combine semantics are
+            // identical, but the call site is one batched ingest
+            // rather than three sequential ones — a path some
+            // drivers may prefer.
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<MergeIngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let p1 = sst_dir.path().join("shard1.sst");
+            let p2 = sst_dir.path().join("shard2.sst");
+            let p3 = sst_dir.path().join("shard3.sst");
+            build_merge_sst(&p1, &[(1, 7)]);
+            build_merge_sst(&p2, &[(1, 11)]);
+            build_merge_sst(&p3, &[(1, 13)]);
+
+            db.ingest_files_cf("counters", vec![p1, p2, p3]).unwrap();
+
+            assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(31)));
+        }
     }
 }
