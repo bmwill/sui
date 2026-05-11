@@ -31,8 +31,11 @@ file will be removed.
   surfaces.
 - A plain, hand-written schema model — schemas are ordinary Rust structs
   of typed `DbMap<K, V>` fields.
-- Dependency hygiene: only crates.io dependencies in this core crate; no
-  internal Sui workspace dependencies.
+- Modest, considered dependency footprint. The foundational primitives
+  stay on crates.io alone, but the indexing-pipeline layer takes a
+  dependency on `sui-types` (for `Object` and `CheckpointData`) so a
+  unified `Pipeline` trait can drive both restore and tip flows from
+  a single impl. See `INDEXING-DESIGN.md`.
 
 ## Non-goals (initial version)
 
@@ -57,9 +60,13 @@ file will be removed.
 `sui-consistent-store` is a foundational primitive. Existing on-disk
 indexes (`sui-core::rpc_index`,
 `sui-indexer-alt-consistent-store`) are expected to migrate onto it.
-The crate has no knowledge of the indexer-alt framework, validator
-execution, or formal snapshots — those concerns live in a sibling crate
-(`sui-consistent-store-framework`, future) or in consumers.
+The crate has no knowledge of the indexer-alt framework or of
+validator execution; those concerns live in a sibling crate
+(`sui-consistent-store-framework`, future) or in consumers. The
+crate *does* know about Sui-level types (`Object` and
+`CheckpointData`) at the indexing-pipeline layer, and about the
+formal-snapshot file format on the restore side. See
+`INDEXING-DESIGN.md` for the full layering rationale.
 
 ### 2. Encoding bound to the type
 
@@ -145,17 +152,23 @@ filesystem-checkpoint use case surfaces.
 
 Two crates:
 
-- **`sui-consistent-store`** (this crate). The foundational primitive.
-  No `sui-indexer-alt-framework` dependency, and no internal-Sui
-  workspace dependencies. Builds against crates.io alone.
+- **`sui-consistent-store`** (this crate). The foundational primitive
+  *and* the indexing-pipeline layer (the `Pipeline` trait, the two
+  restore drivers, the formal-snapshot fetch path, and the
+  validator's checkpoint-executor adapter). No
+  `sui-indexer-alt-framework` dependency. Workspace dependencies
+  are limited to `sui-types` and `sui-storage` (for the formal
+  snapshot wire format). The validator-side perpetual-store
+  restore driver lives in `sui-core` and feeds objects into this
+  crate's restore runner via a small stream trait.
 - **`sui-consistent-store-framework`** (future). Implements the
-  `sui-indexer-alt-framework-store-traits` interfaces, contains the
-  cross-pipeline snapshot coordinator (analogous to today's
-  `sui-indexer-alt-consistent-store::store::synchronizer`), and houses
-  the formal-snapshot restore harness.
+  `sui-indexer-alt-framework-store-traits` interfaces and contains
+  the cross-pipeline snapshot coordinator (analogous to today's
+  `sui-indexer-alt-consistent-store::store::synchronizer`).
 
 We will build and stabilize the core crate before starting the
-framework crate.
+framework crate. See `INDEXING-DESIGN.md` for the indexing-layer
+plan.
 
 ### 6. Zero-copy reads
 
