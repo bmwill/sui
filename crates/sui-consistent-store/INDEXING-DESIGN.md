@@ -170,15 +170,22 @@ pub trait Pipeline: Send + Sync + 'static {
     /// driver always uses 1.
     const MAX_BATCH_CHECKPOINTS: usize = 5 * 60;
 
-    /// Stage updates derived from a single live object into `batch`.
-    /// Drivers parallelize across input objects up to
-    /// `RESTORE_FANOUT`. The same `&Self::Schema` reference is shared
-    /// across worker threads; the `Batch` is per-thread.
+    /// Fold updates derived from a single live object into the
+    /// per-shard accumulator. Drivers parallelize across input
+    /// objects up to `RESTORE_FANOUT`. Each worker owns its own
+    /// accumulator; the driver feeds it to `commit` when the
+    /// shard is done.
+    ///
+    /// Accumulator-style rather than writing through a `Batch`
+    /// directly: SST ingestion requires at most one operation per
+    /// key per shard's commit, so folding by key in the
+    /// accumulator (which `commit` then drains into the write
+    /// target) makes that invariant a property of the pipeline's
+    /// data structure rather than a runtime check.
     fn restore(
         &self,
-        schema: &Self::Schema,
+        accumulator: &mut Self::Batch,
         object: &Object,
-        batch: &mut Batch,
     ) -> Result<(), Error>;
 
     /// Extract a checkpoint into rows. Pure function; called from
