@@ -12,6 +12,7 @@
 //! checkpoint helper follow.
 
 pub mod batch;
+pub mod checkpoint_executor_adapter;
 pub mod db;
 pub mod encode;
 mod encode_buf;
@@ -30,6 +31,7 @@ pub mod sst_writer;
 pub mod storage;
 
 pub use crate::batch::Batch;
+pub use crate::checkpoint_executor_adapter::CheckpointExecutorAdapter;
 pub use crate::db::Db;
 pub use crate::db::DbOptions;
 pub use crate::db::RocksMetrics;
