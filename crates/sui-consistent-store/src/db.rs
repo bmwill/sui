@@ -29,8 +29,13 @@ use parking_lot::RwLock;
 use rocksdb::BoundColumnFamily;
 
 use crate::batch::Batch;
+use crate::encode_buf::with_encode_buf;
+use crate::encode::Decode;
+use crate::encode::Encode;
 use crate::error::Error;
 use crate::error::OpenError;
+use crate::restore_state::RESTORE_CF;
+use crate::restore_state::RestoreState;
 use crate::schema::Schema;
 use crate::snapshot::SnapshotHandle;
 
@@ -187,6 +192,13 @@ impl Db {
         // automatically so schemas don't have to.
         if !cfs.iter().any(|(name, _)| *name == "default") {
             cfs.push(("default", db_options.clone()));
+        }
+        // The internal restore-state column family is auto-registered
+        // alongside the schema's CFs so per-pipeline restore markers
+        // survive process restarts. See [`RESTORE_CF`] and
+        // [`RestoreState`].
+        if !cfs.iter().any(|(name, _)| *name == RESTORE_CF) {
+            cfs.push((RESTORE_CF, db_options.clone()));
         }
 
         let descriptors = cfs
@@ -495,6 +507,99 @@ impl Db {
     pub fn flush(&self) -> Result<(), Error> {
         self.inner.flush()?;
         Ok(())
+    }
+
+    /// Read the persisted [`RestoreState`] for `pipeline`.
+    ///
+    /// Returns `None` if no entry exists — the pipeline has either
+    /// never started restore on this database, or restore was
+    /// cleared via
+    /// [`clear_restore_state`](Self::clear_restore_state).
+    ///
+    /// Storage lives in the internal [`RESTORE_CF`] column family,
+    /// auto-registered by [`Db::open`].
+    pub fn restore_state(&self, pipeline: &str) -> Result<Option<RestoreState>, Error> {
+        let cf = self
+            .cf_handle(RESTORE_CF)
+            .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
+        let pinned = self.inner.get_pinned_cf(&cf, pipeline.as_bytes())?;
+        match pinned {
+            Some(bytes) => {
+                let mut slice = &bytes[..];
+                let state = RestoreState::decode(&mut slice)?;
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Write a [`RestoreState`] for `pipeline`.
+    ///
+    /// Replaces any existing entry. The write goes through
+    /// RocksDB's normal write path (memtable + WAL); callers that
+    /// need this to land atomically alongside ingestion of a
+    /// partition's SSTs should batch the update with the rest of
+    /// their commit work via [`Db::batch`].
+    pub fn set_restore_state(
+        &self,
+        pipeline: &str,
+        state: &RestoreState,
+    ) -> Result<(), Error> {
+        let cf = self
+            .cf_handle(RESTORE_CF)
+            .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
+        with_encode_buf(|buf| -> Result<(), Error> {
+            state.encode_into(buf)?;
+            self.inner.put_cf(&cf, pipeline.as_bytes(), buf.as_slice())?;
+            Ok(())
+        })
+    }
+
+    /// Delete the [`RestoreState`] entry for `pipeline`.
+    ///
+    /// Returns `Ok(())` whether or not an entry existed.
+    pub fn clear_restore_state(&self, pipeline: &str) -> Result<(), Error> {
+        let cf = self
+            .cf_handle(RESTORE_CF)
+            .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
+        self.inner.delete_cf(&cf, pipeline.as_bytes())?;
+        Ok(())
+    }
+
+    /// Enumerate all `(pipeline, state)` pairs in the restore-state
+    /// CF.
+    ///
+    /// Useful at startup to detect pipelines whose restore is
+    /// `InProgress` from a previous run; the driver can then resume
+    /// (skipping already-ingested partitions) or refuse to begin
+    /// tip indexing until restore completes.
+    ///
+    /// The returned `Vec` materializes the whole CF; the CF holds
+    /// one entry per pipeline so this is bounded by the number of
+    /// pipelines registered against the database.
+    pub fn restore_states(&self) -> Result<Vec<(String, RestoreState)>, Error> {
+        let cf = self
+            .cf_handle(RESTORE_CF)
+            .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
+        let mut out = Vec::new();
+        let iter = self
+            .inner
+            .iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for entry in iter {
+            let (key_bytes, value_bytes) = entry?;
+            let pipeline = std::str::from_utf8(&key_bytes)
+                .map_err(|e| {
+                    Error::Decode(crate::error::DecodeError::with_source(
+                        "RESTORE_CF key not valid utf-8",
+                        e,
+                    ))
+                })?
+                .to_string();
+            let mut slice = &value_bytes[..];
+            let state = RestoreState::decode(&mut slice)?;
+            out.push((pipeline, state));
+        }
+        Ok(out)
     }
 
     /// Drop the snapshot at `checkpoint`. Returns `true` if a
@@ -891,6 +996,129 @@ mod tests {
         db.drop_cf("foo").unwrap();
         let err = map.get(&Bytes).unwrap_err();
         assert!(matches!(err, Error::MissingColumnFamily(_)));
+    }
+
+    mod restore_state_accessor {
+        //! Tests for [`Db::restore_state`], [`Db::set_restore_state`],
+        //! [`Db::clear_restore_state`], and [`Db::restore_states`].
+
+        use std::collections::BTreeSet;
+
+        use tempfile::TempDir;
+
+        use super::*;
+
+        #[test]
+        fn restore_cf_is_auto_registered() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+            assert!(db.cf_handle(RESTORE_CF).is_some());
+        }
+
+        #[test]
+        fn restore_state_is_none_for_unknown_pipeline() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+            assert!(db.restore_state("foo").unwrap().is_none());
+        }
+
+        #[test]
+        fn set_then_get_restore_state_round_trips() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let state = RestoreState::InProgress {
+                target_checkpoint: 100,
+                partitions_complete: {
+                    let mut s = BTreeSet::new();
+                    s.insert(vec![0u8, 1, 2]);
+                    s.insert(b"shard-3".to_vec());
+                    s
+                },
+            };
+            db.set_restore_state("balances", &state).unwrap();
+            assert_eq!(db.restore_state("balances").unwrap(), Some(state));
+        }
+
+        #[test]
+        fn set_overwrites_previous_state() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+            db.set_restore_state(
+                "p",
+                &RestoreState::InProgress {
+                    target_checkpoint: 1,
+                    partitions_complete: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+            let done = RestoreState::Complete { restored_at: 42 };
+            db.set_restore_state("p", &done).unwrap();
+            assert_eq!(db.restore_state("p").unwrap(), Some(done));
+        }
+
+        #[test]
+        fn clear_removes_existing_entry() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+            db.set_restore_state("p", &RestoreState::Complete { restored_at: 1 })
+                .unwrap();
+            db.clear_restore_state("p").unwrap();
+            assert!(db.restore_state("p").unwrap().is_none());
+        }
+
+        #[test]
+        fn clear_unknown_pipeline_is_ok() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+            db.clear_restore_state("nope").unwrap();
+        }
+
+        #[test]
+        fn restore_states_enumerates_all_entries_in_key_order() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let s1 = RestoreState::Complete { restored_at: 10 };
+            let s2 = RestoreState::InProgress {
+                target_checkpoint: 99,
+                partitions_complete: {
+                    let mut s = BTreeSet::new();
+                    s.insert(vec![0u8]);
+                    s
+                },
+            };
+            db.set_restore_state("balances", &s1).unwrap();
+            db.set_restore_state("coins", &s2).unwrap();
+
+            let all = db.restore_states().unwrap();
+            assert_eq!(
+                all,
+                vec![
+                    ("balances".to_string(), s1),
+                    ("coins".to_string(), s2),
+                ],
+            );
+        }
+
+        #[test]
+        fn restore_states_empty_when_no_entries() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+            assert!(db.restore_states().unwrap().is_empty());
+        }
+
+        #[test]
+        fn restore_state_persists_across_db_reopen() {
+            let dir = TempDir::new().unwrap();
+            let state = RestoreState::Complete { restored_at: 7 };
+            {
+                let (db, _schema) =
+                    Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+                db.set_restore_state("p", &state).unwrap();
+            }
+            let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+            assert_eq!(db.restore_state("p").unwrap(), Some(state));
+        }
     }
 
     mod options_toggle {
