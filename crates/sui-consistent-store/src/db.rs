@@ -315,6 +315,110 @@ impl Db {
         Some(lo..=hi)
     }
 
+    /// Apply caller-supplied runtime-mutable options to `cf_name`.
+    ///
+    /// Thin typed wrapper around
+    /// [`rocksdb::DB::set_options_cf`] that surfaces an unknown
+    /// column-family name as
+    /// [`Error::MissingColumnFamily`](crate::error::Error::MissingColumnFamily)
+    /// rather than as a generic RocksDB error.
+    ///
+    /// `opts` is a slice of `(name, value)` pairs. Names must come
+    /// from RocksDB's runtime-mutable options list (see
+    /// [`advanced_options.h`]); unknown or non-mutable names fail
+    /// with [`Error::Rocksdb`](crate::error::Error::Rocksdb).
+    ///
+    /// An empty `opts` slice is a no-op (returns `Ok(())` without
+    /// touching RocksDB); the unknown-CF check is still applied.
+    /// RocksDB itself rejects an empty option set with an
+    /// `Invalid argument: empty input` error, but at the typed
+    /// surface "apply nothing" is a sensible default for callers
+    /// that build option lists dynamically.
+    ///
+    /// [`advanced_options.h`]: https://github.com/facebook/rocksdb/blob/main/include/rocksdb/advanced_options.h
+    pub fn set_options_cf(&self, cf_name: &str, opts: &[(&str, &str)]) -> Result<(), Error> {
+        let cf = self
+            .cf_handle(cf_name)
+            .ok_or_else(|| Error::MissingColumnFamily(cf_name.to_string()))?;
+        if opts.is_empty() {
+            return Ok(());
+        }
+        self.inner.set_options_cf(&cf, opts)?;
+        Ok(())
+    }
+
+    /// Apply restore-friendly compaction settings to `cf_name`.
+    ///
+    /// Disables auto-compaction and raises the three L0 triggers to
+    /// ceiling values so a bulk load that produces many L0 files
+    /// (or relies on
+    /// [`ingest_files_cf`](Self::ingest_files_cf) into a fresh CF)
+    /// does not stall on slowdown / stop thresholds.
+    ///
+    /// Pairs with [`set_tip_options_cf`](Self::set_tip_options_cf):
+    /// the application transitions restore → tip with the matching
+    /// toggle and no reopen. Both toggles touch only runtime-mutable
+    /// option keys, so this method can be called at any time on an
+    /// open database.
+    ///
+    /// The keys touched are:
+    /// - `disable_auto_compactions = true`
+    /// - `level0_file_num_compaction_trigger = i32::MAX`
+    /// - `level0_slowdown_writes_trigger = -1` (the disabled
+    ///   sentinel)
+    /// - `level0_stop_writes_trigger = i32::MAX`
+    ///
+    /// # Schema-set tip defaults are not preserved
+    ///
+    /// Per-CF tip-mode values for these specific keys set via
+    /// [`Schema::cfs`](crate::Schema::cfs) at open time are *not*
+    /// captured for reversal by
+    /// [`set_tip_options_cf`](Self::set_tip_options_cf), which
+    /// applies RocksDB defaults. A schema that needs non-default
+    /// values for these knobs at tip should re-apply them via
+    /// [`set_options_cf`](Self::set_options_cf) after the tip-mode
+    /// toggle.
+    pub fn set_restore_options_cf(&self, cf_name: &str) -> Result<(), Error> {
+        // The string values are RocksDB option-parser inputs:
+        // bools are "true"/"false", integers are decimal strings.
+        let max = i32::MAX.to_string();
+        self.set_options_cf(
+            cf_name,
+            &[
+                ("disable_auto_compactions", "true"),
+                ("level0_file_num_compaction_trigger", &max),
+                ("level0_slowdown_writes_trigger", "-1"),
+                ("level0_stop_writes_trigger", &max),
+            ],
+        )
+    }
+
+    /// Apply tip-mode compaction settings to `cf_name`.
+    ///
+    /// Restores RocksDB defaults for the four compaction-trigger
+    /// knobs raised by
+    /// [`set_restore_options_cf`](Self::set_restore_options_cf).
+    /// The values applied are the upstream defaults from
+    /// [`advanced_options.h`]:
+    ///
+    /// - `disable_auto_compactions = false`
+    /// - `level0_file_num_compaction_trigger = 4`
+    /// - `level0_slowdown_writes_trigger = 20`
+    /// - `level0_stop_writes_trigger = 36`
+    ///
+    /// [`advanced_options.h`]: https://github.com/facebook/rocksdb/blob/main/include/rocksdb/advanced_options.h
+    pub fn set_tip_options_cf(&self, cf_name: &str) -> Result<(), Error> {
+        self.set_options_cf(
+            cf_name,
+            &[
+                ("disable_auto_compactions", "false"),
+                ("level0_file_num_compaction_trigger", "4"),
+                ("level0_slowdown_writes_trigger", "20"),
+                ("level0_stop_writes_trigger", "36"),
+            ],
+        )
+    }
+
     /// Atomically ingest a set of pre-built SST files into the
     /// column family named `cf_name`.
     ///
@@ -787,6 +891,210 @@ mod tests {
         db.drop_cf("foo").unwrap();
         let err = map.get(&Bytes).unwrap_err();
         assert!(matches!(err, Error::MissingColumnFamily(_)));
+    }
+
+    mod options_toggle {
+        //! Tests for [`Db::set_options_cf`],
+        //! [`Db::set_restore_options_cf`], and
+        //! [`Db::set_tip_options_cf`].
+
+        use bytes::BufMut;
+        use tempfile::TempDir;
+
+        use super::*;
+        use crate::DbMap;
+        use crate::Encode;
+        use crate::error::EncodeError;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct U64Be(u64);
+
+        impl Encode for U64Be {
+            fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+                buf.put_slice(&self.0.to_be_bytes());
+                Ok(())
+            }
+        }
+
+        impl crate::Decode for U64Be {
+            fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, crate::error::DecodeError> {
+                if buf.remaining() != 8 {
+                    return Err(crate::error::DecodeError::msg("expected 8 bytes"));
+                }
+                Ok(Self(buf.get_u64()))
+            }
+        }
+
+        #[derive(Debug)]
+        struct ItemsSchema {
+            items: DbMap<U64Be, U64Be>,
+        }
+
+        impl Schema for ItemsSchema {
+            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+                vec![("items", base_options.clone())]
+            }
+
+            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+                Ok(Self {
+                    items: DbMap::new(db.clone(), "items")?,
+                })
+            }
+        }
+
+        #[test]
+        fn set_options_cf_applies_known_mutable_options() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) =
+                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            // `disable_auto_compactions` is a documented mutable
+            // option; setting both true and false must succeed.
+            db.set_options_cf("items", &[("disable_auto_compactions", "true")])
+                .unwrap();
+            db.set_options_cf("items", &[("disable_auto_compactions", "false")])
+                .unwrap();
+        }
+
+        #[test]
+        fn set_options_cf_unknown_key_returns_rocksdb_error() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) =
+                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let err = db
+                .set_options_cf("items", &[("not_a_real_option", "1")])
+                .unwrap_err();
+            assert!(matches!(err, Error::Rocksdb(_)));
+        }
+
+        #[test]
+        fn set_options_cf_unknown_cf_returns_missing_column_family() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) =
+                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let err = db
+                .set_options_cf("not_in_schema", &[("disable_auto_compactions", "true")])
+                .unwrap_err();
+            assert!(matches!(err, Error::MissingColumnFamily(_)));
+        }
+
+        #[test]
+        fn set_options_cf_empty_slice_is_ok() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) =
+                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            db.set_options_cf("items", &[]).unwrap();
+        }
+
+        #[test]
+        fn restore_then_tip_toggles_succeed() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) =
+                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            db.set_restore_options_cf("items").unwrap();
+            db.set_tip_options_cf("items").unwrap();
+        }
+
+        #[test]
+        fn restore_options_unknown_cf_errors() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) =
+                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let err = db.set_restore_options_cf("not_in_schema").unwrap_err();
+            assert!(matches!(err, Error::MissingColumnFamily(_)));
+        }
+
+        #[test]
+        fn tip_options_unknown_cf_errors() {
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) =
+                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let err = db.set_tip_options_cf("not_in_schema").unwrap_err();
+            assert!(matches!(err, Error::MissingColumnFamily(_)));
+        }
+
+        #[test]
+        fn writes_proceed_under_restore_options() {
+            // Bulk-load shape: many writes into a CF whose
+            // compaction has been frozen. The L0 stop trigger is at
+            // i32::MAX so no slowdown / stop fires; writes complete
+            // without error.
+            let dir = TempDir::new().unwrap();
+            let (db, schema) =
+                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            db.set_restore_options_cf("items").unwrap();
+
+            // Enough writes plus flushes to produce multiple L0
+            // files. Under default tip options the L0 stop trigger
+            // (36) would not be reached either, but the test still
+            // exercises that writes go through the path we've
+            // toggled.
+            for batch_id in 0..8u64 {
+                let mut batch = db.batch();
+                for i in 0..256u64 {
+                    let k = batch_id * 1024 + i;
+                    batch.put(&schema.items, &U64Be(k), &U64Be(k)).unwrap();
+                }
+                batch.commit().unwrap();
+                db.flush().unwrap();
+            }
+
+            db.set_tip_options_cf("items").unwrap();
+
+            // Continuing writes under tip options also succeed.
+            let mut batch = db.batch();
+            batch
+                .put(&schema.items, &U64Be(9999), &U64Be(9999))
+                .unwrap();
+            batch.commit().unwrap();
+
+            assert_eq!(
+                schema.items.get(&U64Be(0)).unwrap(),
+                Some(U64Be(0)),
+                "data written under restore options must still be readable after tip toggle",
+            );
+            assert_eq!(
+                schema.items.get(&U64Be(9999)).unwrap(),
+                Some(U64Be(9999)),
+            );
+        }
+
+        #[test]
+        fn restore_toggle_is_per_cf() {
+            // Two CFs, restore-mode on one only; the other keeps
+            // its tip defaults. Verified by exercising both CFs and
+            // confirming both write paths succeed independently.
+            #[derive(Debug)]
+            struct TwoCfSchema {
+                a: DbMap<U64Be, U64Be>,
+                b: DbMap<U64Be, U64Be>,
+            }
+
+            impl Schema for TwoCfSchema {
+                fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+                    vec![("a", base_options.clone()), ("b", base_options.clone())]
+                }
+
+                fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+                    Ok(Self {
+                        a: DbMap::new(db.clone(), "a")?,
+                        b: DbMap::new(db.clone(), "b")?,
+                    })
+                }
+            }
+
+            let dir = TempDir::new().unwrap();
+            let (db, schema) = Db::open::<TwoCfSchema>(dir.path(), DbOptions::default()).unwrap();
+            db.set_restore_options_cf("a").unwrap();
+
+            let mut batch = db.batch();
+            batch.put(&schema.a, &U64Be(1), &U64Be(10)).unwrap();
+            batch.put(&schema.b, &U64Be(2), &U64Be(20)).unwrap();
+            batch.commit().unwrap();
+
+            db.set_tip_options_cf("a").unwrap();
+            assert_eq!(schema.a.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
+            assert_eq!(schema.b.get(&U64Be(2)).unwrap(), Some(U64Be(20)));
+        }
     }
 
     mod ingest {
