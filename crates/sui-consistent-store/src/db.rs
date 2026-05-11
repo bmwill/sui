@@ -315,6 +315,71 @@ impl Db {
         Some(lo..=hi)
     }
 
+    /// Atomically ingest a set of pre-built SST files into the
+    /// column family named `cf_name`.
+    ///
+    /// SSTs are typically produced by
+    /// [`SstWriter`](crate::SstWriter). Each SST must contain keys
+    /// in strict comparator order; across SSTs in a single call,
+    /// files may overlap or not. RocksDB places each file at the
+    /// lowest LSM level whose key range does not overlap existing
+    /// data, so ingesting into an empty CF lands files at the
+    /// bottommost level — bypassing the memtable, the WAL, and L0
+    /// entirely.
+    ///
+    /// # Behavior on overlap
+    ///
+    /// - With memtable entries: RocksDB flushes the memtable before
+    ///   ingestion (controlled by `allow_blocking_flush`, default
+    ///   true).
+    /// - With existing SST data: RocksDB walks levels until it finds
+    ///   one with no overlap, falling back to L0. Ingested keys
+    ///   shadow earlier values at the same key.
+    /// - With in-memory snapshots taken before this call:
+    ///   `snapshot_consistency` (default true) ensures pre-ingest
+    ///   snapshots do not see the ingested keys.
+    ///
+    /// # Defaults
+    ///
+    /// This method uses
+    /// [`IngestExternalFileOptions::default`](rocksdb::IngestExternalFileOptions)
+    /// with `move_files = true`. Moving rather than copying requires
+    /// the SST files to live on the same filesystem as the
+    /// database directory; otherwise the call fails. Callers that
+    /// need different options should use
+    /// [`ingest_files_cf_opts`](Self::ingest_files_cf_opts).
+    pub fn ingest_files_cf<P: AsRef<Path>>(
+        &self,
+        cf_name: &str,
+        paths: Vec<P>,
+    ) -> Result<(), Error> {
+        let mut opts = rocksdb::IngestExternalFileOptions::default();
+        opts.set_move_files(true);
+        self.ingest_files_cf_opts(cf_name, &opts, paths)
+    }
+
+    /// Atomically ingest SST files with caller-supplied
+    /// [`IngestExternalFileOptions`](rocksdb::IngestExternalFileOptions).
+    ///
+    /// Use this when the defaults from
+    /// [`ingest_files_cf`](Self::ingest_files_cf) do not fit — for
+    /// example, to disable `move_files` when the SSTs live on a
+    /// different filesystem, or to enable `ingest_behind` for an
+    /// append-only restore on a CF whose schema opened the database
+    /// with `allow_ingest_behind=true`.
+    pub fn ingest_files_cf_opts<P: AsRef<Path>>(
+        &self,
+        cf_name: &str,
+        opts: &rocksdb::IngestExternalFileOptions,
+        paths: Vec<P>,
+    ) -> Result<(), Error> {
+        let cf = self
+            .cf_handle(cf_name)
+            .ok_or_else(|| Error::MissingColumnFamily(cf_name.to_string()))?;
+        self.inner.ingest_external_file_cf_opts(&cf, opts, paths)?;
+        Ok(())
+    }
+
     /// Flush all column families to disk, blocking until each
     /// memtable has been written.
     ///
@@ -722,5 +787,325 @@ mod tests {
         db.drop_cf("foo").unwrap();
         let err = map.get(&Bytes).unwrap_err();
         assert!(matches!(err, Error::MissingColumnFamily(_)));
+    }
+
+    mod ingest {
+        //! Tests for [`Db::ingest_files_cf`] and
+        //! [`Db::ingest_files_cf_opts`].
+
+        use bytes::Buf;
+        use bytes::BufMut;
+        use tempfile::TempDir;
+
+        use super::*;
+        use crate::DbMap;
+        use crate::Decode;
+        use crate::Encode;
+        use crate::SstWriter;
+        use crate::error::DecodeError;
+        use crate::error::EncodeError;
+
+        /// Hand-rolled big-endian `u64`. The byte representation
+        /// matches the comparator order RocksDB uses by default, so
+        /// the encoded form sorts the same way the typed values do.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct U64Be(u64);
+
+        impl Encode for U64Be {
+            fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+                buf.put_slice(&self.0.to_be_bytes());
+                Ok(())
+            }
+        }
+
+        impl Decode for U64Be {
+            fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+                if buf.remaining() != 8 {
+                    return Err(DecodeError::msg("expected 8 bytes"));
+                }
+                Ok(Self(buf.get_u64()))
+            }
+        }
+
+        /// One-CF schema. Used by the put-flavored ingest tests.
+        #[derive(Debug)]
+        struct IngestSchema {
+            items: DbMap<U64Be, U64Be>,
+        }
+
+        impl Schema for IngestSchema {
+            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+                vec![("items", base_options.clone())]
+            }
+
+            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+                Ok(Self {
+                    items: DbMap::new(db.clone(), "items")?,
+                })
+            }
+        }
+
+        /// Associative merge operator that sums big-endian `u64`s.
+        /// Mirrors the operator in `batch::tests` so the ingested
+        /// merge entries combine the way a tip-mode merge would.
+        fn add_u64_merge_op(
+            _key: &[u8],
+            existing: Option<&[u8]>,
+            operands: &rocksdb::MergeOperands,
+        ) -> Option<Vec<u8>> {
+            let mut total: u64 = existing
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+            for op in operands {
+                if let Ok(arr) = <[u8; 8]>::try_from(op) {
+                    total = total.saturating_add(u64::from_be_bytes(arr));
+                }
+            }
+            Some(total.to_be_bytes().to_vec())
+        }
+
+        /// One-CF schema whose CF has the `add_u64` merge operator
+        /// installed. Used by the merge-flavored ingest test.
+        #[derive(Debug)]
+        struct MergeIngestSchema {
+            counters: DbMap<U64Be, U64Be>,
+        }
+
+        impl Schema for MergeIngestSchema {
+            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+                let mut counter_opts = base_options.clone();
+                counter_opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
+                vec![("counters", counter_opts)]
+            }
+
+            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+                Ok(Self {
+                    counters: DbMap::new(db.clone(), "counters")?,
+                })
+            }
+        }
+
+        /// Build a finalized SST at `path` containing the supplied
+        /// (key, value) pairs as `put`s. Caller ensures keys are
+        /// sorted.
+        fn build_put_sst(path: &std::path::Path, kvs: &[(u64, u64)]) {
+            let mut w: SstWriter<U64Be, U64Be> =
+                SstWriter::create(path, rocksdb::Options::default()).unwrap();
+            for (k, v) in kvs {
+                w.put(&U64Be(*k), &U64Be(*v)).unwrap();
+            }
+            let _ = w.finish().unwrap();
+        }
+
+        /// Build a finalized SST at `path` containing the supplied
+        /// (key, operand) pairs as `merge` operations.
+        fn build_merge_sst(path: &std::path::Path, kvs: &[(u64, u64)]) {
+            let mut w: SstWriter<U64Be, U64Be> =
+                SstWriter::create(path, rocksdb::Options::default()).unwrap();
+            for (k, v) in kvs {
+                w.merge(&U64Be(*k), &U64Be(*v)).unwrap();
+            }
+            let _ = w.finish().unwrap();
+        }
+
+        #[test]
+        fn ingest_into_empty_cf_makes_keys_visible() {
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let path = sst_dir.path().join("init.sst");
+            build_put_sst(&path, &[(1, 10), (2, 20), (3, 30)]);
+            db.ingest_files_cf("items", vec![path]).unwrap();
+
+            assert_eq!(schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
+            assert_eq!(schema.items.get(&U64Be(2)).unwrap(), Some(U64Be(20)));
+            assert_eq!(schema.items.get(&U64Be(3)).unwrap(), Some(U64Be(30)));
+            assert!(schema.items.get(&U64Be(4)).unwrap().is_none());
+        }
+
+        #[test]
+        fn ingest_preserves_non_overlapping_existing_data() {
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            // Pre-populate a low-range key via the normal write path.
+            let mut batch = db.batch();
+            batch.put(&schema.items, &U64Be(1), &U64Be(100)).unwrap();
+            batch.commit().unwrap();
+
+            // Ingest a non-overlapping high range via SST.
+            let path = sst_dir.path().join("high.sst");
+            build_put_sst(&path, &[(10, 1000), (11, 1100)]);
+            db.ingest_files_cf("items", vec![path]).unwrap();
+
+            assert_eq!(schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(100)));
+            assert_eq!(schema.items.get(&U64Be(10)).unwrap(), Some(U64Be(1000)));
+            assert_eq!(schema.items.get(&U64Be(11)).unwrap(), Some(U64Be(1100)));
+        }
+
+        #[test]
+        fn ingested_keys_shadow_prior_writes_on_overlap() {
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let mut batch = db.batch();
+            batch.put(&schema.items, &U64Be(1), &U64Be(100)).unwrap();
+            batch.commit().unwrap();
+            // Force the prior write down to an SST so the ingest
+            // sees existing-on-disk overlap rather than memtable
+            // overlap.
+            db.flush().unwrap();
+
+            let path = sst_dir.path().join("shadow.sst");
+            build_put_sst(&path, &[(1, 999)]);
+            db.ingest_files_cf("items", vec![path]).unwrap();
+
+            assert_eq!(schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(999)));
+        }
+
+        #[test]
+        fn ingest_with_memtable_overlap_flushes_then_succeeds() {
+            // `allow_blocking_flush` defaults to true, so the
+            // memtable is flushed before ingestion of an SST whose
+            // key range overlaps memtable contents. The post-ingest
+            // value at the overlapping key is the ingested one.
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let mut batch = db.batch();
+            batch.put(&schema.items, &U64Be(7), &U64Be(70)).unwrap();
+            batch.commit().unwrap();
+            // No explicit flush — the entry sits in the memtable
+            // for the duration of the ingest call.
+
+            let path = sst_dir.path().join("memover.sst");
+            build_put_sst(&path, &[(7, 777)]);
+            db.ingest_files_cf("items", vec![path]).unwrap();
+
+            assert_eq!(schema.items.get(&U64Be(7)).unwrap(), Some(U64Be(777)));
+        }
+
+        #[test]
+        fn ingest_with_merge_operator_combines_at_read_time() {
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<MergeIngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            // Pre-populate via the normal merge path.
+            let mut batch = db.batch();
+            batch.merge(&schema.counters, &U64Be(1), &U64Be(10)).unwrap();
+            batch.commit().unwrap();
+
+            // Ingest a merge SST against the same key plus a fresh key.
+            let path = sst_dir.path().join("merges.sst");
+            build_merge_sst(&path, &[(1, 5), (2, 100)]);
+            db.ingest_files_cf("counters", vec![path]).unwrap();
+
+            // Key 1: 10 (prior) + 5 (ingested merge) = 15. The
+            // operator runs at read time when it sees both the prior
+            // write and the ingested merge entry.
+            assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(15)));
+            // Key 2: 100 (ingested merge alone, no prior value).
+            assert_eq!(schema.counters.get(&U64Be(2)).unwrap(), Some(U64Be(100)));
+        }
+
+        #[test]
+        fn ingest_multiple_non_overlapping_ssts_in_one_call() {
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let p1 = sst_dir.path().join("a.sst");
+            let p2 = sst_dir.path().join("b.sst");
+            build_put_sst(&p1, &[(1, 10), (2, 20)]);
+            build_put_sst(&p2, &[(100, 1000), (200, 2000)]);
+            db.ingest_files_cf("items", vec![p1, p2]).unwrap();
+
+            assert_eq!(schema.items.get(&U64Be(2)).unwrap(), Some(U64Be(20)));
+            assert_eq!(schema.items.get(&U64Be(100)).unwrap(), Some(U64Be(1000)));
+        }
+
+        #[test]
+        fn ingest_unknown_cf_returns_missing_column_family() {
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, _schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let path = sst_dir.path().join("orphan.sst");
+            build_put_sst(&path, &[(1, 10)]);
+            let err = db.ingest_files_cf("not_in_schema", vec![path]).unwrap_err();
+            assert!(matches!(err, Error::MissingColumnFamily(_)));
+        }
+
+        #[test]
+        fn ingest_empty_paths_vec_returns_rocksdb_error() {
+            // RocksDB requires at least one path; surface that as a
+            // Rocksdb error rather than silently no-op'ing.
+            let dir = TempDir::new().unwrap();
+            let (db, _schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let err = db
+                .ingest_files_cf::<&std::path::Path>("items", vec![])
+                .expect_err("empty paths must fail");
+            assert!(matches!(err, Error::Rocksdb(_)));
+        }
+
+        #[test]
+        fn ingest_files_cf_opts_can_disable_move_files() {
+            // Verify the explicit-options entry point routes through.
+            // With move_files=false the SST file is copied; the
+            // source path remains visible to the caller after the
+            // ingest succeeds.
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let path = sst_dir.path().join("copy.sst");
+            build_put_sst(&path, &[(42, 4200)]);
+
+            let mut opts = rocksdb::IngestExternalFileOptions::default();
+            opts.set_move_files(false);
+            db.ingest_files_cf_opts("items", &opts, vec![&path]).unwrap();
+
+            assert_eq!(schema.items.get(&U64Be(42)).unwrap(), Some(U64Be(4200)));
+            assert!(
+                path.exists(),
+                "with move_files=false the source SST must still exist after ingest",
+            );
+        }
+
+        #[test]
+        fn ingest_with_overlap_visible_to_post_ingest_snapshot() {
+            // `snapshot_consistency=true` (the default) means
+            // snapshots taken *before* an ingest must not see
+            // ingested keys, while snapshots taken *after* the ingest
+            // must see them. This test pins the second half.
+            let dir = TempDir::new().unwrap();
+            let sst_dir = TempDir::new_in(dir.path()).unwrap();
+            let (db, schema) =
+                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+
+            let path = sst_dir.path().join("for_snap.sst");
+            build_put_sst(&path, &[(1, 10)]);
+            db.ingest_files_cf("items", vec![path]).unwrap();
+
+            db.take_snapshot(1);
+            let snap = db.at_snapshot(1).unwrap();
+            let snap_items = schema.items.at(&snap);
+            assert_eq!(snap_items.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
+        }
     }
 }
