@@ -12,6 +12,7 @@ async-trait.workspace = true
 bcs.workspace = true
 bytes.workspace = true
 fastcrypto.workspace = true
+futures.workspace = true
 integer-encoding.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
@@ -22,6 +23,7 @@ serde_json.workspace = true
 sui-storage.workspace = true
 sui-types.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 url.workspace = true
 zstd.workspace = true
