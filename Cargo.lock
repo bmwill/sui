@@ -14459,6 +14459,7 @@ dependencies = [
  "bcs",
  "bytes",
  "fastcrypto",
+ "futures",
  "integer-encoding",
  "object_store 0.13.0",
  "parking_lot 0.12.3",
