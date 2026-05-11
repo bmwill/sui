@@ -21,12 +21,17 @@
 //!
 //! # Method roles
 //!
-//! - [`restore`](Pipeline::restore) is called once per object during
-//!   bulk load. Drivers parallelize across input objects up to
-//!   [`RESTORE_FANOUT`](Pipeline::RESTORE_FANOUT). The same
-//!   `&Self::Schema` reference is shared across worker threads;
-//!   the [`Batch`] is per-thread (and is *not* committed by the
-//!   pipeline — the driver commits or ingests it).
+//! Both restore and tip funnel through the same accumulator type
+//! ([`Pipeline::Batch`]) and the same write path
+//! ([`commit`](Pipeline::commit)). The only thing that differs is
+//! how the accumulator is populated:
+//!
+//! - [`restore`](Pipeline::restore) folds updates derived from a
+//!   single live object into a per-shard accumulator. Drivers
+//!   parallelize across input objects up to
+//!   [`RESTORE_FANOUT`](Pipeline::RESTORE_FANOUT). Each worker owns
+//!   its own accumulator; the driver feeds it to
+//!   [`commit`](Pipeline::commit) when the shard is done.
 //! - [`process`](Pipeline::process) is called once per checkpoint
 //!   to extract typed rows from a [`CheckpointData`]. Pure
 //!   function; called from worker threads under the framework's
@@ -38,6 +43,22 @@
 //! - [`commit`](Pipeline::commit) applies the folded accumulator to
 //!   a [`Batch`]. The driver commits the batch atomically alongside
 //!   any other state it owns (watermarks, restore markers).
+//!
+//! # Why an accumulator-style `restore`
+//!
+//! The restore driver finalizes each shard's writes into an SST
+//! file ingested via
+//! [`Db::ingest_files_cf`](crate::Db::ingest_files_cf). An SST
+//! rejects duplicate consecutive keys (it must be strictly sorted),
+//! so a shard cannot emit more than one operation per key.
+//! Accumulator-style restore — fold per-object updates into a
+//! key-keyed accumulator, then emit one op per key in
+//! [`commit`](Pipeline::commit) — makes that invariant a natural
+//! consequence of the pipeline's data structure rather than a
+//! constraint the runner has to police. Cross-shard merges still
+//! work: two shards that touch the same key produce two SSTs each
+//! with one merge entry, and the merge operator combines them at
+//! read or compaction time.
 //!
 //! # Why `anyhow::Error` rather than [`crate::error::Error`]
 //!
@@ -100,21 +121,26 @@ pub trait Pipeline: Send + Sync + 'static {
     /// commits one checkpoint at a time and ignores the value.
     const MAX_BATCH_CHECKPOINTS: usize = 5 * 60;
 
-    /// Stage updates derived from a single live object into
-    /// `batch`.
+    /// Fold updates derived from a single live object into the
+    /// per-shard accumulator.
     ///
-    /// Called from worker threads under both restore drivers,
-    /// up to [`RESTORE_FANOUT`](Self::RESTORE_FANOUT) in parallel
-    /// per pipeline. The same `schema` reference is shared across
-    /// workers; `batch` is per-worker.
+    /// Called from worker threads under both restore drivers, up
+    /// to [`RESTORE_FANOUT`](Self::RESTORE_FANOUT) in parallel per
+    /// pipeline. Each worker owns its own `accumulator`; objects
+    /// may arrive in any order within a worker's slice. The
+    /// pipeline must fold (combine deltas, dedup by key) so that
+    /// when the driver later calls [`commit`](Self::commit) the
+    /// accumulator yields at most one operation per key — the
+    /// invariant SST ingestion requires.
     ///
-    /// The driver commits or ingests the batch — the pipeline must
-    /// not call [`Batch::commit`](crate::Batch::commit) itself.
+    /// Cross-shard collisions are RocksDB's concern: two shards
+    /// that both touch the same key each produce one merge entry
+    /// in their respective SSTs, and the registered merge operator
+    /// combines them after ingest.
     fn restore(
         &self,
-        schema: &Self::Schema,
+        accumulator: &mut Self::Batch,
         object: &Object,
-        batch: &mut Batch,
     ) -> anyhow::Result<()>;
 
     /// Extract typed values from a checkpoint.
@@ -269,15 +295,19 @@ mod tests {
 
         fn restore(
             &self,
-            schema: &Self::Schema,
+            accumulator: &mut Self::Batch,
             object: &Object,
-            batch: &mut Batch,
         ) -> anyhow::Result<()> {
-            batch.put(
-                &schema.versions,
-                &ObjectIdKey::new(object.id()),
-                &U64Be(object.version().value()),
-            )?;
+            // One entry per object — restore folds the same way
+            // `batch` would: keep the highest version observed.
+            accumulator
+                .entry(object.id())
+                .and_modify(|hi| {
+                    if object.version().value() > *hi {
+                        *hi = object.version().value();
+                    }
+                })
+                .or_insert(object.version().value());
             Ok(())
         }
 
@@ -329,17 +359,28 @@ mod tests {
     }
 
     #[test]
-    fn restore_writes_one_entry_per_object() {
+    fn restore_folds_into_accumulator_then_commit_writes() {
         let (_dir, db, schema) = open();
         let pipeline = ObjectVersionPipeline;
 
         let o1 = Object::immutable_with_id_for_testing(ObjectID::from_single_byte(1));
         let o2 = Object::immutable_with_id_for_testing(ObjectID::from_single_byte(2));
 
-        let mut batch = db.batch();
-        pipeline.restore(&schema, &o1, &mut batch).unwrap();
-        pipeline.restore(&schema, &o2, &mut batch).unwrap();
-        batch.commit().unwrap();
+        // Restore folds into the typed accumulator — no Db writes
+        // happen here. The runner would do many of these, then
+        // call `commit` once per shard.
+        let mut acc = <ObjectVersionPipeline as Pipeline>::Batch::default();
+        pipeline.restore(&mut acc, &o1).unwrap();
+        pipeline.restore(&mut acc, &o2).unwrap();
+        assert_eq!(acc.len(), 2);
+
+        // Commit writes the accumulator to a `Batch`, which the
+        // driver commits atomically. The pipeline does not call
+        // `Batch::commit` itself.
+        let mut write_batch = db.batch();
+        let n = pipeline.commit(&schema, &acc, &mut write_batch).unwrap();
+        write_batch.commit().unwrap();
+        assert_eq!(n, 2);
 
         assert_eq!(
             schema.versions.get(&ObjectIdKey::new(o1.id())).unwrap(),
@@ -349,6 +390,24 @@ mod tests {
             schema.versions.get(&ObjectIdKey::new(o2.id())).unwrap(),
             Some(U64Be(o2.version().value())),
         );
+    }
+
+    #[test]
+    fn restore_dedups_repeated_objects_into_one_accumulator_entry() {
+        // Two restore calls for the same object id (same shard) fold
+        // into the accumulator: one entry, the highest version wins.
+        // This is the invariant SST ingestion depends on — at most
+        // one operation per key per shard's commit.
+        let pipeline = ObjectVersionPipeline;
+        let id = ObjectID::from_single_byte(7);
+        let obj = Object::immutable_with_id_for_testing(id);
+        let version = obj.version().value();
+
+        let mut acc = <ObjectVersionPipeline as Pipeline>::Batch::default();
+        pipeline.restore(&mut acc, &obj).unwrap();
+        pipeline.restore(&mut acc, &obj).unwrap();
+        assert_eq!(acc.len(), 1);
+        assert_eq!(acc.get(&id), Some(&version));
     }
 
     #[test]
