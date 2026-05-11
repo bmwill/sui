@@ -1,0 +1,917 @@
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! The [`RestoreRunner`] — the shared bulk-load lifecycle owned by
+//! both restore drivers (formal snapshot, perpetual store).
+//!
+//! The runner is intentionally narrow: it knows how to drive one
+//! shard of objects through one pipeline, persist the partition's
+//! progress in the `__restore` CF, and switch from
+//! `InProgress` → `Complete` at the end. Parallelism strategy
+//! (async tokio tasks fed by an object-store stream, sync
+//! `thread::scope` over `ObjectID`-range shards, etc.) belongs to
+//! the calling driver.
+//!
+//! # Lifecycle
+//!
+//! ```text
+//! RestoreRunner::new(db, pipeline, schema, target_checkpoint, …)
+//!     ↓
+//! runner.begin()  →  Set { partitions already complete from a prior run }
+//!     ↓
+//! For each shard not in the skip set, in any order, possibly
+//! in parallel:
+//!     runner.process_shard(partition_id, objects)
+//!         1. fold objects into Pipeline::Batch via Pipeline::restore
+//!         2. drain into a shard-backed Batch via Pipeline::commit
+//!         3. finalize into per-CF SSTs
+//!         4. ingest the SSTs atomically per CF
+//!         5. mark the partition complete in RestoreState
+//!     ↓
+//! runner.finish()  →  RestoreState::Complete { restored_at }
+//! ```
+//!
+//! # Resumability
+//!
+//! [`begin`](RestoreRunner::begin) inspects the existing
+//! [`RestoreState`] for the pipeline:
+//!
+//! - `None`: writes a fresh `InProgress` entry for
+//!   `target_checkpoint`.
+//! - `InProgress { target_checkpoint: T, … }` with a matching `T`:
+//!   returns the previously-completed partitions; subsequent
+//!   [`process_shard`](RestoreRunner::process_shard) calls skip
+//!   them via the [`already_complete`](RestoreRunner::already_complete)
+//!   check.
+//! - `InProgress` with a different target: refuses to proceed.
+//!   Mid-restore at a different checkpoint indicates the caller
+//!   is mixing two restore runs.
+//! - `Complete`: refuses to begin again. The pipeline is already
+//!   restored; tip indexing should resume.
+//!
+//! # Option toggles are not the runner's job
+//!
+//! The runner does not call
+//! [`Db::set_restore_options_cf`](crate::Db::set_restore_options_cf)
+//! or [`Db::set_tip_options_cf`](crate::Db::set_tip_options_cf).
+//! That sequencing lives in the driver because the driver knows
+//! which CFs across which pipelines should be toggled together
+//! (and when to begin tip indexing for any pipeline).
+
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use sui_types::object::Object;
+use tracing::debug;
+use tracing::info;
+
+use crate::Db;
+use crate::Pipeline;
+use crate::RestoreState;
+use crate::error::Error;
+
+/// Drives one pipeline's restore from a stream of objects.
+///
+/// `RestoreRunner` is constructed once per pipeline and shared
+/// across worker threads or tasks via [`Arc`]. Per-shard work is
+/// done by [`process_shard`](Self::process_shard), which is
+/// `&self` and internally synchronizes updates to the persisted
+/// `__restore` state.
+///
+/// The pipeline's [`Schema`](crate::Pipeline::Schema) is shared
+/// across workers as `&Self::Schema`; the pipeline itself is wrapped
+/// in [`Arc<P>`] so `&self` calls can spread across threads.
+pub struct RestoreRunner<P: Pipeline> {
+    db: Arc<Db>,
+    pipeline: Arc<P>,
+    schema: Arc<P::Schema>,
+    target_checkpoint: u64,
+    staging_dir: PathBuf,
+    sst_options: rocksdb::Options,
+    /// Serializes read-modify-write of the persisted `__restore`
+    /// state across concurrent shard processors. Updates are
+    /// once-per-shard and small, so the contention is minimal.
+    state_lock: Mutex<()>,
+}
+
+impl<P: Pipeline> RestoreRunner<P> {
+    /// Create a new runner.
+    ///
+    /// `staging_dir` should be a directory dedicated to this
+    /// restore (typically created with [`tempfile::TempDir`] or
+    /// otherwise unique per run). The runner creates per-shard
+    /// subdirectories underneath it, and removes them on shard
+    /// success. The parent directory is the caller's responsibility
+    /// to clean up.
+    ///
+    /// `sst_options` is the [`rocksdb::Options`] used to construct
+    /// per-shard [`SstWriter`](crate::SstWriter) instances. The
+    /// default comparator (byte-wise) must match the target CFs;
+    /// schemas using non-default comparators must supply matching
+    /// options here.
+    pub fn new(
+        db: Arc<Db>,
+        pipeline: Arc<P>,
+        schema: Arc<P::Schema>,
+        target_checkpoint: u64,
+        staging_dir: PathBuf,
+        sst_options: rocksdb::Options,
+    ) -> Self {
+        Self {
+            db,
+            pipeline,
+            schema,
+            target_checkpoint,
+            staging_dir,
+            sst_options,
+            state_lock: Mutex::new(()),
+        }
+    }
+
+    /// Initialize the runner's `__restore` entry and return the
+    /// set of partition IDs that were already ingested in a prior
+    /// run. Callers use the returned set to skip those partitions.
+    ///
+    /// # Errors
+    ///
+    /// - The pipeline is already
+    ///   [`Complete`](RestoreState::Complete) — refuse to restart a
+    ///   completed restore.
+    /// - The pipeline is `InProgress` with a different
+    ///   `target_checkpoint` — refuse to mix two restore runs.
+    pub fn begin(&self) -> anyhow::Result<BTreeSet<Vec<u8>>> {
+        let _guard = self.state_lock.lock();
+        match self.db.restore_state(P::NAME)? {
+            None => {
+                self.db.set_restore_state(
+                    P::NAME,
+                    &RestoreState::InProgress {
+                        target_checkpoint: self.target_checkpoint,
+                        partitions_complete: BTreeSet::new(),
+                    },
+                )?;
+                info!(
+                    pipeline = P::NAME,
+                    target_checkpoint = self.target_checkpoint,
+                    "Beginning restore",
+                );
+                Ok(BTreeSet::new())
+            }
+            Some(RestoreState::InProgress {
+                target_checkpoint,
+                partitions_complete,
+            }) => {
+                anyhow::ensure!(
+                    target_checkpoint == self.target_checkpoint,
+                    "pipeline {} is mid-restore at checkpoint {}, but this runner targets {}",
+                    P::NAME,
+                    target_checkpoint,
+                    self.target_checkpoint,
+                );
+                info!(
+                    pipeline = P::NAME,
+                    target_checkpoint,
+                    skip_count = partitions_complete.len(),
+                    "Resuming restore",
+                );
+                Ok(partitions_complete)
+            }
+            Some(RestoreState::Complete { restored_at }) => {
+                anyhow::bail!(
+                    "pipeline {} is already restored at checkpoint {}; refusing to restart",
+                    P::NAME,
+                    restored_at,
+                );
+            }
+        }
+    }
+
+    /// Returns `true` if `partition_id` was already ingested in a
+    /// prior run.
+    ///
+    /// Equivalent to checking the set returned by
+    /// [`begin`](Self::begin), but reads the persisted state on
+    /// each call. Useful when the driver does not cache the
+    /// returned set, or when shard processing happens concurrently
+    /// with [`begin`](Self::begin) returning.
+    pub fn already_complete(&self, partition_id: &[u8]) -> anyhow::Result<bool> {
+        let _guard = self.state_lock.lock();
+        match self.db.restore_state(P::NAME)? {
+            Some(RestoreState::InProgress {
+                partitions_complete,
+                ..
+            }) => Ok(partitions_complete.contains(partition_id)),
+            Some(RestoreState::Complete { .. }) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    /// Process one shard: fold its objects into the accumulator,
+    /// drain into a shard-backed batch, finalize into per-CF SSTs,
+    /// ingest them, and mark the partition complete.
+    ///
+    /// `partition_id` is the opaque driver-supplied identifier
+    /// that distinguishes shards in the persisted progress set;
+    /// it is also hex-encoded into the staging subdirectory name
+    /// so each shard's SST files live in their own scratch space.
+    ///
+    /// `objects` is an iterator of fallible objects. Iterator
+    /// errors abort the shard before any SST is written, so partial
+    /// state never lands in the database.
+    pub fn process_shard<I>(&self, partition_id: &[u8], objects: I) -> anyhow::Result<()>
+    where
+        I: IntoIterator<Item = anyhow::Result<Object>>,
+    {
+        if self.already_complete(partition_id)? {
+            debug!(
+                pipeline = P::NAME,
+                partition = %hex_encode(partition_id),
+                "Skipping already-complete partition",
+            );
+            return Ok(());
+        }
+
+        // 1. Fold objects into the typed accumulator. Per-object
+        // errors abort the shard.
+        let mut acc = <P::Batch as Default>::default();
+        let mut object_count = 0usize;
+        for object in objects {
+            let object = object?;
+            self.pipeline.restore(&mut acc, &object)?;
+            object_count += 1;
+        }
+
+        // 2. Drain the accumulator into a shard-backed Batch.
+        let mut batch = self.db.shard_batch();
+        let row_count = self.pipeline.commit(&self.schema, &acc, &mut batch)?;
+        // Free the accumulator's memory now — `commit` has done
+        // everything it needs from it.
+        drop(acc);
+
+        // If the pipeline produced no writes for this shard, no SST
+        // is needed. Still record the partition as complete so the
+        // driver does not re-process it on resume.
+        let shard_dir = if !batch.is_empty() {
+            let dir = self.shard_staging_dir(partition_id);
+            std::fs::create_dir_all(&dir)?;
+
+            // 3. Finalize into one SST per CF.
+            let ssts = batch.finalize_into_ssts(&dir, &self.sst_options)?;
+
+            // 4. Ingest atomically per CF. The default
+            // `ingest_files_cf` uses `move_files = true`, so each
+            // SST migrates into the DB directory and disappears from
+            // the staging subdir.
+            for (cf, path) in ssts {
+                self.db.ingest_files_cf(&cf, vec![path])?;
+            }
+            Some(dir)
+        } else {
+            None
+        };
+
+        // 5. Mark the partition complete. The mutex serializes
+        // read-modify-write of the persisted state across workers.
+        self.mark_partition_complete(partition_id)?;
+
+        // 6. Best-effort: remove the (now-empty) shard staging dir.
+        if let Some(dir) = shard_dir
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+        {
+            debug!(
+                pipeline = P::NAME,
+                partition = %hex_encode(partition_id),
+                error = %e,
+                "Failed to remove shard staging dir (non-fatal)",
+            );
+        }
+
+        debug!(
+            pipeline = P::NAME,
+            partition = %hex_encode(partition_id),
+            objects = object_count,
+            rows = row_count,
+            "Shard complete",
+        );
+
+        Ok(())
+    }
+
+    /// Mark the restore complete and switch
+    /// `RestoreState::InProgress` → `RestoreState::Complete`.
+    ///
+    /// The caller is responsible for confirming every shard the
+    /// driver intends to run has succeeded before calling this —
+    /// the runner does not enumerate "all partitions" because the
+    /// driver owns that list.
+    pub fn finish(&self) -> anyhow::Result<()> {
+        let _guard = self.state_lock.lock();
+        self.db.set_restore_state(
+            P::NAME,
+            &RestoreState::Complete {
+                restored_at: self.target_checkpoint,
+            },
+        )?;
+        info!(
+            pipeline = P::NAME,
+            restored_at = self.target_checkpoint,
+            "Restore complete",
+        );
+        Ok(())
+    }
+
+    /// The path used to stage SSTs for `partition_id`. Exposed so
+    /// tests and drivers can introspect the layout if needed.
+    fn shard_staging_dir(&self, partition_id: &[u8]) -> PathBuf {
+        self.staging_dir
+            .join(format!("{}_{}", P::NAME, hex_encode(partition_id)))
+    }
+
+    /// Read-modify-write the partition set under
+    /// [`state_lock`](Self::state_lock).
+    fn mark_partition_complete(&self, partition_id: &[u8]) -> Result<(), Error> {
+        let _guard = self.state_lock.lock();
+        let current = self.db.restore_state(P::NAME)?;
+        let mut partitions_complete = match current {
+            Some(RestoreState::InProgress {
+                target_checkpoint,
+                partitions_complete,
+            }) => {
+                debug_assert_eq!(
+                    target_checkpoint, self.target_checkpoint,
+                    "partition update after target_checkpoint mismatch — \
+                     should have been caught at begin()",
+                );
+                partitions_complete
+            }
+            // Mid-restore should always be InProgress; if we see
+            // something else, the state was changed under us, which
+            // is a programmer error in the driver.
+            _ => {
+                return Err(Error::Internal(
+                    "restore state changed unexpectedly during shard processing",
+                ));
+            }
+        };
+        partitions_complete.insert(partition_id.to_vec());
+        self.db.set_restore_state(
+            P::NAME,
+            &RestoreState::InProgress {
+                target_checkpoint: self.target_checkpoint,
+                partitions_complete,
+            },
+        )?;
+        Ok(())
+    }
+}
+
+/// Hex-encode a byte slice for use in human-readable identifiers
+/// (log fields, staging-directory names). The crate does not
+/// otherwise depend on `hex`, and the implementation is small.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use bytes::Buf;
+    use bytes::BufMut;
+    use sui_types::base_types::ObjectID;
+    use sui_types::object::Object;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::Batch;
+    use crate::DbMap;
+    use crate::DbOptions;
+    use crate::Decode;
+    use crate::Encode;
+    use crate::Schema;
+    use crate::error::DecodeError;
+    use crate::error::EncodeError;
+    use crate::error::OpenError;
+
+    /// Big-endian `ObjectID` key newtype.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ObjectIdKey([u8; ObjectID::LENGTH]);
+
+    impl ObjectIdKey {
+        fn new(id: ObjectID) -> Self {
+            Self(id.into_bytes())
+        }
+    }
+
+    impl Encode for ObjectIdKey {
+        fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_slice(&self.0);
+            Ok(())
+        }
+    }
+
+    impl Decode for ObjectIdKey {
+        fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+            if buf.remaining() != ObjectID::LENGTH {
+                return Err(DecodeError::msg("unexpected ObjectIdKey length"));
+            }
+            let mut id = [0u8; ObjectID::LENGTH];
+            buf.copy_to_slice(&mut id);
+            Ok(Self(id))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct U64Be(u64);
+
+    impl Encode for U64Be {
+        fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
+            buf.put_slice(&self.0.to_be_bytes());
+            Ok(())
+        }
+    }
+
+    impl Decode for U64Be {
+        fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+            if buf.remaining() != 8 {
+                return Err(DecodeError::msg("expected 8 bytes"));
+            }
+            Ok(Self(buf.get_u64()))
+        }
+    }
+
+    /// Schema with one CF mapping object id → version.
+    #[derive(Debug)]
+    struct VersionsSchema {
+        versions: DbMap<ObjectIdKey, U64Be>,
+    }
+
+    impl Schema for VersionsSchema {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+            vec![("versions", base_options.clone())]
+        }
+
+        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            Ok(Self {
+                versions: DbMap::new(db.clone(), "versions")?,
+            })
+        }
+    }
+
+    /// Test pipeline: per-object key → version. The accumulator
+    /// keeps the highest version observed per id.
+    struct VersionsPipeline;
+
+    impl Pipeline for VersionsPipeline {
+        const NAME: &'static str = "versions";
+
+        type Schema = VersionsSchema;
+        type Value = (ObjectID, u64);
+        type Batch = BTreeMap<ObjectID, u64>;
+
+        fn restore(
+            &self,
+            accumulator: &mut Self::Batch,
+            object: &Object,
+        ) -> anyhow::Result<()> {
+            accumulator
+                .entry(object.id())
+                .and_modify(|hi| {
+                    if object.version().value() > *hi {
+                        *hi = object.version().value();
+                    }
+                })
+                .or_insert(object.version().value());
+            Ok(())
+        }
+
+        fn process(
+            &self,
+            _checkpoint: &sui_types::full_checkpoint_content::CheckpointData,
+        ) -> anyhow::Result<Vec<Self::Value>> {
+            Ok(vec![])
+        }
+
+        fn batch(&self, _: &mut Self::Batch, _: std::vec::IntoIter<Self::Value>) {}
+
+        fn commit(
+            &self,
+            schema: &Self::Schema,
+            batch: &Self::Batch,
+            write_batch: &mut Batch,
+        ) -> anyhow::Result<usize> {
+            for (id, version) in batch {
+                write_batch.put(
+                    &schema.versions,
+                    &ObjectIdKey::new(*id),
+                    &U64Be(*version),
+                )?;
+            }
+            Ok(batch.len())
+        }
+    }
+
+    /// Schema with one merge-operator CF.
+    #[derive(Debug)]
+    struct CountersSchema {
+        counters: DbMap<ObjectIdKey, U64Be>,
+    }
+
+    fn add_u64_merge_op(
+        _key: &[u8],
+        existing: Option<&[u8]>,
+        operands: &rocksdb::MergeOperands,
+    ) -> Option<Vec<u8>> {
+        let mut total: u64 = existing
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        for op in operands {
+            if let Ok(arr) = <[u8; 8]>::try_from(op) {
+                total = total.saturating_add(u64::from_be_bytes(arr));
+            }
+        }
+        Some(total.to_be_bytes().to_vec())
+    }
+
+    impl Schema for CountersSchema {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+            let mut opts = base_options.clone();
+            opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
+            vec![("counters", opts)]
+        }
+
+        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            Ok(Self {
+                counters: DbMap::new(db.clone(), "counters")?,
+            })
+        }
+    }
+
+    /// Test pipeline: counts how many times each id was observed.
+    /// Uses a merge operator so cross-shard merges combine.
+    struct CountersPipeline;
+
+    impl Pipeline for CountersPipeline {
+        const NAME: &'static str = "counters";
+
+        type Schema = CountersSchema;
+        type Value = ObjectID;
+        type Batch = BTreeMap<ObjectID, u64>;
+
+        fn restore(
+            &self,
+            accumulator: &mut Self::Batch,
+            object: &Object,
+        ) -> anyhow::Result<()> {
+            *accumulator.entry(object.id()).or_insert(0) += 1;
+            Ok(())
+        }
+
+        fn process(
+            &self,
+            _checkpoint: &sui_types::full_checkpoint_content::CheckpointData,
+        ) -> anyhow::Result<Vec<Self::Value>> {
+            Ok(vec![])
+        }
+
+        fn batch(&self, _: &mut Self::Batch, _: std::vec::IntoIter<Self::Value>) {}
+
+        fn commit(
+            &self,
+            schema: &Self::Schema,
+            batch: &Self::Batch,
+            write_batch: &mut Batch,
+        ) -> anyhow::Result<usize> {
+            for (id, count) in batch {
+                write_batch.merge(&schema.counters, &ObjectIdKey::new(*id), &U64Be(*count))?;
+            }
+            Ok(batch.len())
+        }
+    }
+
+    /// Build a runner against a fresh database and a fresh staging
+    /// dir. Returns the runner plus the lifetime-extending temp dirs.
+    fn setup_versions(
+        target_checkpoint: u64,
+    ) -> (TempDir, TempDir, Arc<Db>, Arc<VersionsSchema>, RestoreRunner<VersionsPipeline>) {
+        let db_dir = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let (db, schema) = Db::open::<VersionsSchema>(db_dir.path(), DbOptions::default()).unwrap();
+        let schema = Arc::new(schema);
+        let runner = RestoreRunner::new(
+            db.clone(),
+            Arc::new(VersionsPipeline),
+            schema.clone(),
+            target_checkpoint,
+            staging.path().to_path_buf(),
+            rocksdb::Options::default(),
+        );
+        (db_dir, staging, db, schema, runner)
+    }
+
+    fn obj(id: u8) -> Object {
+        Object::immutable_with_id_for_testing(ObjectID::from_single_byte(id))
+    }
+
+    #[test]
+    fn begin_initializes_state_when_none() {
+        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let skip = runner.begin().unwrap();
+        assert!(skip.is_empty());
+        match db.restore_state("versions").unwrap() {
+            Some(RestoreState::InProgress {
+                target_checkpoint,
+                partitions_complete,
+            }) => {
+                assert_eq!(target_checkpoint, 100);
+                assert!(partitions_complete.is_empty());
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn begin_returns_completed_partitions_from_prior_run() {
+        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        // Simulate a prior partial run.
+        let mut prior = BTreeSet::new();
+        prior.insert(vec![0xAAu8]);
+        prior.insert(vec![0xBBu8]);
+        db.set_restore_state(
+            "versions",
+            &RestoreState::InProgress {
+                target_checkpoint: 100,
+                partitions_complete: prior.clone(),
+            },
+        )
+        .unwrap();
+
+        let skip = runner.begin().unwrap();
+        assert_eq!(skip, prior);
+    }
+
+    #[test]
+    fn begin_refuses_target_mismatch() {
+        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        db.set_restore_state(
+            "versions",
+            &RestoreState::InProgress {
+                target_checkpoint: 200,
+                partitions_complete: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        let err = runner.begin().unwrap_err();
+        assert!(format!("{err}").contains("mid-restore at checkpoint 200"));
+    }
+
+    #[test]
+    fn begin_refuses_already_complete() {
+        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        db.set_restore_state("versions", &RestoreState::Complete { restored_at: 50 })
+            .unwrap();
+        let err = runner.begin().unwrap_err();
+        assert!(format!("{err}").contains("already restored"));
+    }
+
+    #[test]
+    fn process_shard_writes_data_and_marks_partition_complete() {
+        let (_db_dir, _staging, db, schema, runner) = setup_versions(100);
+        runner.begin().unwrap();
+
+        let o1 = obj(1);
+        let o2 = obj(2);
+        let (v1, v2) = (o1.version().value(), o2.version().value());
+        runner
+            .process_shard(b"shard-0", vec![Ok(o1), Ok(o2)])
+            .unwrap();
+
+        // Data is visible.
+        assert_eq!(
+            schema
+                .versions
+                .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
+                .unwrap(),
+            Some(U64Be(v1)),
+        );
+        assert_eq!(
+            schema
+                .versions
+                .get(&ObjectIdKey::new(ObjectID::from_single_byte(2)))
+                .unwrap(),
+            Some(U64Be(v2)),
+        );
+
+        // Partition is recorded.
+        match db.restore_state("versions").unwrap() {
+            Some(RestoreState::InProgress {
+                partitions_complete,
+                ..
+            }) => {
+                assert!(partitions_complete.contains(b"shard-0".as_slice()));
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_shard_skips_already_complete_partitions() {
+        let (_db_dir, _staging, db, schema, runner) = setup_versions(100);
+        runner.begin().unwrap();
+
+        // Pre-mark shard-0 as complete.
+        let mut done = BTreeSet::new();
+        done.insert(b"shard-0".to_vec());
+        db.set_restore_state(
+            "versions",
+            &RestoreState::InProgress {
+                target_checkpoint: 100,
+                partitions_complete: done,
+            },
+        )
+        .unwrap();
+
+        // Running shard-0 again must not write anything new.
+        runner
+            .process_shard(b"shard-0", vec![Ok(obj(1))])
+            .unwrap();
+        assert!(
+            schema
+                .versions
+                .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
+                .unwrap()
+                .is_none(),
+            "skipped shard must not write",
+        );
+    }
+
+    #[test]
+    fn process_shard_with_empty_object_stream_still_marks_partition_complete() {
+        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        runner.begin().unwrap();
+        runner.process_shard(b"empty", Vec::<anyhow::Result<Object>>::new()).unwrap();
+        match db.restore_state("versions").unwrap() {
+            Some(RestoreState::InProgress {
+                partitions_complete,
+                ..
+            }) => {
+                assert!(partitions_complete.contains(b"empty".as_slice()));
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_shard_propagates_object_stream_error_and_does_not_mark_complete() {
+        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        runner.begin().unwrap();
+
+        let stream: Vec<anyhow::Result<Object>> = vec![
+            Ok(obj(1)),
+            Err(anyhow::anyhow!("source-side IO failed")),
+            Ok(obj(2)),
+        ];
+        let err = runner.process_shard(b"bad", stream).unwrap_err();
+        assert!(format!("{err}").contains("source-side IO failed"));
+
+        match db.restore_state("versions").unwrap() {
+            Some(RestoreState::InProgress {
+                partitions_complete,
+                ..
+            }) => {
+                assert!(!partitions_complete.contains(b"bad".as_slice()));
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_shard_merges_combine_through_runner() {
+        // End-to-end exercise of the design's restore story using
+        // the merge-operator pipeline. Two shards each touch the
+        // same object id; the runner emits one merge per shard's
+        // SST, and the registered operator combines them on read.
+        let db_dir = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let (db, schema) =
+            Db::open::<CountersSchema>(db_dir.path(), DbOptions::default()).unwrap();
+        let schema = Arc::new(schema);
+        let runner = RestoreRunner::new(
+            db.clone(),
+            Arc::new(CountersPipeline),
+            schema.clone(),
+            42,
+            staging.path().to_path_buf(),
+            rocksdb::Options::default(),
+        );
+
+        runner.begin().unwrap();
+
+        // Shard A: id #1 appears 3 times in this shard. Folded to
+        // one merge(+=3) by the accumulator.
+        runner
+            .process_shard(b"A", vec![Ok(obj(1)), Ok(obj(1)), Ok(obj(1))])
+            .unwrap();
+        // Shard B: id #1 appears 2 times here, id #2 once.
+        runner
+            .process_shard(b"B", vec![Ok(obj(1)), Ok(obj(1)), Ok(obj(2))])
+            .unwrap();
+
+        runner.finish().unwrap();
+
+        // id #1: 3 + 2 = 5 via the cross-shard merge.
+        assert_eq!(
+            schema
+                .counters
+                .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
+                .unwrap(),
+            Some(U64Be(5)),
+        );
+        // id #2: 1.
+        assert_eq!(
+            schema
+                .counters
+                .get(&ObjectIdKey::new(ObjectID::from_single_byte(2)))
+                .unwrap(),
+            Some(U64Be(1)),
+        );
+
+        // Restore is marked complete.
+        match db.restore_state("counters").unwrap() {
+            Some(RestoreState::Complete { restored_at }) => assert_eq!(restored_at, 42),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_transitions_to_complete() {
+        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        runner.begin().unwrap();
+        runner.process_shard(b"only", vec![Ok(obj(1))]).unwrap();
+        runner.finish().unwrap();
+        match db.restore_state("versions").unwrap() {
+            Some(RestoreState::Complete { restored_at }) => assert_eq!(restored_at, 100),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn already_complete_returns_true_after_finish() {
+        let (_db_dir, _staging, _db, _schema, runner) = setup_versions(100);
+        runner.begin().unwrap();
+        runner.finish().unwrap();
+        assert!(runner.already_complete(b"anything").unwrap());
+    }
+
+    #[test]
+    fn concurrent_shard_processing_serializes_state_updates() {
+        // Spawn many threads each processing one shard. The mutex on
+        // RestoreState updates must serialize so every shard's
+        // partition id ends up recorded.
+        use std::thread;
+        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        runner.begin().unwrap();
+
+        let runner = Arc::new(runner);
+        let mut handles = Vec::new();
+        for i in 0..16u8 {
+            let runner = runner.clone();
+            handles.push(thread::spawn(move || {
+                let partition = vec![i];
+                runner.process_shard(&partition, vec![Ok(obj(i))]).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        match db.restore_state("versions").unwrap() {
+            Some(RestoreState::InProgress {
+                partitions_complete,
+                ..
+            }) => {
+                assert_eq!(partitions_complete.len(), 16);
+                for i in 0..16u8 {
+                    assert!(partitions_complete.contains(&vec![i]));
+                }
+            }
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hex_encode_roundtrips_byte_values() {
+        assert_eq!(super::hex_encode(&[]), "");
+        assert_eq!(super::hex_encode(&[0]), "00");
+        assert_eq!(super::hex_encode(&[0xAB, 0xCD]), "abcd");
+        assert_eq!(super::hex_encode(&[0xFF; 4]), "ffffffff");
+    }
+}
