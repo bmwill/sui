@@ -14452,10 +14452,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "scoped-futures",
  "sui-consistent-store",
  "sui-indexer-alt-framework-store-traits",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 

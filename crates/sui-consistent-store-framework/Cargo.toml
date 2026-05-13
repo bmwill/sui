@@ -13,6 +13,7 @@ workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+scoped-futures.workspace = true
 sui-consistent-store.workspace = true
 sui-indexer-alt-framework-store-traits.workspace = true
 thiserror.workspace = true
@@ -20,3 +21,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
