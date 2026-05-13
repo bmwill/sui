@@ -14478,6 +14478,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sui-consistent-store-framework"
+version = "1.72.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "sui-consistent-store",
+ "sui-indexer-alt-framework-store-traits",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "sui-core"
 version = "0.1.0"
 dependencies = [
