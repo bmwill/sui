@@ -10,6 +10,12 @@
 //! batched writes, typed iteration, and the in-memory snapshot
 //! model have landed; typed merge operators and a filesystem
 //! checkpoint helper follow.
+//!
+//! [`rocksdb`] is re-exported so consumers can construct the
+//! [`rocksdb::Options`] / [`rocksdb::IngestExternalFileOptions`] /
+//! [`rocksdb::WriteOptions`] values our public API takes without
+//! adding a direct rocksdb dependency themselves.
+pub use rocksdb;
 
 pub mod batch;
 pub mod checkpoint_executor_adapter;

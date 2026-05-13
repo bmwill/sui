@@ -55,6 +55,12 @@ use crate::RestoreRunner;
 /// surface. Per-object boxing cost is one vtable indirection per
 /// `next()` call, which is negligible relative to the SST building
 /// work per object on the consumer side.
+///
+/// The trait requires `Send + Sync` on the source itself so the
+/// parallel driver can share `&self` across worker threads. The
+/// returned iterator is not required to be `Send` — it is
+/// created and consumed inside the same worker thread, so its
+/// thread-affinity is unobserved by the driver.
 pub trait LiveObjectSource: Send + Sync {
     /// Yield objects whose `ObjectID` falls in `[start, end]`
     /// inclusive, in `ObjectID` order. Wrapped or otherwise
@@ -67,7 +73,7 @@ pub trait LiveObjectSource: Send + Sync {
         &'a self,
         start: ObjectID,
         end: ObjectID,
-    ) -> Box<dyn Iterator<Item = anyhow::Result<Object>> + Send + 'a>;
+    ) -> Box<dyn Iterator<Item = anyhow::Result<Object>> + 'a>;
 }
 
 /// Maximum allowed `shard_bits` value. `1 << 8 = 256` shards is
@@ -334,7 +340,7 @@ mod tests {
             &'a self,
             start: ObjectID,
             end: ObjectID,
-        ) -> Box<dyn Iterator<Item = anyhow::Result<Object>> + Send + 'a> {
+        ) -> Box<dyn Iterator<Item = anyhow::Result<Object>> + 'a> {
             self.ranges_called.lock().unwrap().push((start, end));
             Box::new(
                 self.objects
