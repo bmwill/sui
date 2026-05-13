@@ -43,8 +43,10 @@
 //! inline.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::Context as _;
+use anyhow::anyhow;
 use anyhow::bail;
 use async_trait::async_trait;
 use scoped_futures::ScopedBoxFuture;
@@ -56,10 +58,13 @@ use sui_indexer_alt_framework_store_traits::SequentialConnection;
 use sui_indexer_alt_framework_store_traits::SequentialStore;
 use sui_indexer_alt_framework_store_traits::Store as _;
 use sui_indexer_alt_framework_store_traits::{self as store_traits};
+use tokio::task::JoinSet;
 
 use crate::schema::ChainId;
 use crate::schema::FrameworkSchema;
 use crate::schema::PipelineTaskKey;
+use crate::synchronizer::Queue;
+use crate::synchronizer::Synchronizer;
 use crate::watermark::Watermark;
 
 /// Framework-side wrapper around an [`Arc<Db>`] plus a
@@ -75,6 +80,12 @@ struct Inner<S> {
     db: Arc<Db>,
     framework: Arc<FrameworkSchema>,
     user: Arc<S>,
+    /// Per-pipeline write queues, set once when
+    /// [`Store::install_sync`] runs a [`Synchronizer`]. If
+    /// `Some`, [`SequentialStore::transaction`] routes through
+    /// the queue instead of committing inline; if `None`, the
+    /// transaction commits inline (single-pipeline mode).
+    queue: OnceLock<Queue>,
 }
 
 impl<S> Store<S> {
@@ -92,8 +103,41 @@ impl<S> Store<S> {
                 db,
                 framework,
                 user,
+                queue: OnceLock::new(),
             }),
         }
+    }
+
+    /// Run the supplied [`Synchronizer`] and register its
+    /// per-pipeline write queues with this store.
+    ///
+    /// After this call returns,
+    /// [`SequentialStore::transaction`] no longer commits inline:
+    /// each transaction ships its `(Watermark, Batch)` pair through
+    /// the appropriate pipeline's queue, where the synchronizer
+    /// task commits it and coordinates with peer pipelines at
+    /// stride boundaries to take cross-pipeline snapshots.
+    ///
+    /// Returns the [`JoinSet`] driving the synchronizer's tasks.
+    /// Dropping the returned [`JoinSet`] does **not** stop the
+    /// tasks immediately — the framework's standard shutdown
+    /// path is to close every pipeline's mpsc sender (by dropping
+    /// the queue inside the store, which happens on the store's
+    /// last [`Arc`] drop), at which point each task observes a
+    /// closed receiver and exits.
+    ///
+    /// Errors:
+    /// - If a synchronizer is already installed on this store.
+    pub fn install_sync(
+        &self,
+        sync: Synchronizer,
+    ) -> anyhow::Result<JoinSet<anyhow::Result<()>>> {
+        let (join_set, queue) = sync.run()?;
+        self.inner
+            .queue
+            .set(queue)
+            .map_err(|_| anyhow!("synchronizer already installed on this store"))?;
+        Ok(join_set)
     }
 
     /// Borrow the underlying [`Db`] handle.
@@ -181,8 +225,9 @@ impl<S: Send + Sync + 'static> SequentialStore for Store<S> {
         };
 
         // Stage the watermark into the same batch as the user's
-        // data writes, then commit atomically.
-        let key = PipelineTaskKey::new(pipeline_task);
+        // data writes so the data and the watermark advance commit
+        // atomically — either both visible or neither.
+        let key = PipelineTaskKey::new(pipeline_task.clone());
         conn.batch
             .put(
                 &self.inner.framework.watermarks,
@@ -190,9 +235,27 @@ impl<S: Send + Sync + 'static> SequentialStore for Store<S> {
                 &watermark,
             )
             .context("staging framework watermark")?;
-        conn.batch
-            .commit()
-            .context("committing framework transaction")?;
+
+        if let Some(queue) = self.inner.queue.get() {
+            // Synchronizer mode: route the batch through the
+            // pipeline's per-task queue. The synchronizer commits
+            // it and coordinates the cross-pipeline snapshot
+            // cadence.
+            let sender = queue.get(&pipeline_task).with_context(|| {
+                format!("pipeline {pipeline_task} not registered with the synchronizer")
+            })?;
+            sender
+                .send((watermark, conn.batch))
+                .await
+                .map_err(|_| anyhow!("{pipeline_task} synchronizer queue closed"))?;
+        } else {
+            // No synchronizer installed: commit inline. This is
+            // the single-pipeline / no-cross-pipeline-snapshot
+            // mode.
+            conn.batch
+                .commit()
+                .context("committing framework transaction")?;
+        }
 
         Ok(r)
     }

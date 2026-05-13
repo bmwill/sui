@@ -19,6 +19,7 @@ sui-indexer-alt-framework = { workspace = true, default-features = false }
 sui-indexer-alt-framework-store-traits.workspace = true
 sui-types.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
