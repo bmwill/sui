@@ -15,7 +15,9 @@ async-trait.workspace = true
 bytes.workspace = true
 scoped-futures.workspace = true
 sui-consistent-store.workspace = true
+sui-indexer-alt-framework = { workspace = true, default-features = false }
 sui-indexer-alt-framework-store-traits.workspace = true
+sui-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
