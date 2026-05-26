@@ -152,7 +152,7 @@ mod tests {
             )]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 versions: DbMap::new(db.clone(), "versions")?,
             })

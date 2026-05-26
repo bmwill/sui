@@ -3,10 +3,12 @@
 
 //! The [`Db`] handle wrapping an opened RocksDB database.
 //!
-//! [`Db`] is shared across the typed column-family handles that a
-//! schema constructs against it; consumers hold an [`Arc<Db>`] for
-//! the database's lifetime, with the Drop on the last clone
-//! triggering RocksDB's own shutdown sequence (flush plus close).
+//! [`Db`] is a cheap-to-clone handle: every clone is one `Arc` bump
+//! against the shared [`DbInner`] holding the actual RocksDB
+//! database. Clones are shared freely across typed column-family
+//! handles and across threads; the database itself stays alive
+//! until the last clone drops, at which point RocksDB's own
+//! shutdown sequence (flush plus close) runs.
 //!
 //! `Db` also holds the in-memory snapshot buffer used to serve
 //! consistent reads at a given checkpoint. See [`take_snapshot`],
@@ -79,13 +81,14 @@ pub struct DbOptions {
 ///
 /// `Db` is not constructed directly; obtain one via [`Db::open`],
 /// which also constructs the typed schema struct that names its
-/// column families.
+/// column families. `Db` is `Clone` and cheap to clone — every
+/// clone shares the same underlying database via an internal
+/// [`Arc`], so handles can be freely passed by value to typed
+/// column-family wrappers and across threads.
 ///
 /// # Examples
 ///
 /// ```
-/// use std::sync::Arc;
-///
 /// use sui_consistent_store::CfDescriptor;
 /// use sui_consistent_store::Db;
 /// use sui_consistent_store::DbOptions;
@@ -93,7 +96,7 @@ pub struct DbOptions {
 /// use sui_consistent_store::error::OpenError;
 ///
 /// struct MySchema {
-///     _db: Arc<Db>,
+///     _db: Db,
 /// }
 ///
 /// impl Schema for MySchema {
@@ -101,7 +104,7 @@ pub struct DbOptions {
 ///         vec![CfDescriptor::new("my_cf", base_options.clone())]
 ///     }
 ///
-///     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+///     fn open(db: &Db) -> Result<Self, OpenError> {
 ///         Ok(Self { _db: db.clone() })
 ///     }
 /// }
@@ -109,10 +112,22 @@ pub struct DbOptions {
 /// let dir = tempfile::tempdir().unwrap();
 /// let (_db, _schema) = Db::open::<MySchema>(dir.path(), DbOptions::default()).unwrap();
 /// ```
+#[derive(Clone)]
 pub struct Db {
-    /// Snapshots are declared *before* `inner` so that, on `Db` drop,
-    /// every retained snapshot drops (and releases its borrow on
-    /// `inner`) before `inner` itself is freed.
+    inner: Arc<DbInner>,
+}
+
+/// The shared storage backing a [`Db`].
+///
+/// Held inside an [`Arc`] inside [`Db`] so every clone of the
+/// public handle co-owns the same underlying database. The last
+/// clone's drop triggers RocksDB's own shutdown sequence.
+///
+/// Field declaration order is load-bearing: `snapshots` is
+/// declared *before* `db` so, on drop, every retained snapshot
+/// drops (and releases its borrow on `db`) before `db` itself is
+/// freed.
+struct DbInner {
     snapshots: RwLock<BTreeMap<u64, Arc<SnapshotEntry>>>,
     snapshot_capacity: NonZeroUsize,
     /// Per-CF restore mode, captured at open time from
@@ -121,22 +136,23 @@ pub struct Db {
     /// [`rocksdb::WriteBatch`] path. Lookup-only after open, so a
     /// plain [`HashMap`] (no lock) is sufficient.
     restore_modes: HashMap<String, RestoreMode>,
-    inner: rocksdb::DB,
+    db: rocksdb::DB,
 }
 
 /// Storage for a single snapshot. The contained [`rocksdb::Snapshot`]
-/// borrows from [`Db::inner`]; the borrow's lifetime is extended to
-/// `'static` via [`std::mem::transmute`] inside
-/// [`Db::take_snapshot`] so the snapshot can be stored in a long-lived
-/// map. Two invariants make this sound:
+/// borrows from [`DbInner::db`]; the borrow's lifetime is extended
+/// to `'static` via [`std::mem::transmute`] inside
+/// [`Db::take_snapshot`] so the snapshot can be stored in a
+/// long-lived map. Two invariants make this sound:
 ///
-/// 1. `Db::inner` is declared after `Db::snapshots`, so `inner` is
-///    dropped only after every retained snapshot has dropped (and
-///    released its borrow).
+/// 1. `DbInner::db` is declared after `DbInner::snapshots`, so `db`
+///    is dropped only after every retained snapshot has dropped
+///    (and released its borrow).
 /// 2. Outstanding [`Snapshot`](crate::Snapshot) values co-own the
-///    same [`Arc<Db>`], so `Db` cannot drop while a `Snapshot`
-///    exists. Field ordering inside `Snapshot` ensures the
-///    `Arc<SnapshotEntry>` drops before the `Arc<Db>`.
+///    same [`Db`] handle (and therefore the same [`Arc<DbInner>`]),
+///    so `DbInner` cannot drop while a `Snapshot` exists. Field
+///    ordering inside `Snapshot` ensures the `Arc<SnapshotEntry>`
+///    drops before the `Db`.
 pub(crate) struct SnapshotEntry {
     snapshot: rocksdb::Snapshot<'static>,
 }
@@ -170,7 +186,7 @@ impl fmt::Debug for Db {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `rocksdb::DB` does not implement Debug; print only the path.
         f.debug_struct("Db")
-            .field("path", &self.inner.path())
+            .field("path", &self.inner.db.path())
             .finish_non_exhaustive()
     }
 }
@@ -184,13 +200,13 @@ impl Db {
     /// [`DbOptions::db_options`] has `create_missing_column_families`
     /// enabled, which is the default.
     ///
-    /// On success, returns the database handle (as an [`Arc`] so it
-    /// can be shared with column-family wrappers) and the constructed
-    /// schema.
+    /// On success, returns the database handle (cheap to clone via
+    /// the inner [`Arc`], so it can be shared with column-family
+    /// wrappers) and the constructed schema.
     pub fn open<S: Schema>(
         path: impl AsRef<Path>,
         opts: DbOptions,
-    ) -> Result<(Arc<Self>, S), OpenError> {
+    ) -> Result<(Self, S), OpenError> {
         let DbOptions {
             db_options,
             snapshot_capacity,
@@ -224,19 +240,29 @@ impl Db {
         let descriptors = cfs
             .into_iter()
             .map(|cf| rocksdb::ColumnFamilyDescriptor::new(cf.name, cf.options));
-        let inner = rocksdb::DB::open_cf_descriptors(&db_options, &path, descriptors)?;
+        let db = rocksdb::DB::open_cf_descriptors(&db_options, &path, descriptors)?;
 
         let path_str = path.as_ref().display().to_string();
         tracing::info!(path = %path_str, "opened consistent-store database");
 
-        let db = Arc::new(Self {
-            snapshots: RwLock::new(BTreeMap::new()),
-            snapshot_capacity,
-            restore_modes,
-            inner,
-        });
+        let db = Self {
+            inner: Arc::new(DbInner {
+                snapshots: RwLock::new(BTreeMap::new()),
+                snapshot_capacity,
+                restore_modes,
+                db,
+            }),
+        };
         let schema = S::open(&db)?;
         Ok((db, schema))
+    }
+
+    /// Returns `true` if `self` and `other` are handles to the same
+    /// underlying database (i.e. clones of each other), `false`
+    /// otherwise. The comparison is a single pointer equality on
+    /// the shared inner [`Arc`].
+    pub fn ptr_eq(&self, other: &Db) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// The [`RestoreMode`] declared for `cf_name`, or `None` if no
@@ -249,7 +275,7 @@ impl Db {
     /// drivers can introspect the mode when assembling shard
     /// commits.
     pub fn restore_mode(&self, cf_name: &str) -> Option<RestoreMode> {
-        self.restore_modes.get(cf_name).copied()
+        self.inner.restore_modes.get(cf_name).copied()
     }
 
     /// Look up a column family handle by name.
@@ -259,7 +285,7 @@ impl Db {
     /// borrows from `self`; callers must not retain it beyond that
     /// borrow.
     pub(crate) fn cf_handle(&self, name: &str) -> Option<Arc<BoundColumnFamily<'_>>> {
-        self.inner.cf_handle(name)
+        self.inner.db.cf_handle(name)
     }
 
     /// Borrow the underlying RocksDB handle.
@@ -267,7 +293,7 @@ impl Db {
     /// Used by typed wrappers (`DbMap`) to call read and write methods
     /// on the database. Not part of the public API.
     pub(crate) fn rocksdb(&self) -> &rocksdb::DB {
-        &self.inner
+        &self.inner.db
     }
 
     /// Construct an empty atomic write batch tied to this database.
@@ -275,7 +301,7 @@ impl Db {
     /// Stage operations against the returned [`Batch`] using
     /// [`Batch::put`] and [`Batch::delete`], then call
     /// [`Batch::commit`] to apply them atomically.
-    pub fn batch(self: &Arc<Self>) -> Batch {
+    pub fn batch(&self) -> Batch {
         Batch::new(self.clone())
     }
 
@@ -294,7 +320,7 @@ impl Db {
     /// fold by key in their accumulator before calling
     /// [`commit`](crate::Pipeline::commit) against a shard-backed
     /// batch.
-    pub fn shard_batch(self: &Arc<Self>) -> Batch {
+    pub fn shard_batch(&self) -> Batch {
         Batch::new_shard(self.clone())
     }
 
@@ -325,20 +351,21 @@ impl Db {
         // checkpoint-N → older-state order: with the capture outside
         // the lock, a thread that captures earlier may insert later
         // and overwrite a fresher snapshot.
-        let mut snaps = self.snapshots.write();
-        let snapshot = self.inner.snapshot();
+        let mut snaps = self.inner.snapshots.write();
+        let snapshot = self.inner.db.snapshot();
         // SAFETY: `rocksdb::Snapshot<'_>` is a borrow of
-        // `self.inner`. The transmute to `'static` is sound because
-        // (1) `Db::inner` is declared after `Db::snapshots`, so
-        // `inner` outlives every snapshot retained in the map; and
-        // (2) `Snapshot`s co-own `Arc<Db>` and drop their
-        // `Arc<SnapshotEntry>` before their `Arc<Db>`, so no
-        // snapshot can survive a `Db` drop.
+        // `self.inner.db`. The transmute to `'static` is sound
+        // because (1) `DbInner::db` is declared after
+        // `DbInner::snapshots`, so `db` outlives every snapshot
+        // retained in the map; and (2) `Snapshot`s co-own the same
+        // [`Db`] handle (and therefore the same `Arc<DbInner>`) and
+        // drop their `Arc<SnapshotEntry>` before their `Db`, so no
+        // snapshot can survive a `DbInner` drop.
         let snapshot: rocksdb::Snapshot<'static> = unsafe { std::mem::transmute(snapshot) };
         let entry = Arc::new(SnapshotEntry { snapshot });
 
         snaps.insert(checkpoint, entry);
-        while snaps.len() > self.snapshot_capacity.get() {
+        while snaps.len() > self.inner.snapshot_capacity.get() {
             snaps.pop_first();
         }
     }
@@ -348,8 +375,8 @@ impl Db {
     /// Returns `None` if no snapshot exists at that checkpoint.
     /// Cloning the returned [`Snapshot`](crate::Snapshot) is cheap;
     /// clones share the same underlying snapshot.
-    pub fn at_snapshot(self: &Arc<Self>, checkpoint: u64) -> Option<Snapshot> {
-        let snaps = self.snapshots.read();
+    pub fn at_snapshot(&self, checkpoint: u64) -> Option<Snapshot> {
+        let snaps = self.inner.snapshots.read();
         let entry = snaps.get(&checkpoint)?.clone();
         Some(Snapshot::new(self.clone(), entry, checkpoint))
     }
@@ -361,8 +388,8 @@ impl Db {
     /// been evicted or dropped). Equivalent to
     /// [`at_snapshot`](Self::at_snapshot) called with the upper
     /// bound of [`snapshot_range`](Self::snapshot_range).
-    pub fn latest_snapshot(self: &Arc<Self>) -> Option<Snapshot> {
-        let snaps = self.snapshots.read();
+    pub fn latest_snapshot(&self) -> Option<Snapshot> {
+        let snaps = self.inner.snapshots.read();
         let (checkpoint, entry) = snaps.iter().next_back()?;
         Some(Snapshot::new(self.clone(), entry.clone(), *checkpoint))
     }
@@ -370,7 +397,7 @@ impl Db {
     /// Returns the inclusive range of checkpoints covered by the
     /// snapshot buffer, or `None` if the buffer is empty.
     pub fn snapshot_range(&self) -> Option<RangeInclusive<u64>> {
-        let snaps = self.snapshots.read();
+        let snaps = self.inner.snapshots.read();
         let lo = *snaps.keys().next()?;
         let hi = *snaps.keys().next_back()?;
         Some(lo..=hi)
@@ -404,7 +431,7 @@ impl Db {
         if opts.is_empty() {
             return Ok(());
         }
-        self.inner.set_options_cf(&cf, opts)?;
+        self.inner.db.set_options_cf(&cf, opts)?;
         Ok(())
     }
 
@@ -541,7 +568,9 @@ impl Db {
         let cf = self
             .cf_handle(cf_name)
             .ok_or_else(|| Error::MissingColumnFamily(cf_name.to_string()))?;
-        self.inner.ingest_external_file_cf_opts(&cf, opts, paths)?;
+        self.inner
+            .db
+            .ingest_external_file_cf_opts(&cf, opts, paths)?;
         Ok(())
     }
 
@@ -554,7 +583,7 @@ impl Db {
     /// database. Routine writes do not require this call; RocksDB
     /// flushes automatically as memtables fill.
     pub fn flush(&self) -> Result<(), Error> {
-        self.inner.flush()?;
+        self.inner.db.flush()?;
         Ok(())
     }
 
@@ -571,7 +600,7 @@ impl Db {
         let cf = self
             .cf_handle(RESTORE_CF)
             .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
-        let pinned = self.inner.get_pinned_cf(&cf, pipeline.as_bytes())?;
+        let pinned = self.inner.db.get_pinned_cf(&cf, pipeline.as_bytes())?;
         match pinned {
             Some(bytes) => {
                 let mut slice = &bytes[..];
@@ -596,6 +625,7 @@ impl Db {
         with_encode_buf(|buf| -> Result<(), Error> {
             state.encode_into(buf)?;
             self.inner
+                .db
                 .put_cf(&cf, pipeline.as_bytes(), buf.as_slice())?;
             Ok(())
         })
@@ -633,7 +663,7 @@ impl Db {
         let cf = self
             .cf_handle(RESTORE_CF)
             .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
-        self.inner.delete_cf(&cf, pipeline.as_bytes())?;
+        self.inner.db.delete_cf(&cf, pipeline.as_bytes())?;
         Ok(())
     }
 
@@ -653,7 +683,10 @@ impl Db {
             .cf_handle(RESTORE_CF)
             .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
         let mut out = Vec::new();
-        let iter = self.inner.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let iter = self
+            .inner
+            .db
+            .iterator_cf(&cf, rocksdb::IteratorMode::Start);
         for entry in iter {
             let (key_bytes, value_bytes) = entry?;
             let pipeline = std::str::from_utf8(&key_bytes)
@@ -678,7 +711,7 @@ impl Db {
     /// checkpoint remain usable until they themselves drop; only the
     /// buffer's reference is released.
     pub fn drop_snapshot(&self, checkpoint: u64) -> bool {
-        self.snapshots.write().remove(&checkpoint).is_some()
+        self.inner.snapshots.write().remove(&checkpoint).is_some()
     }
 
     /// Drop a column family at runtime.
@@ -695,7 +728,7 @@ impl Db {
     /// by RocksDB but may surface as a `MissingColumnFamily` error
     /// at an unpredictable moment.
     pub fn drop_cf(&self, cf_name: &str) -> Result<(), Error> {
-        self.inner.drop_cf(cf_name)?;
+        self.inner.db.drop_cf(cf_name)?;
         Ok(())
     }
 
@@ -714,6 +747,7 @@ impl Db {
         };
         let read = |property: &str| -> i64 {
             self.inner
+                .db
                 .property_int_value_cf(&cf, property)
                 .ok()
                 .flatten()
@@ -862,7 +896,7 @@ mod tests {
     /// Two-CF schema used by the open/close tests in this module.
     #[derive(Debug)]
     struct TestSchema {
-        _db: Arc<Db>,
+        _db: Db,
     }
 
     impl Schema for TestSchema {
@@ -873,7 +907,7 @@ mod tests {
             ]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self { _db: db.clone() })
         }
     }
@@ -1020,7 +1054,7 @@ mod tests {
                 vec![CfDescriptor::new("items", base_options.clone())]
             }
 
-            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            fn open(db: &Db) -> Result<Self, OpenError> {
                 Ok(Self {
                     items: DbMap::new(db.clone(), "items")?,
                 })
@@ -1229,7 +1263,7 @@ mod tests {
                 vec![CfDescriptor::new("items", base_options.clone())]
             }
 
-            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            fn open(db: &Db) -> Result<Self, OpenError> {
                 Ok(Self {
                     items: DbMap::new(db.clone(), "items")?,
                 })
@@ -1360,7 +1394,7 @@ mod tests {
                     ]
                 }
 
-                fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+                fn open(db: &Db) -> Result<Self, OpenError> {
                     Ok(Self {
                         a: DbMap::new(db.clone(), "a")?,
                         b: DbMap::new(db.clone(), "b")?,
@@ -1432,7 +1466,7 @@ mod tests {
                 vec![CfDescriptor::new("items", base_options.clone())]
             }
 
-            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            fn open(db: &Db) -> Result<Self, OpenError> {
                 Ok(Self {
                     items: DbMap::new(db.clone(), "items")?,
                 })
@@ -1478,7 +1512,7 @@ mod tests {
                 vec![CfDescriptor::new("counters", counter_opts)]
             }
 
-            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            fn open(db: &Db) -> Result<Self, OpenError> {
                 Ok(Self {
                     counters: DbMap::new(db.clone(), "counters")?,
                 })

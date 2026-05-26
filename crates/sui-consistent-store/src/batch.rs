@@ -27,8 +27,6 @@
 //! # Examples
 //!
 //! ```
-//! use std::sync::Arc;
-//!
 //! use sui_consistent_store::Db;
 //! use sui_consistent_store::DbMap;
 //! use sui_consistent_store::DbOptions;
@@ -70,7 +68,7 @@
 //!         vec![sui_consistent_store::CfDescriptor::new("items", base_options.clone())]
 //!     }
 //!
-//!     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+//!     fn open(db: &Db) -> Result<Self, OpenError> {
 //!         Ok(Self {
 //!             items: DbMap::new(db.clone(), "items")?,
 //!         })
@@ -92,7 +90,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::Encode;
 use crate::Live;
@@ -144,7 +141,7 @@ use crate::schema::RestoreMode;
 /// underlying RocksDB write can fail with
 /// [`Error::Rocksdb`](crate::error::Error::Rocksdb) at commit time.
 pub struct Batch {
-    db: Arc<Db>,
+    db: Db,
     backing: BatchBacking,
 }
 
@@ -253,14 +250,14 @@ impl ShardBuffer {
 }
 
 impl Batch {
-    pub(crate) fn new(db: Arc<Db>) -> Self {
+    pub(crate) fn new(db: Db) -> Self {
         Self {
             db,
             backing: BatchBacking::Write(rocksdb::WriteBatch::default()),
         }
     }
 
-    pub(crate) fn new_shard(db: Arc<Db>) -> Self {
+    pub(crate) fn new_shard(db: Db) -> Self {
         Self {
             db,
             backing: BatchBacking::Shard(ShardBuffer::new()),
@@ -670,7 +667,7 @@ impl Batch {
 /// [`take_ssts`](Self::take_ssts) and
 /// [`take_write_batch`](Self::take_write_batch) manually.
 pub struct ShardFinalize {
-    db: Arc<Db>,
+    db: Db,
     ssts: Vec<(String, PathBuf)>,
     write_batch: rocksdb::WriteBatch,
 }
@@ -791,8 +788,6 @@ impl fmt::Debug for Batch {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tempfile::TempDir;
 
     use super::*;
@@ -857,7 +852,7 @@ mod tests {
             ]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 items: DbMap::new(db.clone(), "items")?,
                 other: DbMap::new(db.clone(), "other")?,
@@ -865,7 +860,7 @@ mod tests {
         }
     }
 
-    fn open() -> (TempDir, Arc<Db>, TestSchema) {
+    fn open() -> (TempDir, Db, TestSchema) {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
         (dir, db, schema)
@@ -1037,14 +1032,14 @@ mod tests {
             ]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 counters: DbMap::new(db.clone(), "counters")?,
             })
         }
     }
 
-    fn open_merge() -> (TempDir, Arc<Db>, MergeSchema) {
+    fn open_merge() -> (TempDir, Db, MergeSchema) {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<MergeSchema>(dir.path(), DbOptions::default()).unwrap();
         (dir, db, schema)

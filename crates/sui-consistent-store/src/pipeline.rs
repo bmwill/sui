@@ -182,7 +182,6 @@ mod tests {
     //! shape compiles and the four methods are wired up correctly.
 
     use std::collections::BTreeMap;
-    use std::sync::Arc;
 
     use bytes::Buf;
     use bytes::BufMut;
@@ -262,7 +261,7 @@ mod tests {
             vec![crate::CfDescriptor::new("versions", base_options.clone())]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 versions: DbMap::new(db.clone(), "versions")?,
             })
@@ -343,7 +342,7 @@ mod tests {
     }
 
     /// Open a fresh database with `ObjectVersionSchema`.
-    fn open() -> (TempDir, Arc<Db>, ObjectVersionSchema) {
+    fn open() -> (TempDir, Db, ObjectVersionSchema) {
         let dir = TempDir::new().unwrap();
         let (db, schema) =
             Db::open::<ObjectVersionSchema>(dir.path(), DbOptions::default()).unwrap();

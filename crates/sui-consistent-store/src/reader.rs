@@ -27,19 +27,18 @@
 //!
 //! # Cost model
 //!
-//! `Live` owns an [`Arc<Db>`] (one `Arc` clone per [`DbMap`] field,
-//! same cost as today). [`Snapshot`](crate::Snapshot) owns two
-//! `Arc`s plus a `u64`; constructing one is two atomic increments.
-//! Each call to [`DbMap::at`](crate::DbMap::at) clones the
-//! column-family name ([`Box<str>`]) once *and* clones the snapshot
-//! (two `Arc` bumps), so re-projecting an N-CF schema costs N name
-//! clones, 2N `Arc` bumps, and N struct constructions per call to
+//! `Live` owns a [`Db`] handle (one `Arc` bump per [`DbMap`] field,
+//! same cost as today). [`Snapshot`](crate::Snapshot) owns a `Db`
+//! handle plus an `Arc<SnapshotEntry>` plus a `u64`; constructing
+//! one is two atomic increments. Each call to
+//! [`DbMap::at`](crate::DbMap::at) clones the column-family name
+//! ([`Box<str>`]) once *and* clones the snapshot (two `Arc` bumps),
+//! so re-projecting an N-CF schema costs N name clones, 2N `Arc`
+//! bumps, and N struct constructions per call to
 //! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at). For a
 //! per-request handler that projects once and reads many times, this
 //! is amortized; for a hot path that projects on every read, project
 //! once outside the loop.
-
-use std::sync::Arc;
 
 use rocksdb::ReadOptions;
 
@@ -47,9 +46,9 @@ use crate::db::Db;
 
 /// Abstracts the read context a [`DbMap`](crate::DbMap) is bound to.
 ///
-/// Both implementations supply (1) the [`Arc<Db>`] needed to look up
-/// the column-family handle and (2) a fresh [`ReadOptions`] tuned for
-/// the reader's consistency context. [`Live`] returns
+/// Both implementations supply (1) the [`Db`] handle needed to look
+/// up the column-family handle and (2) a fresh [`ReadOptions`]
+/// tuned for the reader's consistency context. [`Live`] returns
 /// [`ReadOptions::default()`]; [`Snapshot`](crate::Snapshot) returns
 /// one with [`set_snapshot`](ReadOptions::set_snapshot) pointed at
 /// the captured snapshot.
@@ -60,11 +59,11 @@ use crate::db::Db;
 /// [`Snapshot`](crate::Snapshot). The trait is sealed via a
 /// pub(crate) supertrait so downstream code cannot add a third — a
 /// custom reader could return [`ReadOptions`] referencing a snapshot
-/// pointer not co-owned through the [`Arc<Db>`] story, leading to UB
-/// inside RocksDB.
+/// pointer not co-owned through the [`Db`] handle story, leading
+/// to UB inside RocksDB.
 pub trait Reader: sealed::Sealed {
     /// The shared database handle the column family lives on.
-    fn db(&self) -> &Arc<Db>;
+    fn db(&self) -> &Db;
 
     /// Construct a fresh [`ReadOptions`] configured for this reader.
     ///
@@ -89,17 +88,17 @@ pub(crate) mod sealed {
 /// reader type parameter is left at its default.
 #[derive(Debug)]
 pub struct Live {
-    db: Arc<Db>,
+    db: Db,
 }
 
 impl Live {
-    pub(crate) fn new(db: Arc<Db>) -> Self {
+    pub(crate) fn new(db: Db) -> Self {
         Self { db }
     }
 }
 
 impl Reader for Live {
-    fn db(&self) -> &Arc<Db> {
+    fn db(&self) -> &Db {
         &self.db
     }
 

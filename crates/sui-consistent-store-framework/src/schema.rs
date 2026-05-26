@@ -27,8 +27,6 @@
 //! [`Connection`]: sui_indexer_alt_framework_store_traits::Connection
 //! [`SequentialConnection`]: sui_indexer_alt_framework_store_traits::SequentialConnection
 
-use std::sync::Arc;
-
 use bytes::Buf;
 use bytes::BufMut;
 use sui_consistent_store::CfDescriptor;
@@ -134,7 +132,7 @@ impl Schema for FrameworkSchema {
         ]
     }
 
-    fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+    fn open(db: &Db) -> Result<Self, OpenError> {
         Ok(Self {
             watermarks: DbMap::new(db.clone(), WATERMARK_CF)?,
             chain_ids: DbMap::new(db.clone(), CHAIN_ID_CF)?,

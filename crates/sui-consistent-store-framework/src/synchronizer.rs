@@ -69,7 +69,7 @@ pub(crate) type Queue = HashMap<String, mpsc::Sender<(Watermark, Batch)>>;
 /// [`run`](Self::run) (which consumes `self`) and produces a
 /// [`Queue`] + a [`JoinSet`] driving the per-pipeline tasks.
 pub struct Synchronizer {
-    db: Arc<Db>,
+    db: Db,
     framework: Arc<FrameworkSchema>,
     last_watermarks: HashMap<String, Option<Watermark>>,
     first_checkpoint: u64,
@@ -97,7 +97,7 @@ impl Synchronizer {
     /// pipelines that have no persisted watermark. `None` defaults
     /// to `0`.
     pub fn new(
-        db: Arc<Db>,
+        db: Db,
         framework: Arc<FrameworkSchema>,
         stride: u64,
         buffer_size: usize,
@@ -189,7 +189,7 @@ impl Synchronizer {
 /// in checkpoint order, commits each batch, and coordinates with
 /// peer tasks at stride boundaries to take a shared snapshot.
 async fn synchronizer_task(
-    db: Arc<Db>,
+    db: Db,
     mut rx: mpsc::Receiver<(Watermark, Batch)>,
     pipeline_task: String,
     first_checkpoint: u64,
@@ -292,12 +292,12 @@ mod tests {
             FrameworkSchema::cfs(base_options)
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self(FrameworkSchema::open(db)?))
         }
     }
 
-    fn open() -> (TempDir, Arc<Db>, Arc<FrameworkSchema>) {
+    fn open() -> (TempDir, Db, Arc<FrameworkSchema>) {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<OnlyFramework>(dir.path(), DbOptions::default()).unwrap();
         (dir, db, Arc::new(schema.0))

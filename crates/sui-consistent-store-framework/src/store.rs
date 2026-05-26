@@ -5,7 +5,7 @@
 //! satisfy [`sui_indexer_alt_framework_store_traits`]'s `Store` /
 //! `Connection` / `SequentialStore` / `SequentialConnection`.
 //!
-//! The store wraps a triple — an [`Arc<Db>`] from
+//! The store wraps a triple — a [`Db`] handle from
 //! [`sui_consistent_store`], an [`Arc<FrameworkSchema>`] holding
 //! the framework's internal watermark and chain-id CFs, and an
 //! `Arc<S>` holding the consumer's own schema. The connection
@@ -67,7 +67,7 @@ use crate::synchronizer::Queue;
 use crate::synchronizer::Synchronizer;
 use crate::watermark::Watermark;
 
-/// Framework-side wrapper around an [`Arc<Db>`] plus a
+/// Framework-side wrapper around a [`Db`] handle plus a
 /// [`FrameworkSchema`] and a consumer-supplied user schema `S`.
 ///
 /// `Store<S>` is `Clone` (cheap, [`Arc`]-backed) so the framework
@@ -77,7 +77,7 @@ pub struct Store<S> {
 }
 
 struct Inner<S> {
-    db: Arc<Db>,
+    db: Db,
     framework: Arc<FrameworkSchema>,
     user: Arc<S>,
     /// Per-pipeline write queues, set once when
@@ -97,7 +97,7 @@ impl<S> Store<S> {
     /// `Arc` is shared across pipelines, but the choice is the
     /// caller's). All three must have been opened against the same
     /// underlying database.
-    pub fn new(db: Arc<Db>, framework: Arc<FrameworkSchema>, user: Arc<S>) -> Self {
+    pub fn new(db: Db, framework: Arc<FrameworkSchema>, user: Arc<S>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 db,
@@ -138,7 +138,7 @@ impl<S> Store<S> {
     }
 
     /// Borrow the underlying [`Db`] handle.
-    pub fn db(&self) -> &Arc<Db> {
+    pub fn db(&self) -> &Db {
         &self.inner.db
     }
 
@@ -379,7 +379,7 @@ mod tests {
             )]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 items: DbMap::new(db.clone(), "items")?,
             })
@@ -403,7 +403,7 @@ mod tests {
             cfs
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 framework: FrameworkSchema::open(db)?,
                 user: UserSchema::open(db)?,

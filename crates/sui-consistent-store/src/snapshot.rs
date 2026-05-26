@@ -16,7 +16,7 @@
 //!
 //! # Ownership
 //!
-//! `Snapshot` co-owns an [`Arc<Db>`] and an [`Arc<SnapshotEntry>`]
+//! `Snapshot` co-owns a [`Db`] handle and an [`Arc<SnapshotEntry>`]
 //! ([`SnapshotEntry`](crate::db::SnapshotEntry) is private). As long
 //! as a `Snapshot` (or any clone of it) exists, the underlying
 //! snapshot is kept alive even if
@@ -31,8 +31,6 @@
 //! # Examples
 //!
 //! ```
-//! use std::sync::Arc;
-//!
 //! use bytes::Buf;
 //! use bytes::BufMut;
 //!
@@ -76,7 +74,7 @@
 //!         vec![sui_consistent_store::CfDescriptor::new("items", base_options.clone())]
 //!     }
 //!
-//!     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+//!     fn open(db: &Db) -> Result<Self, OpenError> {
 //!         Ok(Self {
 //!             items: DbMap::new(db.clone(), "items")?,
 //!         })
@@ -128,15 +126,15 @@ use crate::reader::sealed;
 pub struct Snapshot {
     // Field declaration order is load-bearing: `entry` must drop
     // before `db` so that the contained `rocksdb::Snapshot`
-    // releases its borrow on `Db::inner` before the `Arc<Db>` ref
-    // is decremented.
+    // releases its borrow on `DbInner::db` before the `Db` handle's
+    // `Arc<DbInner>` ref is decremented.
     entry: Arc<SnapshotEntry>,
-    db: Arc<Db>,
+    db: Db,
     checkpoint: u64,
 }
 
 impl Snapshot {
-    pub(crate) fn new(db: Arc<Db>, entry: Arc<SnapshotEntry>, checkpoint: u64) -> Self {
+    pub(crate) fn new(db: Db, entry: Arc<SnapshotEntry>, checkpoint: u64) -> Self {
         Self {
             entry,
             db,
@@ -153,7 +151,7 @@ impl Snapshot {
 impl sealed::Sealed for Snapshot {}
 
 impl Reader for Snapshot {
-    fn db(&self) -> &Arc<Db> {
+    fn db(&self) -> &Db {
         &self.db
     }
 
@@ -229,7 +227,7 @@ mod tests {
             vec![crate::CfDescriptor::new("items", base_options.clone())]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 items: DbMap::new(db.clone(), "items")?,
             })
@@ -245,7 +243,7 @@ mod tests {
         }
     }
 
-    fn open_with_capacity(capacity: usize) -> (TempDir, Arc<Db>, TestSchema) {
+    fn open_with_capacity(capacity: usize) -> (TempDir, Db, TestSchema) {
         let dir = TempDir::new().unwrap();
         let opts = DbOptions {
             snapshot_capacity: std::num::NonZeroUsize::new(capacity)
@@ -256,11 +254,11 @@ mod tests {
         (dir, db, schema)
     }
 
-    fn open() -> (TempDir, Arc<Db>, TestSchema) {
+    fn open() -> (TempDir, Db, TestSchema) {
         open_with_capacity(32)
     }
 
-    fn put(db: &Arc<Db>, schema: &TestSchema, key: u64, value: u64) {
+    fn put(db: &Db, schema: &TestSchema, key: u64, value: u64) {
         let mut batch = db.batch();
         batch
             .put(&schema.items, &U64Be(key), &U64Be(value))

@@ -101,7 +101,7 @@ use crate::error::Error;
 /// across workers as `&Self::Schema`; the pipeline itself is wrapped
 /// in [`Arc<P>`] so `&self` calls can spread across threads.
 pub struct RestoreRunner<P: Pipeline> {
-    db: Arc<Db>,
+    db: Db,
     pipeline: Arc<P>,
     schema: Arc<P::Schema>,
     target_checkpoint: u64,
@@ -129,7 +129,7 @@ impl<P: Pipeline> RestoreRunner<P> {
     /// schemas using non-default comparators must supply matching
     /// options here.
     pub fn new(
-        db: Arc<Db>,
+        db: Db,
         pipeline: Arc<P>,
         schema: Arc<P::Schema>,
         target_checkpoint: u64,
@@ -476,7 +476,7 @@ mod tests {
             vec![crate::CfDescriptor::new("versions", base_options.clone())]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 versions: DbMap::new(db.clone(), "versions")?,
             })
@@ -564,7 +564,7 @@ mod tests {
             ]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 counters: DbMap::new(db.clone(), "counters")?,
             })
@@ -616,7 +616,7 @@ mod tests {
     ) -> (
         TempDir,
         TempDir,
-        Arc<Db>,
+        Db,
         Arc<VersionsSchema>,
         RestoreRunner<VersionsPipeline>,
     ) {
@@ -958,7 +958,7 @@ mod tests {
                 ]
             }
 
-            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            fn open(db: &Db) -> Result<Self, OpenError> {
                 Ok(Self {
                     versions: DbMap::new(db.clone(), "versions")?,
                     counters: DbMap::new(db.clone(), "counters")?,
@@ -1040,7 +1040,7 @@ mod tests {
         ) -> (
             TempDir,
             TempDir,
-            Arc<Db>,
+            Db,
             Arc<HybridSchema>,
             RestoreRunner<HybridPipeline>,
         ) {

@@ -46,6 +46,9 @@
 //!     .add_pipeline(Arc::new(ObjectByOwnerPipeline), Arc::new(schema.clone()))
 //!     .build();
 //! ```
+//!
+//! The [`Db`] handle is `Clone`, so callers pass it by value
+//! (`db.clone()`) rather than wrapping it in an outer `Arc`.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -65,7 +68,7 @@ use crate::Pipeline;
 /// adapter is `Send + Sync` so the validator can share it across
 /// the checkpoint executor's worker pool.
 pub struct CheckpointExecutorAdapter {
-    db: Arc<Db>,
+    db: Db,
     pipelines: Vec<Arc<dyn TipPipeline>>,
     pending: Mutex<BTreeMap<u64, Vec<Box<dyn Any + Send>>>>,
 }
@@ -148,7 +151,7 @@ impl<P: Pipeline> TipPipeline for PipelineAdapter<P> {
 /// via [`add_pipeline`](Self::add_pipeline) and finalizes via
 /// [`build`](Self::build).
 pub struct AdapterBuilder {
-    db: Arc<Db>,
+    db: Db,
     pipelines: Vec<Arc<dyn TipPipeline>>,
 }
 
@@ -183,7 +186,7 @@ impl AdapterBuilder {
 
 impl CheckpointExecutorAdapter {
     /// Start building an adapter for `db`.
-    pub fn builder(db: Arc<Db>) -> AdapterBuilder {
+    pub fn builder(db: Db) -> AdapterBuilder {
         AdapterBuilder {
             db,
             pipelines: Vec::new(),
@@ -379,7 +382,7 @@ mod tests {
             ]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 versions: DbMap::new(db.clone(), "versions")?,
                 counts: DbMap::new(db.clone(), "counts")?,
@@ -480,7 +483,7 @@ mod tests {
     }
 
     /// Build a fresh database, schema, and a two-pipeline adapter.
-    fn setup() -> (TempDir, Arc<Db>, Arc<TestSchema>, CheckpointExecutorAdapter) {
+    fn setup() -> (TempDir, Db, Arc<TestSchema>, CheckpointExecutorAdapter) {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
         let schema = Arc::new(schema);

@@ -25,8 +25,6 @@
 //! # Examples
 //!
 //! ```
-//! use std::sync::Arc;
-//!
 //! use sui_consistent_store::CfDescriptor;
 //! use sui_consistent_store::Db;
 //! use sui_consistent_store::DbMap;
@@ -40,7 +38,7 @@
 //!
 //! struct MySchema<R: Reader = Live> {
 //!     _reader: std::marker::PhantomData<R>,
-//!     _db: Arc<Db>,
+//!     _db: Db,
 //! }
 //!
 //! impl Schema for MySchema<Live> {
@@ -48,7 +46,7 @@
 //!         vec![CfDescriptor::new("my_cf", base_options.clone())]
 //!     }
 //!
-//!     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+//!     fn open(db: &Db) -> Result<Self, OpenError> {
 //!         Ok(Self {
 //!             _reader: std::marker::PhantomData,
 //!             _db: db.clone(),
@@ -69,8 +67,6 @@
 //! let dir = tempfile::tempdir().unwrap();
 //! let (_db, _schema) = Db::open::<MySchema>(dir.path(), DbOptions::default()).unwrap();
 //! ```
-
-use std::sync::Arc;
 
 use crate::db::Db;
 use crate::error::OpenError;
@@ -116,12 +112,12 @@ pub trait Schema: Sized {
 
     /// Construct the schema struct against `db`.
     ///
-    /// Implementations typically clone the supplied `Arc<Db>` into
-    /// each column-family handle they construct. The default
-    /// implementation in user schemas is usually a one-line
-    /// `Self::new(db.clone())` that delegates to inherent methods on
-    /// the schema struct.
-    fn open(db: &Arc<Db>) -> Result<Self, OpenError>;
+    /// Implementations typically clone the supplied [`Db`] handle
+    /// into each column-family handle they construct (a `Db` clone
+    /// is one `Arc` bump). The default implementation in user
+    /// schemas is usually a one-line `Self::new(db.clone())` that
+    /// delegates to inherent methods on the schema struct.
+    fn open(db: &Db) -> Result<Self, OpenError>;
 }
 
 /// How restore-time shard writes are routed for a column family.

@@ -199,7 +199,7 @@ mod tests {
             )]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 versions: DbMap::new(db.clone(), "versions")?,
             })
@@ -219,7 +219,7 @@ mod tests {
             cfs
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 framework: FrameworkSchema::open(db)?,
                 user: VersionsSchema::open(db)?,

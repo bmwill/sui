@@ -4,8 +4,8 @@
 //! Typed column-family handles.
 //!
 //! [`DbMap<K, V, R>`] is the primary read and write surface in the
-//! crate. Each instance is tied to a single column family on an
-//! [`Arc<Db>`] (carried by the reader), to a key type and a value
+//! crate. Each instance is tied to a single column family on a
+//! [`Db`] handle (carried by the reader), to a key type and a value
 //! type that implement the crate's encoding traits, and to a
 //! [`Reader`] that pins the consistency context.
 //!
@@ -34,7 +34,7 @@
 //!   [`bytes::Bytes`]. The `Bytes` is backed zero-copy by the
 //!   RocksDB block cache where possible (cache hits) and by an
 //!   internal copy where not (memtable hits, merge results,
-//!   wide-column values). The handle co-owns the [`Arc<Db>`] (via
+//!   wide-column values). The handle co-owns the [`Db`] handle (via
 //!   the reader) so it is sound to hold the `Bytes` past the borrow
 //!   it was read through.
 //!
@@ -83,8 +83,6 @@ use crate::snapshot::Snapshot;
 /// # Examples
 ///
 /// ```
-/// use std::sync::Arc;
-///
 /// use bytes::Buf;
 /// use bytes::BufMut;
 ///
@@ -128,7 +126,7 @@ use crate::snapshot::Snapshot;
 ///         vec![sui_consistent_store::CfDescriptor::new("items", base_options.clone())]
 ///     }
 ///
-///     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+///     fn open(db: &Db) -> Result<Self, OpenError> {
 ///         Ok(Self {
 ///             items: DbMap::new(db.clone(), "items")?,
 ///         })
@@ -147,9 +145,9 @@ pub struct DbMap<K, V, R: Reader = Live> {
     _data: PhantomData<fn(K) -> V>,
 }
 
-/// Owner struct used to tie a `DBPinnableSlice` to an `Arc<Db>` so
-/// the slice can be wrapped in `bytes::Bytes::from_owner`. The
-/// `'static` lifetime on the slice is justified by the `Arc<Db>`
+/// Owner struct used to tie a `DBPinnableSlice` to a [`Db`] handle
+/// so the slice can be wrapped in `bytes::Bytes::from_owner`. The
+/// `'static` lifetime on the slice is justified by the [`Db`]
 /// co-owner; see `pinned_to_bytes` for the safety argument.
 ///
 /// Field declaration order is load-bearing: `slice` must drop before
@@ -158,7 +156,7 @@ pub struct DbMap<K, V, R: Reader = Live> {
 /// allocation is still alive.
 struct PinnedOwner {
     slice: DBPinnableSlice<'static>,
-    _db: Arc<Db>,
+    _db: Db,
 }
 
 impl<K, V> DbMap<K, V, Live> {
@@ -175,7 +173,7 @@ impl<K, V> DbMap<K, V, Live> {
     /// then call [`DbMap::at`] (or use
     /// [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) for the
     /// whole-schema equivalent).
-    pub fn new(db: Arc<Db>, cf_name: impl Into<Box<str>>) -> Result<Self, OpenError> {
+    pub fn new(db: Db, cf_name: impl Into<Box<str>>) -> Result<Self, OpenError> {
         let cf_name = cf_name.into();
         if db.cf_handle(&cf_name).is_none() {
             return Err(OpenError::msg(format!(
@@ -212,7 +210,7 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     /// underlying bug.
     pub fn at(&self, snap: &Snapshot) -> DbMap<K, V, Snapshot> {
         assert!(
-            Arc::ptr_eq(self.reader.db(), snap.db()),
+            self.reader.db().ptr_eq(snap.db()),
             "snapshot was taken on a different Db than this DbMap is bound to",
         );
         DbMap {
@@ -229,10 +227,10 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
             .ok_or_else(|| Error::MissingColumnFamily(self.cf_name.to_string()))
     }
 
-    /// The shared `Arc<Db>` this handle is bound to. Used by
+    /// The shared [`Db`] handle this `DbMap` is bound to. Used by
     /// `Batch` to look up the same column family the handle points
     /// at.
-    pub(crate) fn db(&self) -> &Arc<Db> {
+    pub(crate) fn db(&self) -> &Db {
         self.reader.db()
     }
 
@@ -305,8 +303,8 @@ where
     /// [`Bytes`] is backed zero-copy by the RocksDB block cache when
     /// the read hits a cached block; otherwise it backs onto a small
     /// internal copy made by RocksDB's pinned-read machinery. Either
-    /// way, the `Bytes` co-owns the underlying [`Arc<Db>`] so it can
-    /// outlive any borrow this method was called through.
+    /// way, the `Bytes` co-owns the underlying [`Db`] handle so it
+    /// can outlive any borrow this method was called through.
     pub fn get_raw(&self, key: &K) -> Result<Option<Bytes>, Error> {
         let opts = self.reader.read_options();
         let cf = self.cf()?;
@@ -571,7 +569,7 @@ impl AsRef<[u8]> for PinnedOwner {
     }
 }
 
-/// Wrap a `DBPinnableSlice` plus its co-owned `Arc<Db>` in a
+/// Wrap a `DBPinnableSlice` plus its co-owned [`Db`] handle in a
 /// `bytes::Bytes` so callers do not have to reason about RocksDB
 /// lifetimes themselves.
 ///
@@ -582,13 +580,13 @@ impl AsRef<[u8]> for PinnedOwner {
 /// buffer owned by the C++ `PinnableSlice` itself (freed when the
 /// slice drops). Neither path requires a live `&DB` borrow; both
 /// require only that the underlying DB allocation outlive the slice,
-/// which the co-owned `Arc<Db>` guarantees. Drop order in
-/// `PinnedOwner` (slice first, `Arc` second) ensures the cleanup
-/// runs before the `Arc`'s last reference goes away.
-fn pinned_to_bytes(db: Arc<Db>, slice: DBPinnableSlice<'_>) -> Bytes {
+/// which the co-owned [`Db`] handle guarantees. Drop order in
+/// `PinnedOwner` (slice first, `Db` second) ensures the cleanup
+/// runs before the [`Db`] handle's last reference goes away.
+fn pinned_to_bytes(db: Db, slice: DBPinnableSlice<'_>) -> Bytes {
     // SAFETY: see the function-level doc comment. The lifetime is a
     // conservative phantom annotation; the actual memory pin is
-    // sustained by the `Arc<Db>` co-owner held in `PinnedOwner`.
+    // sustained by the [`Db`] co-owner held in `PinnedOwner`.
     let slice: DBPinnableSlice<'static> = unsafe { mem::transmute(slice) };
     Bytes::from_owner(PinnedOwner { slice, _db: db })
 }
@@ -635,7 +633,7 @@ mod tests {
             vec![crate::CfDescriptor::new("items", base_options.clone())]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 items: DbMap::new(db.clone(), "items")?,
             })
@@ -653,7 +651,7 @@ mod tests {
         db.rocksdb().put_cf(&cf, key_bytes, value_bytes).unwrap();
     }
 
-    fn open() -> (TempDir, Arc<Db>, TestSchema) {
+    fn open() -> (TempDir, Db, TestSchema) {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
         (dir, db, schema)
@@ -698,7 +696,7 @@ mod tests {
         let (_dir, db, schema) = open();
         seed(&db, "items", &U64Be(11), &U64Be(1100));
         let bytes = schema.items.get_raw(&U64Be(11)).unwrap().unwrap();
-        // Drop the schema (and its DbMap clone of `Arc<Db>`); the
+        // Drop the schema (and its DbMap clone of `Db`); the
         // `Bytes` still co-owns the DB via `PinnedOwner`.
         drop(schema);
         assert_eq!(&bytes[..], &1100u64.to_be_bytes());
@@ -1123,7 +1121,7 @@ mod tests {
     // (odd keys 1,3,5,7,9) so each bound can be probed for "exact
     // match" (bound is in the data) vs "inexact match" (bound falls
     // between keys). Mirrors alt-consistent-store's coverage.
-    fn open_with_odd_keys() -> (TempDir, Arc<Db>, TestSchema) {
+    fn open_with_odd_keys() -> (TempDir, Db, TestSchema) {
         let (dir, db, schema) = open();
         for k in (1..=9u64).step_by(2) {
             seed(&db, "items", &U64Be(k), &U64Be(k * 10));
@@ -1475,14 +1473,14 @@ mod tests {
             vec![crate::CfDescriptor::new("rows", base_options.clone())]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 rows: DbMap::new(db.clone(), "rows")?,
             })
         }
     }
 
-    fn open_compound() -> (TempDir, Arc<Db>, CompoundSchema) {
+    fn open_compound() -> (TempDir, Db, CompoundSchema) {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<CompoundSchema>(dir.path(), DbOptions::default()).unwrap();
         (dir, db, schema)

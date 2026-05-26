@@ -626,7 +626,7 @@ mod tests {
                 vec![crate::CfDescriptor::new("versions", base_options.clone())]
             }
 
-            fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+            fn open(db: &Db) -> Result<Self, OpenError> {
                 Ok(Self {
                     versions: DbMap::new(db.clone(), "versions")?,
                 })

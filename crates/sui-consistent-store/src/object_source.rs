@@ -250,7 +250,7 @@ mod tests {
             vec![crate::CfDescriptor::new("versions", base_options.clone())]
         }
 
-        fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
+        fn open(db: &Db) -> Result<Self, OpenError> {
             Ok(Self {
                 versions: DbMap::new(db.clone(), "versions")?,
             })
@@ -345,7 +345,7 @@ mod tests {
         Object::immutable_with_id_for_testing(ObjectID::new(bytes))
     }
 
-    fn open_db() -> (TempDir, Arc<Db>, Arc<VersionsSchema>) {
+    fn open_db() -> (TempDir, Db, Arc<VersionsSchema>) {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<VersionsSchema>(dir.path(), DbOptions::default()).unwrap();
         (dir, db, Arc::new(schema))
