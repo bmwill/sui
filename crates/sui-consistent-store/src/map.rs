@@ -125,8 +125,8 @@ use crate::snapshot::SnapshotHandle;
 /// }
 ///
 /// impl Schema for MySchema<Live> {
-///     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-///         vec![("items", base_options.clone())]
+///     fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
+///         vec![sui_consistent_store::CfDescriptor::new("items", base_options.clone())]
 ///     }
 ///
 ///     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -258,11 +258,11 @@ where
         let cf = self.cf()?;
         with_encode_buf(|buf| {
             key.encode_into(buf)?;
-            let pinned = self
-                .reader
-                .db()
-                .rocksdb()
-                .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
+            let pinned =
+                self.reader
+                    .db()
+                    .rocksdb()
+                    .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
             match pinned {
                 Some(slice) => Ok(Some(V::decode(&mut &slice[..])?)),
                 None => Ok(None),
@@ -312,11 +312,11 @@ where
         let cf = self.cf()?;
         with_encode_buf(|buf| {
             key.encode_into(buf)?;
-            let pinned = self
-                .reader
-                .db()
-                .rocksdb()
-                .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
+            let pinned =
+                self.reader
+                    .db()
+                    .rocksdb()
+                    .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
             Ok(pinned.map(|slice| pinned_to_bytes(self.reader.db().clone(), slice)))
         })
     }
@@ -413,11 +413,11 @@ where
             {
                 return Ok(false);
             }
-            let pinned = self
-                .reader
-                .db()
-                .rocksdb()
-                .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
+            let pinned =
+                self.reader
+                    .db()
+                    .rocksdb()
+                    .get_pinned_cf_opt(&cf, buf.as_slice(), &opts)?;
             Ok(pinned.is_some())
         })
     }
@@ -631,8 +631,8 @@ mod tests {
     }
 
     impl Schema for TestSchema<Live> {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-            vec![("items", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
+            vec![crate::CfDescriptor::new("items", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -1094,7 +1094,10 @@ mod tests {
         // widening to "no lower bound."
         let collected: Vec<_> = schema
             .items
-            .iter((std::ops::Bound::Excluded(U64Be(u64::MAX)), std::ops::Bound::Unbounded))
+            .iter((
+                std::ops::Bound::Excluded(U64Be(u64::MAX)),
+                std::ops::Bound::Unbounded,
+            ))
             .unwrap()
             .map(|r| r.unwrap().0)
             .collect();
@@ -1468,8 +1471,8 @@ mod tests {
     }
 
     impl Schema for CompoundSchema<Live> {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-            vec![("rows", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
+            vec![crate::CfDescriptor::new("rows", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {

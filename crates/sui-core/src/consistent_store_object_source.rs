@@ -145,8 +145,11 @@ mod tests {
     impl Schema for VersionsSchema {
         fn cfs(
             base_options: &sui_consistent_store::rocksdb::Options,
-        ) -> Vec<(&'static str, sui_consistent_store::rocksdb::Options)> {
-            vec![("versions", base_options.clone())]
+        ) -> Vec<sui_consistent_store::CfDescriptor> {
+            vec![sui_consistent_store::CfDescriptor::new(
+                "versions",
+                base_options.clone(),
+            )]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {

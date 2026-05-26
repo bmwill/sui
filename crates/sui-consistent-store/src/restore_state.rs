@@ -97,9 +97,10 @@ impl Encode for RestoreState {
             } => {
                 buf.put_u8(TAG_IN_PROGRESS);
                 buf.put_u64(*target_checkpoint);
-                let count: u32 = partitions_complete.len().try_into().map_err(|_| {
-                    EncodeError::msg("partitions_complete count exceeds u32::MAX")
-                })?;
+                let count: u32 = partitions_complete
+                    .len()
+                    .try_into()
+                    .map_err(|_| EncodeError::msg("partitions_complete count exceeds u32::MAX"))?;
                 buf.put_u32(count);
                 for partition in partitions_complete {
                     let len: u32 = partition
@@ -128,7 +129,9 @@ impl Decode for RestoreState {
         match tag {
             TAG_IN_PROGRESS => {
                 if buf.remaining() < 8 + 4 {
-                    return Err(DecodeError::msg("RestoreState::InProgress truncated header"));
+                    return Err(DecodeError::msg(
+                        "RestoreState::InProgress truncated header",
+                    ));
                 }
                 let target_checkpoint = buf.get_u64();
                 let count = buf.get_u32() as usize;

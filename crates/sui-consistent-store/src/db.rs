@@ -19,6 +19,7 @@
 //! [`at_snapshot`]: Db::at_snapshot
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::RangeInclusive;
@@ -29,13 +30,15 @@ use parking_lot::RwLock;
 use rocksdb::BoundColumnFamily;
 
 use crate::batch::Batch;
-use crate::encode_buf::with_encode_buf;
 use crate::encode::Decode;
 use crate::encode::Encode;
+use crate::encode_buf::with_encode_buf;
 use crate::error::Error;
 use crate::error::OpenError;
 use crate::restore_state::RESTORE_CF;
 use crate::restore_state::RestoreState;
+use crate::schema::CfDescriptor;
+use crate::schema::RestoreMode;
 use crate::schema::Schema;
 use crate::snapshot::SnapshotHandle;
 
@@ -83,6 +86,7 @@ pub struct DbOptions {
 /// ```
 /// use std::sync::Arc;
 ///
+/// use sui_consistent_store::CfDescriptor;
 /// use sui_consistent_store::Db;
 /// use sui_consistent_store::DbOptions;
 /// use sui_consistent_store::Schema;
@@ -93,8 +97,8 @@ pub struct DbOptions {
 /// }
 ///
 /// impl Schema for MySchema {
-///     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-///         vec![("my_cf", base_options.clone())]
+///     fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
+///         vec![CfDescriptor::new("my_cf", base_options.clone())]
 ///     }
 ///
 ///     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -111,6 +115,12 @@ pub struct Db {
     /// `inner`) before `inner` itself is freed.
     snapshots: RwLock<BTreeMap<u64, Arc<SnapshotEntry>>>,
     snapshot_capacity: NonZeroUsize,
+    /// Per-CF restore mode, captured at open time from
+    /// [`Schema::cfs`]. Used by shard-backed [`Batch`]es to dispatch
+    /// per-CF writes between SST bulk ingestion and the
+    /// [`rocksdb::WriteBatch`] path. Lookup-only after open, so a
+    /// plain [`HashMap`] (no lock) is sufficient.
+    restore_modes: HashMap<String, RestoreMode>,
     inner: rocksdb::DB,
 }
 
@@ -190,20 +200,30 @@ impl Db {
         // RocksDB requires the default column family to be declared
         // when opening with `open_cf_descriptors`. Register it
         // automatically so schemas don't have to.
-        if !cfs.iter().any(|(name, _)| *name == "default") {
-            cfs.push(("default", db_options.clone()));
+        if !cfs.iter().any(|cf| cf.name == "default") {
+            cfs.push(CfDescriptor::new("default", db_options.clone()));
         }
         // The internal restore-state column family is auto-registered
         // alongside the schema's CFs so per-pipeline restore markers
         // survive process restarts. See [`RESTORE_CF`] and
-        // [`RestoreState`].
-        if !cfs.iter().any(|(name, _)| *name == RESTORE_CF) {
-            cfs.push((RESTORE_CF, db_options.clone()));
+        // [`RestoreState`]. The marker writes go through the
+        // [`rocksdb::WriteBatch`] path so they commit atomically
+        // alongside merge-mode shard writes (see [`RestoreMode`]).
+        if !cfs.iter().any(|cf| cf.name == RESTORE_CF) {
+            cfs.push(
+                CfDescriptor::new(RESTORE_CF, db_options.clone())
+                    .with_restore_mode(RestoreMode::MergeViaWriteBatch),
+            );
+        }
+
+        let mut restore_modes: HashMap<String, RestoreMode> = HashMap::with_capacity(cfs.len());
+        for cf in &cfs {
+            restore_modes.insert(cf.name.to_string(), cf.restore_mode);
         }
 
         let descriptors = cfs
             .into_iter()
-            .map(|(name, opts)| rocksdb::ColumnFamilyDescriptor::new(name, opts));
+            .map(|cf| rocksdb::ColumnFamilyDescriptor::new(cf.name, cf.options));
         let inner = rocksdb::DB::open_cf_descriptors(&db_options, &path, descriptors)?;
 
         let path_str = path.as_ref().display().to_string();
@@ -212,10 +232,24 @@ impl Db {
         let db = Arc::new(Self {
             snapshots: RwLock::new(BTreeMap::new()),
             snapshot_capacity,
+            restore_modes,
             inner,
         });
         let schema = S::open(&db)?;
         Ok((db, schema))
+    }
+
+    /// The [`RestoreMode`] declared for `cf_name`, or `None` if no
+    /// such column family is registered on this database.
+    ///
+    /// Used by shard-backed [`Batch`]es to route per-CF writes
+    /// between SST bulk ingestion and the [`rocksdb::WriteBatch`]
+    /// path. Schema authors do not call this directly — the routing
+    /// is internal to [`Batch`] — but the accessor is public so
+    /// drivers can introspect the mode when assembling shard
+    /// commits.
+    pub fn restore_mode(&self, cf_name: &str) -> Option<RestoreMode> {
+        self.restore_modes.get(cf_name).copied()
     }
 
     /// Look up a column family handle by name.
@@ -559,8 +593,30 @@ impl Db {
     /// need this to land atomically alongside ingestion of a
     /// partition's SSTs should batch the update with the rest of
     /// their commit work via [`Db::batch`].
-    pub fn set_restore_state(
+    pub fn set_restore_state(&self, pipeline: &str, state: &RestoreState) -> Result<(), Error> {
+        let cf = self
+            .cf_handle(RESTORE_CF)
+            .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
+        with_encode_buf(|buf| -> Result<(), Error> {
+            state.encode_into(buf)?;
+            self.inner
+                .put_cf(&cf, pipeline.as_bytes(), buf.as_slice())?;
+            Ok(())
+        })
+    }
+
+    /// Stage a [`RestoreState`] write into `write_batch`.
+    ///
+    /// Use this when the marker must land atomically with other
+    /// writes the caller is staging in the same batch (for example,
+    /// the merge-mode shard writes finalized by
+    /// [`Batch::finalize_for_shard`](crate::Batch::finalize_for_shard)).
+    /// The state is encoded into the batch as a `put_cf` against
+    /// the internal [`RESTORE_CF`]; it becomes visible only when
+    /// the batch is committed.
+    pub fn stage_restore_state(
         &self,
+        write_batch: &mut rocksdb::WriteBatch,
         pipeline: &str,
         state: &RestoreState,
     ) -> Result<(), Error> {
@@ -569,7 +625,7 @@ impl Db {
             .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
         with_encode_buf(|buf| -> Result<(), Error> {
             state.encode_into(buf)?;
-            self.inner.put_cf(&cf, pipeline.as_bytes(), buf.as_slice())?;
+            write_batch.put_cf(&cf, pipeline.as_bytes(), buf.as_slice());
             Ok(())
         })
     }
@@ -601,9 +657,7 @@ impl Db {
             .cf_handle(RESTORE_CF)
             .ok_or_else(|| Error::MissingColumnFamily(RESTORE_CF.to_string()))?;
         let mut out = Vec::new();
-        let iter = self
-            .inner
-            .iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let iter = self.inner.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         for entry in iter {
             let (key_bytes, value_bytes) = entry?;
             let pipeline = std::str::from_utf8(&key_bytes)
@@ -816,8 +870,11 @@ mod tests {
     }
 
     impl Schema for TestSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-            vec![("foo", base_options.clone()), ("bar", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
+            vec![
+                CfDescriptor::new("foo", base_options.clone()),
+                CfDescriptor::new("bar", base_options.clone()),
+            ]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -963,8 +1020,8 @@ mod tests {
         }
 
         impl Schema for PersistSchema {
-            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-                vec![("items", base_options.clone())]
+            fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
+                vec![CfDescriptor::new("items", base_options.clone())]
             }
 
             fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -978,16 +1035,13 @@ mod tests {
         {
             let (db, schema) = Db::open::<PersistSchema>(dir.path(), DbOptions::default()).unwrap();
             let mut batch = db.batch();
-            batch
-                .put(&schema.items, &U64Be(42), &U64Be(43))
-                .unwrap();
+            batch.put(&schema.items, &U64Be(42), &U64Be(43)).unwrap();
             batch.commit().unwrap();
             // Live-tip read confirms before close.
             assert_eq!(schema.items.get(&U64Be(42)).unwrap(), Some(U64Be(43)));
         }
         // Drop everything, then reopen at the same path.
-        let (_db2, schema2) =
-            Db::open::<PersistSchema>(dir.path(), DbOptions::default()).unwrap();
+        let (_db2, schema2) = Db::open::<PersistSchema>(dir.path(), DbOptions::default()).unwrap();
         assert_eq!(schema2.items.get(&U64Be(42)).unwrap(), Some(U64Be(43)));
     }
 
@@ -1112,10 +1166,7 @@ mod tests {
             let all = db.restore_states().unwrap();
             assert_eq!(
                 all,
-                vec![
-                    ("balances".to_string(), s1),
-                    ("coins".to_string(), s2),
-                ],
+                vec![("balances".to_string(), s1), ("coins".to_string(), s2),],
             );
         }
 
@@ -1178,8 +1229,8 @@ mod tests {
         }
 
         impl Schema for ItemsSchema {
-            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-                vec![("items", base_options.clone())]
+            fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
+                vec![CfDescriptor::new("items", base_options.clone())]
             }
 
             fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -1192,8 +1243,7 @@ mod tests {
         #[test]
         fn set_options_cf_applies_known_mutable_options() {
             let dir = TempDir::new().unwrap();
-            let (db, _schema) =
-                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
             // `disable_auto_compactions` is a documented mutable
             // option; setting both true and false must succeed.
             db.set_options_cf("items", &[("disable_auto_compactions", "true")])
@@ -1205,8 +1255,7 @@ mod tests {
         #[test]
         fn set_options_cf_unknown_key_returns_rocksdb_error() {
             let dir = TempDir::new().unwrap();
-            let (db, _schema) =
-                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
             let err = db
                 .set_options_cf("items", &[("not_a_real_option", "1")])
                 .unwrap_err();
@@ -1216,8 +1265,7 @@ mod tests {
         #[test]
         fn set_options_cf_unknown_cf_returns_missing_column_family() {
             let dir = TempDir::new().unwrap();
-            let (db, _schema) =
-                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
             let err = db
                 .set_options_cf("not_in_schema", &[("disable_auto_compactions", "true")])
                 .unwrap_err();
@@ -1227,16 +1275,14 @@ mod tests {
         #[test]
         fn set_options_cf_empty_slice_is_ok() {
             let dir = TempDir::new().unwrap();
-            let (db, _schema) =
-                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
             db.set_options_cf("items", &[]).unwrap();
         }
 
         #[test]
         fn restore_then_tip_toggles_succeed() {
             let dir = TempDir::new().unwrap();
-            let (db, _schema) =
-                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
             db.set_restore_options_cf("items").unwrap();
             db.set_tip_options_cf("items").unwrap();
         }
@@ -1244,8 +1290,7 @@ mod tests {
         #[test]
         fn restore_options_unknown_cf_errors() {
             let dir = TempDir::new().unwrap();
-            let (db, _schema) =
-                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
             let err = db.set_restore_options_cf("not_in_schema").unwrap_err();
             assert!(matches!(err, Error::MissingColumnFamily(_)));
         }
@@ -1253,8 +1298,7 @@ mod tests {
         #[test]
         fn tip_options_unknown_cf_errors() {
             let dir = TempDir::new().unwrap();
-            let (db, _schema) =
-                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
             let err = db.set_tip_options_cf("not_in_schema").unwrap_err();
             assert!(matches!(err, Error::MissingColumnFamily(_)));
         }
@@ -1266,8 +1310,7 @@ mod tests {
             // i32::MAX so no slowdown / stop fires; writes complete
             // without error.
             let dir = TempDir::new().unwrap();
-            let (db, schema) =
-                Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, schema) = Db::open::<ItemsSchema>(dir.path(), DbOptions::default()).unwrap();
             db.set_restore_options_cf("items").unwrap();
 
             // Enough writes plus flushes to produce multiple L0
@@ -1299,10 +1342,7 @@ mod tests {
                 Some(U64Be(0)),
                 "data written under restore options must still be readable after tip toggle",
             );
-            assert_eq!(
-                schema.items.get(&U64Be(9999)).unwrap(),
-                Some(U64Be(9999)),
-            );
+            assert_eq!(schema.items.get(&U64Be(9999)).unwrap(), Some(U64Be(9999)),);
         }
 
         #[test]
@@ -1317,8 +1357,11 @@ mod tests {
             }
 
             impl Schema for TwoCfSchema {
-                fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-                    vec![("a", base_options.clone()), ("b", base_options.clone())]
+                fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
+                    vec![
+                        CfDescriptor::new("a", base_options.clone()),
+                        CfDescriptor::new("b", base_options.clone()),
+                    ]
                 }
 
                 fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -1389,8 +1432,8 @@ mod tests {
         }
 
         impl Schema for IngestSchema {
-            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-                vec![("items", base_options.clone())]
+            fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
+                vec![CfDescriptor::new("items", base_options.clone())]
             }
 
             fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -1428,10 +1471,15 @@ mod tests {
         }
 
         impl Schema for MergeIngestSchema {
-            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+            fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
                 let mut counter_opts = base_options.clone();
                 counter_opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
-                vec![("counters", counter_opts)]
+                // These tests exercise raw SST ingestion with merge
+                // entries against the foundational [`Db::ingest_files_cf`]
+                // API directly (not through the shard-backed [`Batch`]),
+                // so the per-CF restore mode is irrelevant here — the
+                // default `BulkIngest` is fine.
+                vec![CfDescriptor::new("counters", counter_opts)]
             }
 
             fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -1468,8 +1516,7 @@ mod tests {
         fn ingest_into_empty_cf_makes_keys_visible() {
             let dir = TempDir::new().unwrap();
             let sst_dir = TempDir::new_in(dir.path()).unwrap();
-            let (db, schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
 
             let path = sst_dir.path().join("init.sst");
             build_put_sst(&path, &[(1, 10), (2, 20), (3, 30)]);
@@ -1485,8 +1532,7 @@ mod tests {
         fn ingest_preserves_non_overlapping_existing_data() {
             let dir = TempDir::new().unwrap();
             let sst_dir = TempDir::new_in(dir.path()).unwrap();
-            let (db, schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
 
             // Pre-populate a low-range key via the normal write path.
             let mut batch = db.batch();
@@ -1507,8 +1553,7 @@ mod tests {
         fn ingested_keys_shadow_prior_writes_on_overlap() {
             let dir = TempDir::new().unwrap();
             let sst_dir = TempDir::new_in(dir.path()).unwrap();
-            let (db, schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
 
             let mut batch = db.batch();
             batch.put(&schema.items, &U64Be(1), &U64Be(100)).unwrap();
@@ -1533,8 +1578,7 @@ mod tests {
             // value at the overlapping key is the ingested one.
             let dir = TempDir::new().unwrap();
             let sst_dir = TempDir::new_in(dir.path()).unwrap();
-            let (db, schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
 
             let mut batch = db.batch();
             batch.put(&schema.items, &U64Be(7), &U64Be(70)).unwrap();
@@ -1558,7 +1602,9 @@ mod tests {
 
             // Pre-populate via the normal merge path.
             let mut batch = db.batch();
-            batch.merge(&schema.counters, &U64Be(1), &U64Be(10)).unwrap();
+            batch
+                .merge(&schema.counters, &U64Be(1), &U64Be(10))
+                .unwrap();
             batch.commit().unwrap();
 
             // Ingest a merge SST against the same key plus a fresh key.
@@ -1578,8 +1624,7 @@ mod tests {
         fn ingest_multiple_non_overlapping_ssts_in_one_call() {
             let dir = TempDir::new().unwrap();
             let sst_dir = TempDir::new_in(dir.path()).unwrap();
-            let (db, schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
 
             let p1 = sst_dir.path().join("a.sst");
             let p2 = sst_dir.path().join("b.sst");
@@ -1595,8 +1640,7 @@ mod tests {
         fn ingest_unknown_cf_returns_missing_column_family() {
             let dir = TempDir::new().unwrap();
             let sst_dir = TempDir::new_in(dir.path()).unwrap();
-            let (db, _schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
 
             let path = sst_dir.path().join("orphan.sst");
             build_put_sst(&path, &[(1, 10)]);
@@ -1609,8 +1653,7 @@ mod tests {
             // RocksDB requires at least one path; surface that as a
             // Rocksdb error rather than silently no-op'ing.
             let dir = TempDir::new().unwrap();
-            let (db, _schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, _schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
             let err = db
                 .ingest_files_cf::<&std::path::Path>("items", vec![])
                 .expect_err("empty paths must fail");
@@ -1625,15 +1668,15 @@ mod tests {
             // ingest succeeds.
             let dir = TempDir::new().unwrap();
             let sst_dir = TempDir::new_in(dir.path()).unwrap();
-            let (db, schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
 
             let path = sst_dir.path().join("copy.sst");
             build_put_sst(&path, &[(42, 4200)]);
 
             let mut opts = rocksdb::IngestExternalFileOptions::default();
             opts.set_move_files(false);
-            db.ingest_files_cf_opts("items", &opts, vec![&path]).unwrap();
+            db.ingest_files_cf_opts("items", &opts, vec![&path])
+                .unwrap();
 
             assert_eq!(schema.items.get(&U64Be(42)).unwrap(), Some(U64Be(4200)));
             assert!(
@@ -1650,8 +1693,7 @@ mod tests {
             // must see them. This test pins the second half.
             let dir = TempDir::new().unwrap();
             let sst_dir = TempDir::new_in(dir.path()).unwrap();
-            let (db, schema) =
-                Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
+            let (db, schema) = Db::open::<IngestSchema>(dir.path(), DbOptions::default()).unwrap();
 
             let path = sst_dir.path().join("for_snap.sst");
             build_put_sst(&path, &[(1, 10)]);

@@ -283,8 +283,9 @@ impl LiveObjectsFile {
 
             let mut encoding_byte = [0u8; 1];
             read.read_exact(&mut encoding_byte)?;
-            let encoding = BlobEncoding::try_from(encoding_byte[0])
-                .with_context(|| format!("Invalid encoding in object file: {}", encoding_byte[0]))?;
+            let encoding = BlobEncoding::try_from(encoding_byte[0]).with_context(|| {
+                format!("Invalid encoding in object file: {}", encoding_byte[0])
+            })?;
 
             let mut data = vec![0u8; len as usize];
             read.read_exact(&mut data)?;

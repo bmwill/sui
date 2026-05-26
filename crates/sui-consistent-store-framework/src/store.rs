@@ -128,10 +128,7 @@ impl<S> Store<S> {
     ///
     /// Errors:
     /// - If a synchronizer is already installed on this store.
-    pub fn install_sync(
-        &self,
-        sync: Synchronizer,
-    ) -> anyhow::Result<JoinSet<anyhow::Result<()>>> {
+    pub fn install_sync(&self, sync: Synchronizer) -> anyhow::Result<JoinSet<anyhow::Result<()>>> {
         let (join_set, queue) = sync.run()?;
         self.inner
             .queue
@@ -213,9 +210,7 @@ impl<S: Send + Sync + 'static> SequentialStore for Store<S> {
     where
         R: Send + 'a,
         F: Send + 'a,
-        F: for<'r> FnOnce(
-            &'r mut Connection<'_, S>,
-        ) -> ScopedBoxFuture<'a, 'r, anyhow::Result<R>>,
+        F: for<'r> FnOnce(&'r mut Connection<'_, S>) -> ScopedBoxFuture<'a, 'r, anyhow::Result<R>>,
     {
         let mut conn = self.connect().await?;
         let r = f(&mut conn).await?;
@@ -229,11 +224,7 @@ impl<S: Send + Sync + 'static> SequentialStore for Store<S> {
         // atomically — either both visible or neither.
         let key = PipelineTaskKey::new(pipeline_task.clone());
         conn.batch
-            .put(
-                &self.inner.framework.watermarks,
-                &key,
-                &watermark,
-            )
+            .put(&self.inner.framework.watermarks, &key, &watermark)
             .context("staging framework watermark")?;
 
         if let Some(queue) = self.inner.queue.get() {
@@ -381,8 +372,11 @@ mod tests {
     }
 
     impl Schema for UserSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-            vec![("items", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
+            vec![sui_consistent_store::CfDescriptor::new(
+                "items",
+                base_options.clone(),
+            )]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -403,7 +397,7 @@ mod tests {
     }
 
     impl Schema for Combined {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
             let mut cfs = FrameworkSchema::cfs(base_options);
             cfs.extend(UserSchema::cfs(base_options));
             cfs
@@ -420,11 +414,7 @@ mod tests {
     fn setup() -> (TempDir, Store<UserSchema>) {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<Combined>(dir.path(), DbOptions::default()).unwrap();
-        let store = Store::new(
-            db,
-            Arc::new(schema.framework),
-            Arc::new(schema.user),
-        );
+        let store = Store::new(db, Arc::new(schema.framework), Arc::new(schema.user));
         (dir, store)
     }
 
@@ -450,12 +440,10 @@ mod tests {
         store
             .transaction(|c| {
                 async move {
-                    c.batch.put(&c.store.schema().items, &U64Be(1), &U64Be(10))?;
-                    c.set_committer_watermark(
-                        "items",
-                        CommitterWatermark::new_for_testing(7),
-                    )
-                    .await?;
+                    c.batch
+                        .put(&c.store.schema().items, &U64Be(1), &U64Be(10))?;
+                    c.set_committer_watermark("items", CommitterWatermark::new_for_testing(7))
+                        .await?;
                     Ok::<(), anyhow::Error>(())
                 }
                 .scope_boxed()
@@ -480,7 +468,8 @@ mod tests {
         let err = store
             .transaction(|c| {
                 async move {
-                    c.batch.put(&c.store.schema().items, &U64Be(1), &U64Be(10))?;
+                    c.batch
+                        .put(&c.store.schema().items, &U64Be(1), &U64Be(10))?;
                     // Note: no set_committer_watermark call.
                     Ok::<(), anyhow::Error>(())
                 }
@@ -533,11 +522,8 @@ mod tests {
         store
             .transaction(|c| {
                 async move {
-                    c.set_committer_watermark(
-                        "p",
-                        CommitterWatermark::new_for_testing(42),
-                    )
-                    .await?;
+                    c.set_committer_watermark("p", CommitterWatermark::new_for_testing(42))
+                        .await?;
                     Ok::<(), anyhow::Error>(())
                 }
                 .scope_boxed()
@@ -568,11 +554,8 @@ mod tests {
                     async move {
                         c.batch
                             .put(&c.store.schema().items, &U64Be(cp), &U64Be(cp * 10))?;
-                        c.set_committer_watermark(
-                            "p",
-                            CommitterWatermark::new_for_testing(cp),
-                        )
-                        .await?;
+                        c.set_committer_watermark("p", CommitterWatermark::new_for_testing(cp))
+                            .await?;
                         Ok::<(), anyhow::Error>(())
                     }
                     .scope_boxed()
@@ -599,12 +582,10 @@ mod tests {
         store
             .transaction(|c| {
                 async move {
-                    c.batch.put(&c.store.schema().items, &U64Be(1), &U64Be(10))?;
-                    c.set_committer_watermark(
-                        "p",
-                        CommitterWatermark::new_for_testing(1),
-                    )
-                    .await?;
+                    c.batch
+                        .put(&c.store.schema().items, &U64Be(1), &U64Be(10))?;
+                    c.set_committer_watermark("p", CommitterWatermark::new_for_testing(1))
+                        .await?;
                     Ok::<(), anyhow::Error>(())
                 }
                 .scope_boxed()

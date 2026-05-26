@@ -66,8 +66,8 @@
 //! }
 //!
 //! impl Schema for MySchema {
-//!     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-//!         vec![("items", base_options.clone())]
+//!     fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
+//!         vec![sui_consistent_store::CfDescriptor::new("items", base_options.clone())]
 //!     }
 //!
 //!     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -101,6 +101,7 @@ use crate::db::Db;
 use crate::encode_buf::with_encode_buf;
 use crate::error::Error;
 use crate::map::DbMap;
+use crate::schema::RestoreMode;
 
 /// An accumulating, typed write batch.
 ///
@@ -109,13 +110,17 @@ use crate::map::DbMap;
 /// - The **write backing** (default; via [`Db::batch`]) wraps
 ///   [`rocksdb::WriteBatch`] and commits to the live database via
 ///   [`commit`](Self::commit) — the tip-of-chain write path.
-/// - The **shard backing** (via [`Db::shard_batch`]) records writes
-///   into per-CF sorted in-memory buffers. The driver finalizes the
-///   buffers into SST files via
-///   [`finalize_into_ssts`](Self::finalize_into_ssts) and atomically
-///   ingests them via
-///   [`Db::ingest_files_cf`](crate::Db::ingest_files_cf) — the
-///   bulk-load restore path.
+/// - The **shard backing** (via [`Db::shard_batch`]) is a *hybrid*
+///   per-CF dispatch used by restore drivers. Each write is routed
+///   based on the CF's [`RestoreMode`](crate::RestoreMode):
+///   [`BulkIngest`](crate::RestoreMode::BulkIngest) CFs buffer into
+///   per-CF sorted in-memory maps for SST emission;
+///   [`MergeViaWriteBatch`](crate::RestoreMode::MergeViaWriteBatch)
+///   CFs stream into an internal [`rocksdb::WriteBatch`] for atomic
+///   commit. The driver finalizes the batch via
+///   [`finalize_for_shard`](Self::finalize_for_shard), which
+///   produces per-CF SST paths plus the WriteBatch holding the
+///   merge-mode writes.
 ///
 /// Both backings expose the same typed [`put`](Self::put),
 /// [`merge`](Self::merge), and [`delete`](Self::delete) API against
@@ -124,12 +129,14 @@ use crate::map::DbMap;
 /// either.
 ///
 /// Shard-backed batches enforce at most one operation per key per
-/// column family (the invariant SST ingestion requires). A second
-/// write to the same key in the same CF returns
+/// [`BulkIngest`](crate::RestoreMode::BulkIngest) column family
+/// (the invariant SST ingestion requires). A second write to the
+/// same key in the same `BulkIngest` CF returns
 /// [`Error::DuplicateShardOp`](crate::error::Error::DuplicateShardOp).
-/// Pipelines should fold by key in their
-/// [`Self::Batch`](crate::Pipeline::Batch) accumulator before
-/// emitting writes.
+/// [`MergeViaWriteBatch`](crate::RestoreMode::MergeViaWriteBatch)
+/// CFs have *no* per-key constraint: pipelines emit as many
+/// operations per key per shard as their merge operator's semantics
+/// require.
 ///
 /// All staged operations on a write-backed batch either become
 /// visible together or not at all. Encoding failures during staging
@@ -152,12 +159,27 @@ enum BatchBacking {
     Shard(ShardBuffer),
 }
 
-/// Per-CF sorted in-memory buffer used by the shard backing of
-/// [`Batch`]. Per the SST-ingestion invariant, at most one
-/// operation per key is allowed; duplicates are rejected at write
-/// time.
+/// Hybrid shard-mode buffer. Routes per-CF writes between a sorted
+/// per-CF map (for [`RestoreMode::BulkIngest`] CFs) and an internal
+/// [`rocksdb::WriteBatch`] (for [`RestoreMode::MergeViaWriteBatch`]
+/// CFs).
 struct ShardBuffer {
-    per_cf: BTreeMap<String, BTreeMap<Vec<u8>, ShardOp>>,
+    /// Per-CF sorted buffer of operations for CFs that finalize
+    /// into SSTs. SST ingestion requires at most one op per key, so
+    /// duplicates are rejected at write time.
+    bulk_ingest: BTreeMap<String, BTreeMap<Vec<u8>, ShardOp>>,
+    /// Operations for CFs whose merge operator should see many
+    /// operands per key per shard. Buffered into a
+    /// [`rocksdb::WriteBatch`] that the runner commits atomically
+    /// alongside the shard's partition-complete marker.
+    merge_write: rocksdb::WriteBatch,
+    /// Count of ops staged into `merge_write`; tracked separately
+    /// because [`rocksdb::WriteBatch::len`] reports the total
+    /// including any externally appended writes.
+    merge_write_ops: usize,
+    /// Approximate byte size of ops staged into `merge_write`.
+    /// Same caveat as the per-CF buffer: excludes per-CF metadata.
+    merge_write_size: usize,
 }
 
 /// One staged operation in a [`ShardBuffer`].
@@ -170,14 +192,23 @@ enum ShardOp {
 impl ShardBuffer {
     fn new() -> Self {
         Self {
-            per_cf: BTreeMap::new(),
+            bulk_ingest: BTreeMap::new(),
+            merge_write: rocksdb::WriteBatch::default(),
+            merge_write_ops: 0,
+            merge_write_size: 0,
         }
     }
 
-    /// Insert `op` at `key` in `cf_name`. Errors if a different op
-    /// already exists at the same key in the same CF.
-    fn insert(&mut self, cf_name: &str, key: Vec<u8>, op: ShardOp) -> Result<(), Error> {
-        let per_key = self.per_cf.entry(cf_name.to_string()).or_default();
+    /// Insert `op` at `key` in a [`RestoreMode::BulkIngest`] CF's
+    /// per-key buffer. Errors if a different op already exists at
+    /// the same key in the same CF.
+    fn insert_bulk_ingest(
+        &mut self,
+        cf_name: &str,
+        key: Vec<u8>,
+        op: ShardOp,
+    ) -> Result<(), Error> {
+        let per_key = self.bulk_ingest.entry(cf_name.to_string()).or_default();
         let key_len = key.len();
         match per_key.entry(key) {
             std::collections::btree_map::Entry::Vacant(v) => {
@@ -193,14 +224,19 @@ impl ShardBuffer {
 
     /// Total number of staged operations across all CFs.
     fn len(&self) -> usize {
-        self.per_cf.values().map(BTreeMap::len).sum()
+        self.bulk_ingest_len() + self.merge_write_ops
+    }
+
+    fn bulk_ingest_len(&self) -> usize {
+        self.bulk_ingest.values().map(BTreeMap::len).sum()
     }
 
     /// Rough size in bytes: sum of encoded key + value bytes plus a
     /// one-byte op tag per entry. Useful for the `Batch::size_in_bytes`
     /// surface but not exact (excludes per-CF map overhead).
     fn size_in_bytes(&self) -> usize {
-        self.per_cf
+        let bulk_bytes: usize = self
+            .bulk_ingest
             .values()
             .flat_map(|m| m.iter())
             .map(|(k, op)| {
@@ -211,7 +247,8 @@ impl ShardBuffer {
                         ShardOp::Delete => 0,
                     }
             })
-            .sum()
+            .sum();
+        bulk_bytes + self.merge_write_size
     }
 }
 
@@ -245,16 +282,20 @@ impl Batch {
     /// The key and value are encoded into a thread-local scratch
     /// buffer once per call. For a write-backed batch RocksDB copies
     /// the bytes into the batch's internal representation
-    /// synchronously; for a shard-backed batch the bytes are owned
-    /// by an internal per-CF buffer.
+    /// synchronously; for a shard-backed batch the routing depends
+    /// on the CF's [`RestoreMode`](crate::RestoreMode):
+    /// [`BulkIngest`](crate::RestoreMode::BulkIngest) buffers into a
+    /// per-CF sorted map (one op per key); other modes stream into
+    /// the internal [`rocksdb::WriteBatch`].
     ///
     /// `map` is constrained to a [`Live`]-bound handle: writes always
     /// go to the live tip, and snapshot-bound projections are
     /// statically read-only.
     ///
-    /// Shard-backed batches return
+    /// On a shard-backed batch targeting a
+    /// [`BulkIngest`](crate::RestoreMode::BulkIngest) CF, returns
     /// [`Error::DuplicateShardOp`](crate::error::Error::DuplicateShardOp)
-    /// if `key` already has a staged operation in the same CF.
+    /// if `key` already has a staged operation.
     pub fn put<K, V>(
         &mut self,
         map: &DbMap<K, V, Live>,
@@ -280,10 +321,28 @@ impl Batch {
                     Ok(())
                 })?;
             }
-            BatchBacking::Shard(sb) => {
-                let (key_bytes, value_bytes) = encode_key_and_value(key, value)?;
-                sb.insert(map.cf_name(), key_bytes, ShardOp::Put(value_bytes))?;
-            }
+            BatchBacking::Shard(sb) => match shard_mode_for(&self.db, map.cf_name())? {
+                RestoreMode::BulkIngest => {
+                    let (key_bytes, value_bytes) = encode_key_and_value(key, value)?;
+                    sb.insert_bulk_ingest(map.cf_name(), key_bytes, ShardOp::Put(value_bytes))?;
+                }
+                RestoreMode::MergeViaWriteBatch => {
+                    let cf = self
+                        .db
+                        .cf_handle(map.cf_name())
+                        .ok_or_else(|| Error::MissingColumnFamily(map.cf_name().to_string()))?;
+                    let total_len = with_encode_buf(|buf| -> Result<usize, Error> {
+                        key.encode_into(buf)?;
+                        let k_end = buf.len();
+                        value.encode_into(buf)?;
+                        let bytes = buf.as_slice();
+                        sb.merge_write.put_cf(&cf, &bytes[..k_end], &bytes[k_end..]);
+                        Ok(bytes.len())
+                    })?;
+                    sb.merge_write_ops += 1;
+                    sb.merge_write_size += total_len + 1;
+                }
+            },
         }
         Ok(self)
     }
@@ -292,9 +351,10 @@ impl Batch {
     ///
     /// `map` is constrained to a [`Live`]-bound handle.
     ///
-    /// Shard-backed batches return
+    /// On a shard-backed batch targeting a
+    /// [`BulkIngest`](crate::RestoreMode::BulkIngest) CF, returns
     /// [`Error::DuplicateShardOp`](crate::error::Error::DuplicateShardOp)
-    /// if `key` already has a staged operation in the same CF.
+    /// if `key` already has a staged operation.
     pub fn delete<K, V>(&mut self, map: &DbMap<K, V, Live>, key: &K) -> Result<&mut Self, Error>
     where
         K: Encode,
@@ -311,10 +371,25 @@ impl Batch {
                     Ok(())
                 })?;
             }
-            BatchBacking::Shard(sb) => {
-                let key_bytes = encode_key(key)?;
-                sb.insert(map.cf_name(), key_bytes, ShardOp::Delete)?;
-            }
+            BatchBacking::Shard(sb) => match shard_mode_for(&self.db, map.cf_name())? {
+                RestoreMode::BulkIngest => {
+                    let key_bytes = encode_key(key)?;
+                    sb.insert_bulk_ingest(map.cf_name(), key_bytes, ShardOp::Delete)?;
+                }
+                RestoreMode::MergeViaWriteBatch => {
+                    let cf = self
+                        .db
+                        .cf_handle(map.cf_name())
+                        .ok_or_else(|| Error::MissingColumnFamily(map.cf_name().to_string()))?;
+                    let k_len = with_encode_buf(|buf| -> Result<usize, Error> {
+                        key.encode_into(buf)?;
+                        sb.merge_write.delete_cf(&cf, buf.as_slice());
+                        Ok(buf.len())
+                    })?;
+                    sb.merge_write_ops += 1;
+                    sb.merge_write_size += k_len + 1;
+                }
+            },
         }
         Ok(self)
     }
@@ -327,14 +402,25 @@ impl Batch {
     /// operator combines the operand with any existing value at
     /// `key` lazily, at the next read or during compaction.
     ///
-    /// For a shard-backed batch, the operand is staged into the
-    /// per-CF buffer and, on
-    /// [`finalize_into_ssts`](Self::finalize_into_ssts), written as
-    /// a merge entry into the produced SST file. RocksDB applies
-    /// the operator at read or compaction time after the SST is
-    /// ingested. Cross-shard collisions (the same key emitted by
-    /// two different shards' SSTs) combine via the operator as
-    /// usual.
+    /// For a shard-backed batch the routing depends on the CF's
+    /// [`RestoreMode`](crate::RestoreMode):
+    ///
+    /// - [`BulkIngest`](crate::RestoreMode::BulkIngest): the operand
+    ///   is staged into the per-CF buffer and, on
+    ///   [`finalize_for_shard`](Self::finalize_for_shard), written
+    ///   as a merge entry into the produced SST file. RocksDB
+    ///   applies the operator at read or compaction time after the
+    ///   SST is ingested. *One merge operand per key per shard*;
+    ///   the pipeline must pre-fold by key in its accumulator.
+    ///
+    /// - [`MergeViaWriteBatch`](crate::RestoreMode::MergeViaWriteBatch):
+    ///   the operand streams into the batch's internal
+    ///   [`rocksdb::WriteBatch`]. Many operands per key per shard
+    ///   are allowed; the runner commits the WriteBatch atomically
+    ///   when the shard finalizes.
+    ///
+    /// Cross-shard collisions on the same key combine via the
+    /// operator regardless of mode.
     ///
     /// `operand` is constrained to the column family's value type
     /// `V`. Schemas whose merge semantics expect a different operand
@@ -348,10 +434,6 @@ impl Batch {
     /// the shard backing).
     ///
     /// `map` is constrained to a [`Live`]-bound handle.
-    ///
-    /// Shard-backed batches return
-    /// [`Error::DuplicateShardOp`](crate::error::Error::DuplicateShardOp)
-    /// if `key` already has a staged operation in the same CF.
     pub fn merge<K, V>(
         &mut self,
         map: &DbMap<K, V, Live>,
@@ -377,10 +459,29 @@ impl Batch {
                     Ok(())
                 })?;
             }
-            BatchBacking::Shard(sb) => {
-                let (key_bytes, operand_bytes) = encode_key_and_value(key, operand)?;
-                sb.insert(map.cf_name(), key_bytes, ShardOp::Merge(operand_bytes))?;
-            }
+            BatchBacking::Shard(sb) => match shard_mode_for(&self.db, map.cf_name())? {
+                RestoreMode::BulkIngest => {
+                    let (key_bytes, operand_bytes) = encode_key_and_value(key, operand)?;
+                    sb.insert_bulk_ingest(map.cf_name(), key_bytes, ShardOp::Merge(operand_bytes))?;
+                }
+                RestoreMode::MergeViaWriteBatch => {
+                    let cf = self
+                        .db
+                        .cf_handle(map.cf_name())
+                        .ok_or_else(|| Error::MissingColumnFamily(map.cf_name().to_string()))?;
+                    let total_len = with_encode_buf(|buf| -> Result<usize, Error> {
+                        key.encode_into(buf)?;
+                        let k_end = buf.len();
+                        operand.encode_into(buf)?;
+                        let bytes = buf.as_slice();
+                        sb.merge_write
+                            .merge_cf(&cf, &bytes[..k_end], &bytes[k_end..]);
+                        Ok(bytes.len())
+                    })?;
+                    sb.merge_write_ops += 1;
+                    sb.merge_write_size += total_len + 1;
+                }
+            },
         }
         Ok(self)
     }
@@ -429,16 +530,28 @@ impl Batch {
         }
     }
 
-    /// Drain a shard-backed batch into per-CF SST files in
-    /// `staging_dir`, ready for atomic ingest via
-    /// [`Db::ingest_files_cf`](crate::Db::ingest_files_cf).
+    /// Drain a shard-backed batch into a [`ShardFinalize`] ready to
+    /// commit.
     ///
-    /// Produces one SST per CF that has staged operations. CFs with
-    /// no operations are skipped. The returned `Vec` holds
-    /// `(cf_name, path)` pairs in CF-name order; the caller is
-    /// responsible for ingesting them — typically one call per CF,
-    /// so each set of SSTs lands at the bottommost level on a fresh
-    /// CF.
+    /// The returned [`ShardFinalize`] carries:
+    ///
+    /// - One SST per [`RestoreMode::BulkIngest`](crate::RestoreMode::BulkIngest)
+    ///   CF that has staged operations, finalized into
+    ///   `staging_dir`. The runner ingests these via
+    ///   [`Db::ingest_files_cf`](crate::Db::ingest_files_cf).
+    ///
+    /// - A [`rocksdb::WriteBatch`] holding writes for every
+    ///   [`RestoreMode::MergeViaWriteBatch`](crate::RestoreMode::MergeViaWriteBatch)
+    ///   CF the pipeline touched. The runner is expected to stage
+    ///   the partition-complete marker into this same batch (via
+    ///   [`Db::stage_restore_state`](crate::Db::stage_restore_state))
+    ///   and commit it atomically *after* the SSTs are ingested —
+    ///   so a crash between the two steps leaves the partition not
+    ///   marked, and the resume re-runs the shard without
+    ///   double-merging.
+    ///
+    /// CFs with no staged operations are skipped. SST entries are
+    /// returned in CF-name order.
     ///
     /// `sst_options` configures the produced SST files. For the
     /// SSTs to ingest cleanly the comparator must match the target
@@ -448,22 +561,22 @@ impl Batch {
     /// Consumes `self`. Only valid for a shard-backed batch;
     /// write-backed batches return
     /// [`Error::Internal`](crate::error::Error::Internal).
-    pub fn finalize_into_ssts(
+    pub fn finalize_for_shard(
         self,
         staging_dir: &Path,
         sst_options: &rocksdb::Options,
-    ) -> Result<Vec<(String, PathBuf)>, Error> {
+    ) -> Result<ShardFinalize, Error> {
         let buf = match self.backing {
             BatchBacking::Shard(b) => b,
             BatchBacking::Write(_) => {
                 return Err(Error::Internal(
-                    "Batch::finalize_into_ssts called on a write-backed batch; use commit",
+                    "Batch::finalize_for_shard called on a write-backed batch; use commit",
                 ));
             }
         };
 
-        let mut out = Vec::with_capacity(buf.per_cf.len());
-        for (cf_name, ops) in buf.per_cf {
+        let mut ssts = Vec::with_capacity(buf.bulk_ingest.len());
+        for (cf_name, ops) in buf.bulk_ingest {
             if ops.is_empty() {
                 continue;
             }
@@ -482,16 +595,21 @@ impl Batch {
                 }
             }
             let path = writer.finish()?;
-            out.push((cf_name, path));
+            ssts.push((cf_name, path));
         }
-        Ok(out)
+
+        Ok(ShardFinalize {
+            db: self.db,
+            ssts,
+            write_batch: buf.merge_write,
+        })
     }
 
     /// Returns whether the batch has no staged operations.
     pub fn is_empty(&self) -> bool {
         match &self.backing {
             BatchBacking::Write(wb) => wb.is_empty(),
-            BatchBacking::Shard(sb) => sb.per_cf.values().all(BTreeMap::is_empty),
+            BatchBacking::Shard(sb) => sb.len() == 0,
         }
     }
 
@@ -519,6 +637,106 @@ impl Batch {
     }
 }
 
+/// The output of [`Batch::finalize_for_shard`] — everything a
+/// restore driver needs to atomically commit one shard's writes.
+///
+/// `ssts` holds finalized SST file paths for every
+/// [`RestoreMode::BulkIngest`](crate::RestoreMode::BulkIngest) CF
+/// the shard touched, in CF-name order. The driver ingests these
+/// via [`Db::ingest_files_cf`](crate::Db::ingest_files_cf).
+///
+/// `write_batch` holds operations against every
+/// [`RestoreMode::MergeViaWriteBatch`](crate::RestoreMode::MergeViaWriteBatch)
+/// CF the shard touched. The driver extends it with the shard's
+/// partition-complete marker (typically via
+/// [`Db::stage_restore_state`](crate::Db::stage_restore_state)) and
+/// commits it atomically via [`commit`](Self::commit).
+///
+/// # Commit ordering
+///
+/// Always ingest SSTs first, then commit the WriteBatch. A crash
+/// between the two steps leaves the partition-complete marker
+/// unwritten, so resume re-runs the shard from scratch:
+///
+/// - Re-ingest of the same SST contents is idempotent for puts
+///   (last-write-wins) and for deletes; the bottom-most level
+///   ends up with the same observable state.
+/// - The WriteBatch never committed on the first run, so no
+///   merge-mode operations landed — no double-merge on resume.
+///
+/// [`commit`](Self::commit) implements this ordering. Drivers that
+/// need finer control (e.g. to ingest multiple shards' SSTs before
+/// committing any of their markers) can drain
+/// [`take_ssts`](Self::take_ssts) and
+/// [`take_write_batch`](Self::take_write_batch) manually.
+pub struct ShardFinalize {
+    db: Arc<Db>,
+    ssts: Vec<(String, PathBuf)>,
+    write_batch: rocksdb::WriteBatch,
+}
+
+impl ShardFinalize {
+    /// The per-CF SST paths to ingest.
+    pub fn ssts(&self) -> &[(String, PathBuf)] {
+        &self.ssts
+    }
+
+    /// Borrow the internal [`rocksdb::WriteBatch`] mutably so the
+    /// driver can stage additional operations (typically the
+    /// partition-complete marker via
+    /// [`Db::stage_restore_state`](crate::Db::stage_restore_state)).
+    pub fn write_batch_mut(&mut self) -> &mut rocksdb::WriteBatch {
+        &mut self.write_batch
+    }
+
+    /// Take the SST paths, leaving the [`ShardFinalize`] usable for
+    /// a later WriteBatch commit. Useful for drivers that batch
+    /// ingest calls across shards.
+    pub fn take_ssts(&mut self) -> Vec<(String, PathBuf)> {
+        std::mem::take(&mut self.ssts)
+    }
+
+    /// Take the WriteBatch, leaving the [`ShardFinalize`] empty.
+    /// Useful for drivers that commit through a custom path.
+    pub fn take_write_batch(&mut self) -> rocksdb::WriteBatch {
+        std::mem::take(&mut self.write_batch)
+    }
+
+    /// Atomically commit this shard's writes.
+    ///
+    /// Sequence:
+    /// 1. Ingest each SST via
+    ///    [`Db::ingest_files_cf`](crate::Db::ingest_files_cf).
+    /// 2. Commit the (caller-extended) [`rocksdb::WriteBatch`].
+    ///
+    /// See the [`ShardFinalize`] docs for the crash-safety story
+    /// of this ordering.
+    pub fn commit(self) -> Result<(), Error> {
+        for (cf, path) in &self.ssts {
+            self.db.ingest_files_cf(cf, vec![path.clone()])?;
+        }
+        self.db.rocksdb().write(self.write_batch)?;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ShardFinalize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardFinalize")
+            .field("ssts", &self.ssts.len())
+            .field("write_batch_ops", &self.write_batch.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Look up the [`RestoreMode`] for `cf_name` on `db`, returning
+/// [`Error::MissingColumnFamily`] if the CF was not registered at
+/// open time. Used by the shard backing to dispatch per-CF.
+fn shard_mode_for(db: &Db, cf_name: &str) -> Result<RestoreMode, Error> {
+    db.restore_mode(cf_name)
+        .ok_or_else(|| Error::MissingColumnFamily(cf_name.to_string()))
+}
+
 /// Newtype that round-trips raw bytes through [`Encode`] so the
 /// shard-backing finalize path can drive a typed
 /// [`SstWriter<RawBytes, RawBytes>`] with pre-encoded contents.
@@ -526,10 +744,7 @@ impl Batch {
 struct RawBytes(Vec<u8>);
 
 impl Encode for RawBytes {
-    fn encode_into<B: bytes::BufMut>(
-        &self,
-        buf: &mut B,
-    ) -> Result<(), crate::error::EncodeError> {
+    fn encode_into<B: bytes::BufMut>(&self, buf: &mut B) -> Result<(), crate::error::EncodeError> {
         buf.put_slice(&self.0);
         Ok(())
     }
@@ -635,10 +850,10 @@ mod tests {
     }
 
     impl Schema for TestSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
             vec![
-                ("items", base_options.clone()),
-                ("other", base_options.clone()),
+                crate::CfDescriptor::new("items", base_options.clone()),
+                crate::CfDescriptor::new("other", base_options.clone()),
             ]
         }
 
@@ -811,10 +1026,15 @@ mod tests {
     }
 
     impl Schema for MergeSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
             let mut counter_opts = base_options.clone();
             counter_opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
-            vec![("counters", counter_opts)]
+            // The merge-operator CF opts into the WriteBatch shard
+            // mode so per-shard tests can stage many merges per key.
+            vec![
+                crate::CfDescriptor::new("counters", counter_opts)
+                    .with_restore_mode(crate::RestoreMode::MergeViaWriteBatch),
+            ]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -953,23 +1173,24 @@ mod tests {
             batch.put(&schema.items, &U64Be(2), &U64Be(20)).unwrap();
             assert_eq!(batch.len(), 2);
 
-            let ssts = batch
-                .finalize_into_ssts(staging.path(), &rocksdb::Options::default())
+            let finalize = batch
+                .finalize_for_shard(staging.path(), &rocksdb::Options::default())
                 .unwrap();
-            assert_eq!(ssts.len(), 1);
-            let (cf, path) = ssts.into_iter().next().unwrap();
-            assert_eq!(cf, "items");
-            assert!(path.exists());
+            assert_eq!(finalize.ssts().len(), 1);
+            assert_eq!(finalize.ssts()[0].0, "items");
+            assert!(finalize.ssts()[0].1.exists());
 
-            db.ingest_files_cf("items", vec![path]).unwrap();
+            finalize.commit().unwrap();
             assert_eq!(schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
             assert_eq!(schema.items.get(&U64Be(2)).unwrap(), Some(U64Be(20)));
         }
 
         #[test]
-        fn shard_merge_then_finalize_then_ingest_combines_via_operator() {
-            // Shard-backed batch writes merge entries; ingest at
-            // bottom level; the operator combines on read.
+        fn shard_merge_via_write_batch_combines_via_operator() {
+            // The merge-operator CF in MergeSchema opts into the
+            // MergeViaWriteBatch shard mode. Many merges per key in
+            // one shard are allowed; the WriteBatch commit applies
+            // them in order through the registered operator.
             let (_dir, db, schema) = open_merge();
             let staging = TempDir::new().unwrap();
 
@@ -977,18 +1198,20 @@ mod tests {
             batch
                 .merge(&schema.counters, &U64Be(1), &U64Be(10))
                 .unwrap();
+            batch.merge(&schema.counters, &U64Be(1), &U64Be(5)).unwrap();
             batch
                 .merge(&schema.counters, &U64Be(2), &U64Be(20))
                 .unwrap();
-            let ssts = batch
-                .finalize_into_ssts(staging.path(), &rocksdb::Options::default())
+
+            let finalize = batch
+                .finalize_for_shard(staging.path(), &rocksdb::Options::default())
                 .unwrap();
-            for (cf, path) in ssts {
-                db.ingest_files_cf(&cf, vec![path]).unwrap();
-            }
-            // Both keys see exactly one merge operand, so the
-            // operator's output equals that operand.
-            assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
+            // No SSTs are produced — the merge-mode CF goes via
+            // WriteBatch only.
+            assert!(finalize.ssts().is_empty());
+            finalize.commit().unwrap();
+
+            assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(15)));
             assert_eq!(schema.counters.get(&U64Be(2)).unwrap(), Some(U64Be(20)));
         }
 
@@ -1007,24 +1230,20 @@ mod tests {
 
             let mut shard = db.shard_batch();
             shard.delete(&schema.items, &U64Be(1)).unwrap();
-            let ssts = shard
-                .finalize_into_ssts(staging.path(), &rocksdb::Options::default())
+            let finalize = shard
+                .finalize_for_shard(staging.path(), &rocksdb::Options::default())
                 .unwrap();
-            for (cf, path) in ssts {
-                db.ingest_files_cf(&cf, vec![path]).unwrap();
-            }
+            finalize.commit().unwrap();
             assert!(schema.items.get(&U64Be(1)).unwrap().is_none());
             assert_eq!(schema.items.get(&U64Be(2)).unwrap(), Some(U64Be(20)));
         }
 
         #[test]
-        fn shard_duplicate_put_returns_duplicate_shard_op_error() {
+        fn shard_duplicate_put_in_bulk_ingest_cf_returns_duplicate_shard_op() {
             let (_dir, db, schema) = open();
             let mut batch = db.shard_batch();
             batch.put(&schema.items, &U64Be(1), &U64Be(10)).unwrap();
-            let err = batch
-                .put(&schema.items, &U64Be(1), &U64Be(11))
-                .unwrap_err();
+            let err = batch.put(&schema.items, &U64Be(1), &U64Be(11)).unwrap_err();
             match err {
                 Error::DuplicateShardOp { ref cf, key_len } => {
                     assert_eq!(cf, "items");
@@ -1035,24 +1254,27 @@ mod tests {
         }
 
         #[test]
-        fn shard_duplicate_merge_returns_duplicate_shard_op_error() {
+        fn shard_duplicate_merge_in_merge_mode_cf_is_allowed() {
+            // The merge-operator CF declares MergeViaWriteBatch mode;
+            // pipelines may emit many merge operands per key per
+            // shard without DuplicateShardOp firing.
             let (_dir, db, schema) = open_merge();
             let mut batch = db.shard_batch();
             batch
                 .merge(&schema.counters, &U64Be(1), &U64Be(10))
                 .unwrap();
-            let err = batch
+            batch
                 .merge(&schema.counters, &U64Be(1), &U64Be(20))
-                .unwrap_err();
-            assert!(matches!(err, Error::DuplicateShardOp { .. }));
+                .unwrap();
+            assert_eq!(batch.len(), 2);
         }
 
         #[test]
-        fn shard_put_then_delete_same_key_is_duplicate_op() {
-            // SST ingest constrains the per-shard buffer to one op
-            // per key. Mixed put-then-delete still counts as a
-            // duplicate — the pipeline should resolve to a single
-            // op in its accumulator.
+        fn shard_put_then_delete_same_key_in_bulk_cf_is_duplicate_op() {
+            // SST ingest constrains BulkIngest CFs to one op per key.
+            // Mixed put-then-delete still counts as a duplicate — the
+            // pipeline should resolve to a single op in its
+            // accumulator.
             let (_dir, db, schema) = open();
             let mut batch = db.shard_batch();
             batch.put(&schema.items, &U64Be(1), &U64Be(10)).unwrap();
@@ -1082,15 +1304,16 @@ mod tests {
         }
 
         #[test]
-        fn finalize_emits_one_sst_per_cf_with_ops() {
+        fn finalize_emits_one_sst_per_bulk_ingest_cf_with_ops() {
             let (_dir, db, schema) = open();
             let staging = TempDir::new().unwrap();
             let mut batch = db.shard_batch();
             batch.put(&schema.items, &U64Be(1), &U64Be(10)).unwrap();
             batch.put(&schema.other, &U64Be(2), &U64Be(20)).unwrap();
-            let ssts = batch
-                .finalize_into_ssts(staging.path(), &rocksdb::Options::default())
+            let finalize = batch
+                .finalize_for_shard(staging.path(), &rocksdb::Options::default())
                 .unwrap();
+            let ssts = finalize.ssts();
             assert_eq!(ssts.len(), 2);
             let cf_names: Vec<String> = ssts.iter().map(|(cf, _)| cf.clone()).collect();
             // BTreeMap key order is by &str.
@@ -1101,14 +1324,16 @@ mod tests {
         }
 
         #[test]
-        fn finalize_empty_shard_batch_returns_empty_vec() {
+        fn finalize_empty_shard_batch_returns_empty_finalize() {
             let (_dir, db, _schema) = open();
             let staging = TempDir::new().unwrap();
             let batch = db.shard_batch();
-            let ssts = batch
-                .finalize_into_ssts(staging.path(), &rocksdb::Options::default())
+            let finalize = batch
+                .finalize_for_shard(staging.path(), &rocksdb::Options::default())
                 .unwrap();
-            assert!(ssts.is_empty());
+            assert!(finalize.ssts().is_empty());
+            // Committing the empty finalize is a no-op.
+            finalize.commit().unwrap();
         }
 
         #[test]
@@ -1128,7 +1353,7 @@ mod tests {
             let staging = TempDir::new().unwrap();
             let batch = db.batch();
             let err = batch
-                .finalize_into_ssts(staging.path(), &rocksdb::Options::default())
+                .finalize_for_shard(staging.path(), &rocksdb::Options::default())
                 .unwrap_err();
             assert!(
                 matches!(err, Error::Internal(msg) if msg.contains("write-backed")),
@@ -1157,9 +1382,9 @@ mod tests {
         #[test]
         fn cross_shard_merges_combine_through_full_pipeline() {
             // End-to-end exercise of the design's restore story:
-            // two independent shard-backed batches each emit a
-            // merge for the same key, finalize into SSTs, ingest;
-            // the registered merge operator combines them.
+            // two independent shard-backed batches each emit one or
+            // more merges for the same key, finalize, commit; the
+            // registered merge operator combines across shards.
             let (_dir, db, schema) = open_merge();
             let staging = TempDir::new().unwrap();
 
@@ -1173,14 +1398,36 @@ mod tests {
                 .unwrap();
 
             for batch in [shard1, shard2] {
-                let ssts = batch
-                    .finalize_into_ssts(staging.path(), &rocksdb::Options::default())
+                let finalize = batch
+                    .finalize_for_shard(staging.path(), &rocksdb::Options::default())
                     .unwrap();
-                for (cf, path) in ssts {
-                    db.ingest_files_cf(&cf, vec![path]).unwrap();
-                }
+                finalize.commit().unwrap();
             }
             assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(30)));
+        }
+
+        #[test]
+        fn shard_finalize_extends_write_batch_with_runner_marker() {
+            // The runner stages the partition-complete marker into
+            // the same WriteBatch that holds the shard's merge-mode
+            // writes. Verify the surface: get the WriteBatch, stage
+            // a marker, commit, observe both effects.
+            let (_dir, db, schema) = open_merge();
+            let staging = TempDir::new().unwrap();
+
+            let mut batch = db.shard_batch();
+            batch.merge(&schema.counters, &U64Be(1), &U64Be(7)).unwrap();
+            let mut finalize = batch
+                .finalize_for_shard(staging.path(), &rocksdb::Options::default())
+                .unwrap();
+
+            let marker = crate::RestoreState::Complete { restored_at: 42 };
+            db.stage_restore_state(finalize.write_batch_mut(), "p", &marker)
+                .unwrap();
+            finalize.commit().unwrap();
+
+            assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(7)));
+            assert_eq!(db.restore_state("p").unwrap(), Some(marker));
         }
     }
 }

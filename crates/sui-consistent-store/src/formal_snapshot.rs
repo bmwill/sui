@@ -182,8 +182,12 @@ impl FormalSnapshot {
         metadata: &FileMetadata,
     ) -> anyhow::Result<LiveObjectsFile> {
         let bytes = self.fetch_file(metadata).await?;
-        LiveObjectsFile::read(&bytes, metadata)
-            .with_context(|| format!("Failed to parse partition {}_{}", metadata.bucket, metadata.partition))
+        LiveObjectsFile::read(&bytes, metadata).with_context(|| {
+            format!(
+                "Failed to parse partition {}_{}",
+                metadata.bucket, metadata.partition
+            )
+        })
     }
 
     /// Fetch the raw bytes of a `.obj` or `.ref` file described by
@@ -255,23 +259,17 @@ pub async fn restore_pipeline_from_formal_snapshot<P: Pipeline>(
             let snapshot = snapshot.clone();
             async move {
                 let partition_id = FormalSnapshot::partition_id(&meta);
-                let parsed = snapshot
-                    .fetch_partition(&meta)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to fetch partition {}_{}",
-                            meta.bucket, meta.partition,
-                        )
-                    })?;
+                let parsed = snapshot.fetch_partition(&meta).await.with_context(|| {
+                    format!(
+                        "Failed to fetch partition {}_{}",
+                        meta.bucket, meta.partition,
+                    )
+                })?;
                 // `process_shard` is CPU-bound (SST building) and
                 // sync; run it on a blocking pool so the async
                 // executor stays responsive.
                 tokio::task::spawn_blocking(move || {
-                    runner.process_shard(
-                        &partition_id,
-                        parsed.objects.into_iter().map(Ok),
-                    )
+                    runner.process_shard(&partition_id, parsed.objects.into_iter().map(Ok))
                 })
                 .await
                 .context("process_shard worker task panicked")??;
@@ -385,8 +383,7 @@ pub(crate) mod test_fixture {
         for o in objects {
             let live = LiveObject::Normal(o);
             let blob = Blob::encode(&live, BlobEncoding::Bcs).unwrap();
-            integer_encoding::VarIntWriter::write_varint(&mut out, blob.data.len() as u64)
-                .unwrap();
+            integer_encoding::VarIntWriter::write_varint(&mut out, blob.data.len() as u64).unwrap();
             out.write_all(&[blob.encoding.into()]).unwrap();
             out.write_all(&blob.data).unwrap();
         }
@@ -625,8 +622,8 @@ mod tests {
         }
 
         impl Schema for VersionsSchema {
-            fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-                vec![("versions", base_options.clone())]
+            fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
+                vec![crate::CfDescriptor::new("versions", base_options.clone())]
             }
 
             fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -673,11 +670,7 @@ mod tests {
                 write_batch: &mut Batch,
             ) -> anyhow::Result<usize> {
                 for (id, v) in batch {
-                    write_batch.put(
-                        &schema.versions,
-                        &ObjectIdKey::new(*id),
-                        &U64Be(*v),
-                    )?;
+                    write_batch.put(&schema.versions, &ObjectIdKey::new(*id), &U64Be(*v))?;
                 }
                 Ok(batch.len())
             }
@@ -737,10 +730,7 @@ mod tests {
             // the pipeline's CF.
             for id in [1u8, 2, 3, 4, 5, 6] {
                 let obj_id = ObjectID::from_single_byte(id);
-                let val = schema
-                    .versions
-                    .get(&ObjectIdKey::new(obj_id))
-                    .unwrap();
+                let val = schema.versions.get(&ObjectIdKey::new(obj_id)).unwrap();
                 assert!(val.is_some(), "object {id} missing");
             }
 
@@ -809,11 +799,7 @@ mod tests {
 
             // Resume the restore. Only partition 1 should be
             // fetched and ingested.
-            let snapshot = Arc::new(
-                FormalSnapshot::open(snapshot_store, Some(7))
-                    .await
-                    .unwrap(),
-            );
+            let snapshot = Arc::new(FormalSnapshot::open(snapshot_store, Some(7)).await.unwrap());
             let runner = Arc::new(RestoreRunner::new(
                 db.clone(),
                 Arc::new(VersionsPipeline),

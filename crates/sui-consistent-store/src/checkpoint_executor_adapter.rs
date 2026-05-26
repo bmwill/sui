@@ -165,11 +165,7 @@ impl AdapterBuilder {
     /// matter for correctness since each pipeline owns disjoint
     /// CFs, but it does set the order in which commits land in the
     /// shared [`Batch`].
-    pub fn add_pipeline<P: Pipeline>(
-        mut self,
-        pipeline: Arc<P>,
-        schema: Arc<P::Schema>,
-    ) -> Self {
+    pub fn add_pipeline<P: Pipeline>(mut self, pipeline: Arc<P>, schema: Arc<P::Schema>) -> Self {
         self.pipelines
             .push(Arc::new(PipelineAdapter { pipeline, schema }));
         self
@@ -216,16 +212,9 @@ impl CheckpointExecutorAdapter {
         // partial state.
         let mut staged = Vec::with_capacity(self.pipelines.len());
         for pipeline in &self.pipelines {
-            staged.push(
-                pipeline
-                    .process_into_batch(checkpoint)
-                    .with_context(|| {
-                        format!(
-                            "indexing checkpoint {seq} for pipeline {}",
-                            pipeline.name()
-                        )
-                    })?,
-            );
+            staged.push(pipeline.process_into_batch(checkpoint).with_context(|| {
+                format!("indexing checkpoint {seq} for pipeline {}", pipeline.name())
+            })?);
         }
 
         self.pending.lock().insert(seq, staged);
@@ -262,12 +251,14 @@ impl CheckpointExecutorAdapter {
         let mut total = 0usize;
         for (i, acc) in staged.into_iter().enumerate() {
             let pipeline = &self.pipelines[i];
-            total += pipeline.commit_batch(acc, &mut write_batch).with_context(|| {
-                format!(
-                    "committing checkpoint {seq} for pipeline {}",
-                    pipeline.name()
-                )
-            })?;
+            total += pipeline
+                .commit_batch(acc, &mut write_batch)
+                .with_context(|| {
+                    format!(
+                        "committing checkpoint {seq} for pipeline {}",
+                        pipeline.name()
+                    )
+                })?;
         }
         write_batch.commit()?;
         Ok(total)
@@ -381,10 +372,10 @@ mod tests {
     }
 
     impl Schema for TestSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
             vec![
-                ("versions", base_options.clone()),
-                ("counts", base_options.clone()),
+                crate::CfDescriptor::new("versions", base_options.clone()),
+                crate::CfDescriptor::new("counts", base_options.clone()),
             ]
         }
 
@@ -439,11 +430,7 @@ mod tests {
             write_batch: &mut Batch,
         ) -> anyhow::Result<usize> {
             for (id, v) in batch {
-                write_batch.put(
-                    &schema.versions,
-                    &ObjectIdKey::new(*id),
-                    &U64Be(*v),
-                )?;
+                write_batch.put(&schema.versions, &ObjectIdKey::new(*id), &U64Be(*v))?;
             }
             Ok(batch.len())
         }
@@ -523,7 +510,11 @@ mod tests {
         // explicitly-created one plus producer-side bookkeeping
         // like the gas object); rely on cardinality bounds rather
         // than an exact count.
-        let expected_objects = cp.transactions.iter().flat_map(|tx| &tx.output_objects).count();
+        let expected_objects = cp
+            .transactions
+            .iter()
+            .flat_map(|tx| &tx.output_objects)
+            .count();
         adapter.index_checkpoint(&cp).unwrap();
         assert_eq!(adapter.pending_checkpoint_count(), 1);
         assert_eq!(adapter.next_staged_checkpoint(), Some(1));
@@ -582,7 +573,9 @@ mod tests {
     #[test]
     fn commit_clears_the_staging_entry() {
         let (_dir, _db, _schema, adapter) = setup();
-        adapter.index_checkpoint(&checkpoint_with_object(5, 1)).unwrap();
+        adapter
+            .index_checkpoint(&checkpoint_with_object(5, 1))
+            .unwrap();
         adapter.commit_update_for_checkpoint(5).unwrap();
         // A second commit at the same seq has nothing to drain.
         let err = adapter.commit_update_for_checkpoint(5).unwrap_err();
@@ -592,7 +585,9 @@ mod tests {
     #[test]
     fn discard_removes_staged_checkpoint() {
         let (_dir, _db, _schema, adapter) = setup();
-        adapter.index_checkpoint(&checkpoint_with_object(9, 1)).unwrap();
+        adapter
+            .index_checkpoint(&checkpoint_with_object(9, 1))
+            .unwrap();
         assert!(adapter.discard_staged_checkpoint(9));
         assert_eq!(adapter.pending_checkpoint_count(), 0);
         assert!(!adapter.discard_staged_checkpoint(9));
@@ -657,7 +652,9 @@ mod tests {
         let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
         let adapter = CheckpointExecutorAdapter::builder(db).build();
 
-        adapter.index_checkpoint(&checkpoint_with_object(1, 1)).unwrap();
+        adapter
+            .index_checkpoint(&checkpoint_with_object(1, 1))
+            .unwrap();
         let rows = adapter.commit_update_for_checkpoint(1).unwrap();
         assert_eq!(rows, 0);
     }

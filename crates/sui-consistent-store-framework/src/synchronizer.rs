@@ -288,7 +288,7 @@ mod tests {
     struct OnlyFramework(FrameworkSchema);
 
     impl Schema for OnlyFramework {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
             FrameworkSchema::cfs(base_options)
         }
 

@@ -137,11 +137,7 @@ pub trait Pipeline: Send + Sync + 'static {
     /// that both touch the same key each produce one merge entry
     /// in their respective SSTs, and the registered merge operator
     /// combines them after ingest.
-    fn restore(
-        &self,
-        accumulator: &mut Self::Batch,
-        object: &Object,
-    ) -> anyhow::Result<()>;
+    fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()>;
 
     /// Extract typed values from a checkpoint.
     ///
@@ -262,8 +258,8 @@ mod tests {
     }
 
     impl Schema for ObjectVersionSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-            vec![("versions", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
+            vec![crate::CfDescriptor::new("versions", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -293,11 +289,7 @@ mod tests {
         type Value = VersionRow;
         type Batch = BTreeMap<ObjectID, u64>;
 
-        fn restore(
-            &self,
-            accumulator: &mut Self::Batch,
-            object: &Object,
-        ) -> anyhow::Result<()> {
+        fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()> {
             // One entry per object — restore folds the same way
             // `batch` would: keep the highest version observed.
             accumulator

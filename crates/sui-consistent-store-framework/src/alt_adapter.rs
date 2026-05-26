@@ -103,8 +103,7 @@ impl<P: Pipeline> sequential::Handler for AltAdapter<P> {
         // so we can hand it to the pipeline without going through
         // `&conn` (which would conflict with `conn.store`'s
         // immutable borrow).
-        self.0
-            .commit(conn.store.schema(), batch, &mut conn.batch)
+        self.0.commit(conn.store.schema(), batch, &mut conn.batch)
     }
 }
 
@@ -193,8 +192,11 @@ mod tests {
     }
 
     impl Schema for VersionsSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-            vec![("versions", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
+            vec![sui_consistent_store::CfDescriptor::new(
+                "versions",
+                base_options.clone(),
+            )]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -211,7 +213,7 @@ mod tests {
     }
 
     impl Schema for Combined {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
             let mut cfs = FrameworkSchema::cfs(base_options);
             cfs.extend(VersionsSchema::cfs(base_options));
             cfs
@@ -238,10 +240,7 @@ mod tests {
             Ok(())
         }
 
-        fn process(
-            &self,
-            checkpoint: &CheckpointData,
-        ) -> anyhow::Result<Vec<Self::Value>> {
+        fn process(&self, checkpoint: &CheckpointData) -> anyhow::Result<Vec<Self::Value>> {
             let mut out = vec![];
             for tx in &checkpoint.transactions {
                 for o in &tx.output_objects {
@@ -304,7 +303,10 @@ mod tests {
     #[tokio::test]
     async fn name_is_propagated_from_pipeline() {
         // Compile-time: const propagation through the trait.
-        assert_eq!(<AltAdapter<VersionsPipeline> as Processor>::NAME, "versions");
+        assert_eq!(
+            <AltAdapter<VersionsPipeline> as Processor>::NAME,
+            "versions"
+        );
     }
 
     #[tokio::test]
@@ -322,7 +324,11 @@ mod tests {
         let adapter = AltAdapter::new(VersionsPipeline);
         let mut acc = BTreeMap::new();
         let id = ObjectID::from_single_byte(7);
-        sequential::Handler::batch(&adapter, &mut acc, vec![(id, 1), (id, 5), (id, 3)].into_iter());
+        sequential::Handler::batch(
+            &adapter,
+            &mut acc,
+            vec![(id, 1), (id, 5), (id, 3)].into_iter(),
+        );
         assert_eq!(acc.get(&id), Some(&5));
     }
 
@@ -361,7 +367,10 @@ mod tests {
         );
         // Watermark advanced.
         let mut conn = store.connect().await.unwrap();
-        let w = conn.committer_watermark(VersionsPipeline::NAME).await.unwrap();
+        let w = conn
+            .committer_watermark(VersionsPipeline::NAME)
+            .await
+            .unwrap();
         assert_eq!(w.unwrap().checkpoint_hi_inclusive, 1);
     }
 

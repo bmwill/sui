@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::BufMut;
+use sui_consistent_store::CfDescriptor;
 use sui_consistent_store::Db;
 use sui_consistent_store::DbMap;
 use sui_consistent_store::Decode;
@@ -126,10 +127,10 @@ pub struct FrameworkSchema {
 }
 
 impl Schema for FrameworkSchema {
-    fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
+    fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
         vec![
-            (WATERMARK_CF, base_options.clone()),
-            (CHAIN_ID_CF, base_options.clone()),
+            CfDescriptor::new(WATERMARK_CF, base_options.clone()),
+            CfDescriptor::new(CHAIN_ID_CF, base_options.clone()),
         ]
     }
 
@@ -151,8 +152,7 @@ mod tests {
     #[test]
     fn open_registers_framework_cfs() {
         let dir = TempDir::new().unwrap();
-        let (db, _schema) =
-            Db::open::<FrameworkSchema>(dir.path(), DbOptions::default()).unwrap();
+        let (db, _schema) = Db::open::<FrameworkSchema>(dir.path(), DbOptions::default()).unwrap();
         // Reading raw rocksdb CF presence isn't exposed publicly,
         // but the DbMap construction in `open` would have failed if
         // the CFs were not registered. Sanity-check by attempting a
@@ -163,8 +163,7 @@ mod tests {
     #[test]
     fn watermark_round_trips_through_db() {
         let dir = TempDir::new().unwrap();
-        let (db, schema) =
-            Db::open::<FrameworkSchema>(dir.path(), DbOptions::default()).unwrap();
+        let (db, schema) = Db::open::<FrameworkSchema>(dir.path(), DbOptions::default()).unwrap();
         let key = PipelineTaskKey::new("balances");
         let w = Watermark {
             epoch_hi_inclusive: 3,
@@ -184,8 +183,7 @@ mod tests {
     #[test]
     fn chain_id_round_trips_through_db() {
         let dir = TempDir::new().unwrap();
-        let (db, schema) =
-            Db::open::<FrameworkSchema>(dir.path(), DbOptions::default()).unwrap();
+        let (db, schema) = Db::open::<FrameworkSchema>(dir.path(), DbOptions::default()).unwrap();
         let key = PipelineTaskKey::new("balances");
         let chain_id = ChainId([7u8; 32]);
 
@@ -219,8 +217,7 @@ mod tests {
         // Sanity: the two CFs are independent, so the same key
         // string in each does not collide.
         let dir = TempDir::new().unwrap();
-        let (db, schema) =
-            Db::open::<FrameworkSchema>(dir.path(), DbOptions::default()).unwrap();
+        let (db, schema) = Db::open::<FrameworkSchema>(dir.path(), DbOptions::default()).unwrap();
         let key = PipelineTaskKey::new("p");
 
         let mut batch = db.batch();
@@ -234,7 +231,9 @@ mod tests {
                 },
             )
             .unwrap();
-        batch.put(&schema.chain_ids, &key, &ChainId([1u8; 32])).unwrap();
+        batch
+            .put(&schema.chain_ids, &key, &ChainId([1u8; 32]))
+            .unwrap();
         batch.commit().unwrap();
 
         assert!(schema.watermarks.get(&key).unwrap().is_some());

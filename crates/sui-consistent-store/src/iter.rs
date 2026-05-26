@@ -352,7 +352,10 @@ where
         )));
     };
 
-    let item = match (K::decode(&mut &key_bytes[..]), V::decode(&mut &value_bytes[..])) {
+    let item = match (
+        K::decode(&mut &key_bytes[..]),
+        V::decode(&mut &value_bytes[..]),
+    ) {
         (Ok(k), Ok(v)) => Ok((k, v)),
         (Err(e), _) | (_, Err(e)) => {
             *slot = None;

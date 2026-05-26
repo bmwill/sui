@@ -115,9 +115,7 @@ where
     let total_shards: u32 = 1 << shard_bits;
     info!(
         pipeline = P::NAME,
-        shard_bits,
-        total_shards,
-        "Beginning perpetual-store restore",
+        shard_bits, total_shards, "Beginning perpetual-store restore",
     );
 
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -248,8 +246,8 @@ mod tests {
     }
 
     impl Schema for VersionsSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-            vec![("versions", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
+            vec![crate::CfDescriptor::new("versions", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -267,11 +265,7 @@ mod tests {
         type Value = (ObjectID, u64);
         type Batch = BTreeMap<ObjectID, u64>;
 
-        fn restore(
-            &self,
-            accumulator: &mut Self::Batch,
-            object: &Object,
-        ) -> anyhow::Result<()> {
+        fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()> {
             accumulator
                 .entry(object.id())
                 .and_modify(|hi| {
@@ -299,11 +293,7 @@ mod tests {
             write_batch: &mut Batch,
         ) -> anyhow::Result<usize> {
             for (id, v) in batch {
-                write_batch.put(
-                    &schema.versions,
-                    &ObjectIdKey::new(*id),
-                    &U64Be(*v),
-                )?;
+                write_batch.put(&schema.versions, &ObjectIdKey::new(*id), &U64Be(*v))?;
             }
             Ok(batch.len())
         }
@@ -342,11 +332,7 @@ mod tests {
             end: ObjectID,
         ) -> Box<dyn Iterator<Item = anyhow::Result<Object>> + 'a> {
             self.ranges_called.lock().unwrap().push((start, end));
-            Box::new(
-                self.objects
-                    .range(start..=end)
-                    .map(|(_, o)| Ok(o.clone())),
-            )
+            Box::new(self.objects.range(start..=end).map(|(_, o)| Ok(o.clone())))
         }
     }
 
@@ -361,8 +347,7 @@ mod tests {
 
     fn open_db() -> (TempDir, Arc<Db>, Arc<VersionsSchema>) {
         let dir = TempDir::new().unwrap();
-        let (db, schema) =
-            Db::open::<VersionsSchema>(dir.path(), DbOptions::default()).unwrap();
+        let (db, schema) = Db::open::<VersionsSchema>(dir.path(), DbOptions::default()).unwrap();
         (dir, db, Arc::new(schema))
     }
 
@@ -522,10 +507,7 @@ mod tests {
     #[test]
     fn resume_skips_already_completed_partitions() {
         let (_dir, db, schema) = open_db();
-        let objects = vec![
-            obj_with_first_byte(0x00),
-            obj_with_first_byte(0xFF),
-        ];
+        let objects = vec![obj_with_first_byte(0x00), obj_with_first_byte(0xFF)];
         let source = MockSource::new(objects);
 
         let staging = TempDir::new().unwrap();

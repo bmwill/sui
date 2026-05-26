@@ -70,8 +70,8 @@
 //! }
 //!
 //! impl Schema for MySchema<Live> {
-//!     fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-//!         vec![("items", base_options.clone())]
+//!     fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
+//!         vec![sui_consistent_store::CfDescriptor::new("items", base_options.clone())]
 //!     }
 //!
 //!     fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -221,8 +221,8 @@ mod tests {
     }
 
     impl Schema for TestSchema<Live> {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<(&'static str, rocksdb::Options)> {
-            vec![("items", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
+            vec![crate::CfDescriptor::new("items", base_options.clone())]
         }
 
         fn open(db: &Arc<Db>) -> Result<Self, OpenError> {
@@ -614,9 +614,6 @@ mod tests {
 
         let snap = db.at_snapshot(1).unwrap();
         let snap_schema = schema.at(&snap);
-        assert_eq!(
-            snap_schema.items.get(&U64Be(1)).unwrap(),
-            Some(U64Be(100)),
-        );
+        assert_eq!(snap_schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(100)),);
     }
 }

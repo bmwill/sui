@@ -165,8 +165,14 @@ mod tests {
     async fn object_store_storage_missing_path_errors() {
         let dir = TempDir::new().unwrap();
         let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
-        let err = Storage::get(&store, Path::from("nope.txt")).await.unwrap_err();
-        assert!(format!("{err:#}").to_lowercase().contains("failed to fetch"));
+        let err = Storage::get(&store, Path::from("nope.txt"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}")
+                .to_lowercase()
+                .contains("failed to fetch")
+        );
     }
 
     #[test]
