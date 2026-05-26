@@ -11,12 +11,15 @@
 //!
 //! # The reader parameter
 //!
-//! `R` defaults to [`Live`], so today's call sites
+//! `R` defaults to [`Db`], so today's call sites
 //! (`DbMap::new(db, "items")`, schemas opened via
-//! [`Db::open`](crate::Db::open)) work unchanged. To re-bind a map at
-//! a captured snapshot, call [`DbMap::at`]; for the whole-schema
+//! [`Db::open`](crate::Db::open)) work unchanged. To re-bind a map
+//! at a captured snapshot, call [`DbMap::at`]; for the whole-schema
 //! equivalent see
-//! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at).
+//! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at). To
+//! construct a borrowed-reader handle (no `Arc` bump), pass `&db`
+//! or `&snap` to [`DbMap::new`] — the reader type is inferred from
+//! the argument.
 //!
 //! Schemas are typically structs of `DbMap` fields parameterized by
 //! `R`; see the [`Schema`](crate::Schema) trait for the construction
@@ -69,8 +72,6 @@ use crate::iter::Iter;
 use crate::iter::RevIter;
 use crate::iter::prefix_to_byte_bounds;
 use crate::iter::range_to_byte_bounds;
-use crate::reader::Live;
-use crate::reader::LiveRef;
 use crate::reader::Reader;
 use crate::snapshot::Snapshot;
 
@@ -92,7 +93,6 @@ use crate::snapshot::Snapshot;
 /// use sui_consistent_store::DbOptions;
 /// use sui_consistent_store::Decode;
 /// use sui_consistent_store::Encode;
-/// use sui_consistent_store::Live;
 /// use sui_consistent_store::Reader;
 /// use sui_consistent_store::Schema;
 /// use sui_consistent_store::error::DecodeError;
@@ -118,11 +118,11 @@ use crate::snapshot::Snapshot;
 ///     }
 /// }
 ///
-/// struct MySchema<R: Reader = Live> {
+/// struct MySchema<R: Reader = Db> {
 ///     items: DbMap<U64Be, U64Be, R>,
 /// }
 ///
-/// impl Schema for MySchema<Live> {
+/// impl Schema for MySchema {
 ///     fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
 ///         vec![sui_consistent_store::CfDescriptor::new("items", base_options.clone())]
 ///     }
@@ -140,7 +140,7 @@ use crate::snapshot::Snapshot;
 /// assert!(schema.items.get(&U64Be(1)).unwrap().is_none());
 /// ```
 #[derive(Debug)]
-pub struct DbMap<K, V, R: Reader = Live> {
+pub struct DbMap<K, V, R: Reader = Db> {
     reader: R,
     cf_name: &'static str,
     _data: PhantomData<fn(K) -> V>,
@@ -160,57 +160,36 @@ struct PinnedOwner {
     _db: Db,
 }
 
-impl<K, V> DbMap<K, V, Live> {
+impl<K, V, R: Reader> DbMap<K, V, R> {
     /// Construct a typed handle for the column family named `cf_name`
-    /// at the database's live tip.
+    /// on `reader`'s database.
+    ///
+    /// `reader` controls the consistency context. Common cases:
+    ///
+    /// - `DbMap::new(db, "items")` — owned [`Db`] (live-tip,
+    ///   one `Arc` bump).
+    /// - `DbMap::new(&db, "items")` — borrowed [`Db`] (live-tip,
+    ///   no `Arc` bump; the returned handle borrows `db`).
+    /// - `DbMap::new(snap, "items")` — owned [`Snapshot`]
+    ///   (snapshot-bound). Usually obtained via
+    ///   [`DbMap::at`] from an existing handle so the cross-`Db`
+    ///   safety check fires.
+    /// - `DbMap::new(&snap, "items")` — borrowed
+    ///   [`Snapshot`] (snapshot-bound, no `Arc` bump).
     ///
     /// Returns an [`OpenError`] if the named column family is not
-    /// registered on `db`. Construction is the only place where a
-    /// missing column family is reported as an open-time error;
-    /// subsequent operations report it as
+    /// registered on `reader.db()`. Construction is the only place
+    /// where a missing column family is reported as an open-time
+    /// error; subsequent operations report it as
     /// [`Error::MissingColumnFamily`](crate::error::Error::MissingColumnFamily).
-    ///
-    /// To bind to a snapshot instead, construct via this method and
-    /// then call [`DbMap::at`] (or use
-    /// [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) for the
-    /// whole-schema equivalent).
-    pub fn new(db: Db, cf_name: &'static str) -> Result<Self, OpenError> {
-        if db.cf_handle(cf_name).is_none() {
+    pub fn new(reader: R, cf_name: &'static str) -> Result<Self, OpenError> {
+        if reader.db().cf_handle(cf_name).is_none() {
             return Err(OpenError::msg(format!(
                 "column family `{cf_name}` is not registered",
             )));
         }
         Ok(Self {
-            reader: Live::new(db),
-            cf_name,
-            _data: PhantomData,
-        })
-    }
-}
-
-impl<'a, K, V> DbMap<K, V, LiveRef<'a>> {
-    /// Borrowed counterpart to [`DbMap::new`]: construct a typed
-    /// handle for the column family named `cf_name` at the
-    /// database's live tip, bound to a borrowed [`Db`] handle
-    /// rather than an owned (cloned) one.
-    ///
-    /// Returns an [`OpenError`] if the named column family is not
-    /// registered on `db`. The returned [`DbMap`] borrows `db` for
-    /// the lifetime `'a`; it cannot outlive the borrow it was
-    /// constructed from.
-    ///
-    /// Use this when the resulting handle is scoped to a single
-    /// function body and can be tied to a [`Db`] the caller already
-    /// holds — it avoids the per-handle `Arc` bump that
-    /// [`DbMap::new`] pays.
-    pub fn new_ref(db: &'a Db, cf_name: &'static str) -> Result<Self, OpenError> {
-        if db.cf_handle(cf_name).is_none() {
-            return Err(OpenError::msg(format!(
-                "column family `{cf_name}` is not registered",
-            )));
-        }
-        Ok(Self {
-            reader: LiveRef::new(db),
+            reader,
             cf_name,
             _data: PhantomData,
         })
@@ -679,11 +658,11 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestSchema<R: Reader = Live> {
+    struct TestSchema<R: Reader = Db> {
         items: DbMap<U64Be, U64Be, R>,
     }
 
-    impl Schema for TestSchema<Live> {
+    impl Schema for TestSchema {
         fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
             vec![crate::CfDescriptor::new("items", base_options.clone())]
         }
@@ -713,25 +692,24 @@ mod tests {
     }
 
     #[test]
-    fn new_ref_errors_on_unknown_cf() {
+    fn new_with_borrowed_db_errors_on_unknown_cf() {
         let (_dir, db, _schema) = open();
-        let err = DbMap::<U64Be, U64Be, LiveRef<'_>>::new_ref(&db, "missing").unwrap_err();
+        let err = DbMap::<U64Be, U64Be, &Db>::new(&db, "missing").unwrap_err();
         assert!(err.to_string().contains("missing"));
     }
 
     #[test]
-    fn new_ref_reads_live_tip() {
-        // Construct a LiveRef-bound DbMap against a borrowed Db and
-        // verify reads see writes committed through the Live-bound
-        // schema. Avoids the per-handle Arc bump that DbMap::new
-        // pays.
+    fn new_with_borrowed_db_reads_live_tip() {
+        // Construct a &Db-bound DbMap against a borrowed Db and
+        // verify reads see writes committed through the owned-Db
+        // schema. Avoids the per-handle Arc bump that an owned
+        // `DbMap::new(db.clone(), …)` pays.
         let (_dir, db, schema) = open();
         let mut batch = db.batch();
         batch.put(&schema.items, &U64Be(1), &U64Be(10)).unwrap();
         batch.commit().unwrap();
 
-        let items_ref: DbMap<U64Be, U64Be, LiveRef<'_>> =
-            DbMap::new_ref(&db, "items").unwrap();
+        let items_ref: DbMap<U64Be, U64Be, &Db> = DbMap::new(&db, "items").unwrap();
         assert_eq!(items_ref.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
     }
 
@@ -1542,11 +1520,11 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct CompoundSchema<R: Reader = Live> {
+    struct CompoundSchema<R: Reader = Db> {
         rows: DbMap<ByteAndU32, U64Be, R>,
     }
 
-    impl Schema for CompoundSchema<Live> {
+    impl Schema for CompoundSchema {
         fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
             vec![crate::CfDescriptor::new("rows", base_options.clone())]
         }

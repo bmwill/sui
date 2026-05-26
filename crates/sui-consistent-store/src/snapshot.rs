@@ -39,7 +39,6 @@
 //! use sui_consistent_store::DbOptions;
 //! use sui_consistent_store::Decode;
 //! use sui_consistent_store::Encode;
-//! use sui_consistent_store::Live;
 //! use sui_consistent_store::Reader;
 //! use sui_consistent_store::Schema;
 //! use sui_consistent_store::error::DecodeError;
@@ -65,11 +64,11 @@
 //!     }
 //! }
 //!
-//! struct MySchema<R: Reader = Live> {
+//! struct MySchema<R: Reader = Db> {
 //!     items: DbMap<U64Be, U64Be, R>,
 //! }
 //!
-//! impl Schema for MySchema<Live> {
+//! impl Schema for MySchema {
 //!     fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
 //!         vec![sui_consistent_store::CfDescriptor::new("items", base_options.clone())]
 //!     }
@@ -208,7 +207,6 @@ mod tests {
 
     use super::*;
     use crate::DbOptions;
-    use crate::Live;
     use crate::Reader;
     use crate::Schema;
     use crate::SchemaAtSnapshot;
@@ -240,11 +238,11 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestSchema<R: Reader = Live> {
+    struct TestSchema<R: Reader = Db> {
         items: DbMap<U64Be, U64Be, R>,
     }
 
-    impl Schema for TestSchema<Live> {
+    impl Schema for TestSchema {
         fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
             vec![crate::CfDescriptor::new("items", base_options.clone())]
         }
@@ -256,7 +254,7 @@ mod tests {
         }
     }
 
-    impl SchemaAtSnapshot for TestSchema<Live> {
+    impl SchemaAtSnapshot for TestSchema {
         type At = TestSchema<Snapshot>;
         fn at(&self, snap: &Snapshot) -> Self::At {
             TestSchema {

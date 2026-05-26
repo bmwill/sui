@@ -51,8 +51,6 @@ pub use crate::map::DbMap;
 pub use crate::object_source::LiveObjectSource;
 pub use crate::object_source::restore_pipeline_from_object_source;
 pub use crate::pipeline::Pipeline;
-pub use crate::reader::Live;
-pub use crate::reader::LiveRef;
 pub use crate::reader::Reader;
 pub use crate::restore_runner::RestoreRunner;
 pub use crate::restore_state::RESTORE_CF;

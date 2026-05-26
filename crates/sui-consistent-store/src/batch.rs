@@ -92,7 +92,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::Encode;
-use crate::Live;
 use crate::SstWriter;
 use crate::db::Db;
 use crate::encode_buf::with_encode_buf;
@@ -285,9 +284,9 @@ impl Batch {
     /// per-CF sorted map (one op per key); other modes stream into
     /// the internal [`rocksdb::WriteBatch`].
     ///
-    /// `map` is constrained to a [`Live`]-bound handle: writes always
-    /// go to the live tip, and snapshot-bound projections are
-    /// statically read-only.
+    /// `map` is constrained to a [`Db`]-bound handle: writes always
+    /// go to the live tip, and snapshot-bound projections (or
+    /// borrowed-`&Db` projections) are statically refused.
     ///
     /// On a shard-backed batch targeting a
     /// [`BulkIngest`](crate::RestoreMode::BulkIngest) CF, returns
@@ -295,7 +294,7 @@ impl Batch {
     /// if `key` already has a staged operation.
     pub fn put<K, V>(
         &mut self,
-        map: &DbMap<K, V, Live>,
+        map: &DbMap<K, V, Db>,
         key: &K,
         value: &V,
     ) -> Result<&mut Self, Error>
@@ -346,13 +345,13 @@ impl Batch {
 
     /// Stage a delete on the column family backing `map`.
     ///
-    /// `map` is constrained to a [`Live`]-bound handle.
+    /// `map` is constrained to a [`Db`]-bound handle.
     ///
     /// On a shard-backed batch targeting a
     /// [`BulkIngest`](crate::RestoreMode::BulkIngest) CF, returns
     /// [`Error::DuplicateShardOp`](crate::error::Error::DuplicateShardOp)
     /// if `key` already has a staged operation.
-    pub fn delete<K, V>(&mut self, map: &DbMap<K, V, Live>, key: &K) -> Result<&mut Self, Error>
+    pub fn delete<K, V>(&mut self, map: &DbMap<K, V, Db>, key: &K) -> Result<&mut Self, Error>
     where
         K: Encode,
     {
@@ -430,10 +429,10 @@ impl Batch {
     /// (for the write backing) or at read time after ingest (for
     /// the shard backing).
     ///
-    /// `map` is constrained to a [`Live`]-bound handle.
+    /// `map` is constrained to a [`Db`]-bound handle.
     pub fn merge<K, V>(
         &mut self,
-        map: &DbMap<K, V, Live>,
+        map: &DbMap<K, V, Db>,
         key: &K,
         operand: &V,
     ) -> Result<&mut Self, Error>

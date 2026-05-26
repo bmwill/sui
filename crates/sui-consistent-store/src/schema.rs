@@ -8,11 +8,11 @@
 //!
 //! Schemas are hand-written Rust structs whose fields are typed
 //! handles into individual column families ([`DbMap<K, V, R>`](crate::DbMap)).
-//! The struct is parameterized by a [`Reader`](crate::Reader) (defaulted
-//! to [`Live`](crate::Live)) so the same schema body serves both the
+//! The struct is parameterized by a [`Reader`](crate::Reader)
+//! (defaulted to [`Db`]) so the same schema body serves both the
 //! live tip and snapshot-bound projections.
 //!
-//! [`Schema`] is implemented for the live variant (`MySchema<Live>`)
+//! [`Schema`] is implemented for the live variant (`MySchema<Db>`)
 //! and pairs the static set of column families a schema requires
 //! ([`Schema::cfs`]) with the constructor that builds the schema
 //! struct from an opened database ([`Schema::open`]).
@@ -29,19 +29,18 @@
 //! use sui_consistent_store::Db;
 //! use sui_consistent_store::DbMap;
 //! use sui_consistent_store::DbOptions;
-//! use sui_consistent_store::Live;
 //! use sui_consistent_store::Reader;
 //! use sui_consistent_store::Schema;
 //! use sui_consistent_store::SchemaAtSnapshot;
 //! use sui_consistent_store::Snapshot;
 //! use sui_consistent_store::error::OpenError;
 //!
-//! struct MySchema<R: Reader = Live> {
+//! struct MySchema<R: Reader = Db> {
 //!     _reader: std::marker::PhantomData<R>,
 //!     _db: Db,
 //! }
 //!
-//! impl Schema for MySchema<Live> {
+//! impl Schema for MySchema {
 //!     fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
 //!         vec![CfDescriptor::new("my_cf", base_options.clone())]
 //!     }
@@ -54,7 +53,7 @@
 //!     }
 //! }
 //!
-//! impl SchemaAtSnapshot for MySchema<Live> {
+//! impl SchemaAtSnapshot for MySchema {
 //!     type At = MySchema<Snapshot>;
 //!     fn at(&self, _snap: &Snapshot) -> Self::At {
 //!         MySchema {
@@ -76,11 +75,10 @@ use crate::snapshot::Snapshot;
 /// typed handle struct against an opened database at the live tip.
 ///
 /// Implementations are typically hand-written structs parameterized
-/// by a [`Reader`](crate::Reader) (defaulted to [`Live`](crate::Live))
-/// whose fields are typed column-family handles. The trait itself is
-/// implemented only for the [`Live`](crate::Live) variant of the
-/// schema; snapshot-bound variants are constructed by re-binding,
-/// not by re-opening.
+/// by a [`Reader`](crate::Reader) (defaulted to [`Db`]) whose fields
+/// are typed column-family handles. The trait itself is implemented
+/// only for the [`Db`]-bound variant of the schema; snapshot-bound
+/// variants are constructed by re-binding, not by re-opening.
 ///
 /// The trait has two responsibilities:
 ///
