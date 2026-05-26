@@ -33,14 +33,14 @@
 //! same cost as today). [`Snapshot`](crate::Snapshot) owns a `Db`
 //! handle plus an `Arc<SnapshotEntry>` plus a `u64`; constructing
 //! one is two atomic increments. Each call to
-//! [`DbMap::at`](crate::DbMap::at) clones the column-family name
-//! ([`Box<str>`]) once *and* clones the snapshot (two `Arc` bumps),
-//! so re-projecting an N-CF schema costs N name clones, 2N `Arc`
-//! bumps, and N struct constructions per call to
+//! [`DbMap::at`](crate::DbMap::at) clones the snapshot (two `Arc`
+//! bumps); the column-family name is a [`&'static str`](prim@str),
+//! so it copies without allocating. Re-projecting an N-CF schema
+//! costs 2N `Arc` bumps and N struct constructions per call to
 //! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at). For a
-//! per-request handler that projects once and reads many times, this
-//! is amortized; for a hot path that projects on every read, project
-//! once outside the loop.
+//! per-request handler that projects once and reads many times,
+//! this is amortized; for a hot path that projects on every read,
+//! project once outside the loop.
 //!
 //! [`LiveRef`] and the `&Snapshot` blanket impl are the
 //! zero-`Arc`-bump variants: they hold a borrow rather than an owned

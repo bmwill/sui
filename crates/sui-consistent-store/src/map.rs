@@ -142,7 +142,7 @@ use crate::snapshot::Snapshot;
 #[derive(Debug)]
 pub struct DbMap<K, V, R: Reader = Live> {
     reader: R,
-    cf_name: Box<str>,
+    cf_name: &'static str,
     _data: PhantomData<fn(K) -> V>,
 }
 
@@ -174,9 +174,8 @@ impl<K, V> DbMap<K, V, Live> {
     /// then call [`DbMap::at`] (or use
     /// [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) for the
     /// whole-schema equivalent).
-    pub fn new(db: Db, cf_name: impl Into<Box<str>>) -> Result<Self, OpenError> {
-        let cf_name = cf_name.into();
-        if db.cf_handle(&cf_name).is_none() {
+    pub fn new(db: Db, cf_name: &'static str) -> Result<Self, OpenError> {
+        if db.cf_handle(cf_name).is_none() {
             return Err(OpenError::msg(format!(
                 "column family `{cf_name}` is not registered",
             )));
@@ -204,9 +203,8 @@ impl<'a, K, V> DbMap<K, V, LiveRef<'a>> {
     /// function body and can be tied to a [`Db`] the caller already
     /// holds — it avoids the per-handle `Arc` bump that
     /// [`DbMap::new`] pays.
-    pub fn new_ref(db: &'a Db, cf_name: impl Into<Box<str>>) -> Result<Self, OpenError> {
-        let cf_name = cf_name.into();
-        if db.cf_handle(&cf_name).is_none() {
+    pub fn new_ref(db: &'a Db, cf_name: &'static str) -> Result<Self, OpenError> {
+        if db.cf_handle(cf_name).is_none() {
             return Err(OpenError::msg(format!(
                 "column family `{cf_name}` is not registered",
             )));
@@ -227,9 +225,10 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     /// database state at the snapshot's checkpoint regardless of
     /// writes that occurred after
     /// [`Db::take_snapshot`](crate::Db::take_snapshot) was called.
-    /// The returned handle owns its column-family name (a `Box<str>`
-    /// clone) and owns a clone of `snap` (two `Arc` bumps), so it is
-    /// self-contained and can outlive the originating `Snapshot`.
+    /// The returned handle owns a clone of `snap` (two `Arc`
+    /// bumps), so it is self-contained and can outlive the
+    /// originating `Snapshot`. The column-family name is a
+    /// [`&'static str`](prim@str), so re-binding does not allocate.
     ///
     /// # Panics
     ///
@@ -246,7 +245,7 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
         );
         DbMap {
             reader: snap.clone(),
-            cf_name: self.cf_name.clone(),
+            cf_name: self.cf_name,
             _data: PhantomData,
         }
     }
@@ -255,9 +254,10 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     /// at a borrowed [`Snapshot`] rather than cloning it.
     ///
     /// Returns a new [`DbMap`] whose reader is `&'a Snapshot`,
-    /// tied to the lifetime of `snap`. The cf-name [`Box<str>`]
-    /// is still cloned (one allocation per returned handle), but
-    /// the snapshot's two `Arc`s are not bumped.
+    /// tied to the lifetime of `snap`. The snapshot's two `Arc`s
+    /// are not bumped, and the column-family name is a
+    /// [`&'static str`](prim@str) (no allocation), so the re-bind
+    /// is essentially free.
     ///
     /// # Panics
     ///
@@ -270,7 +270,7 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
         );
         DbMap {
             reader: snap,
-            cf_name: self.cf_name.clone(),
+            cf_name: self.cf_name,
             _data: PhantomData,
         }
     }
@@ -278,7 +278,7 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     fn cf(&self) -> Result<Arc<rocksdb::BoundColumnFamily<'_>>, Error> {
         self.reader
             .db()
-            .cf_handle(&self.cf_name)
+            .cf_handle(self.cf_name)
             .ok_or_else(|| Error::MissingColumnFamily(self.cf_name.to_string()))
     }
 
@@ -290,8 +290,8 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     }
 
     /// The name of the column family this handle is bound to.
-    pub(crate) fn cf_name(&self) -> &str {
-        &self.cf_name
+    pub(crate) fn cf_name(&self) -> &'static str {
+        self.cf_name
     }
 }
 
