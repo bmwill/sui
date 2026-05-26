@@ -70,6 +70,7 @@ use crate::iter::RevIter;
 use crate::iter::prefix_to_byte_bounds;
 use crate::iter::range_to_byte_bounds;
 use crate::reader::Live;
+use crate::reader::LiveRef;
 use crate::reader::Reader;
 use crate::snapshot::Snapshot;
 
@@ -188,6 +189,36 @@ impl<K, V> DbMap<K, V, Live> {
     }
 }
 
+impl<'a, K, V> DbMap<K, V, LiveRef<'a>> {
+    /// Borrowed counterpart to [`DbMap::new`]: construct a typed
+    /// handle for the column family named `cf_name` at the
+    /// database's live tip, bound to a borrowed [`Db`] handle
+    /// rather than an owned (cloned) one.
+    ///
+    /// Returns an [`OpenError`] if the named column family is not
+    /// registered on `db`. The returned [`DbMap`] borrows `db` for
+    /// the lifetime `'a`; it cannot outlive the borrow it was
+    /// constructed from.
+    ///
+    /// Use this when the resulting handle is scoped to a single
+    /// function body and can be tied to a [`Db`] the caller already
+    /// holds — it avoids the per-handle `Arc` bump that
+    /// [`DbMap::new`] pays.
+    pub fn new_ref(db: &'a Db, cf_name: impl Into<Box<str>>) -> Result<Self, OpenError> {
+        let cf_name = cf_name.into();
+        if db.cf_handle(&cf_name).is_none() {
+            return Err(OpenError::msg(format!(
+                "column family `{cf_name}` is not registered",
+            )));
+        }
+        Ok(Self {
+            reader: LiveRef::new(db),
+            cf_name,
+            _data: PhantomData,
+        })
+    }
+}
+
 impl<K, V, R: Reader> DbMap<K, V, R> {
     /// Re-bind this handle at a captured snapshot.
     ///
@@ -215,6 +246,30 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
         );
         DbMap {
             reader: snap.clone(),
+            cf_name: self.cf_name.clone(),
+            _data: PhantomData,
+        }
+    }
+
+    /// Borrowed counterpart to [`DbMap::at`]: re-bind this handle
+    /// at a borrowed [`Snapshot`] rather than cloning it.
+    ///
+    /// Returns a new [`DbMap`] whose reader is `&'a Snapshot`,
+    /// tied to the lifetime of `snap`. The cf-name [`Box<str>`]
+    /// is still cloned (one allocation per returned handle), but
+    /// the snapshot's two `Arc`s are not bumped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `snap` was taken on a different [`Db`] than this
+    /// handle is bound to; see [`DbMap::at`] for the rationale.
+    pub fn at_ref<'a>(&self, snap: &'a Snapshot) -> DbMap<K, V, &'a Snapshot> {
+        assert!(
+            self.reader.db().ptr_eq(snap.db()),
+            "snapshot was taken on a different Db than this DbMap is bound to",
+        );
+        DbMap {
+            reader: snap,
             cf_name: self.cf_name.clone(),
             _data: PhantomData,
         }
@@ -655,6 +710,29 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (db, schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
         (dir, db, schema)
+    }
+
+    #[test]
+    fn new_ref_errors_on_unknown_cf() {
+        let (_dir, db, _schema) = open();
+        let err = DbMap::<U64Be, U64Be, LiveRef<'_>>::new_ref(&db, "missing").unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn new_ref_reads_live_tip() {
+        // Construct a LiveRef-bound DbMap against a borrowed Db and
+        // verify reads see writes committed through the Live-bound
+        // schema. Avoids the per-handle Arc bump that DbMap::new
+        // pays.
+        let (_dir, db, schema) = open();
+        let mut batch = db.batch();
+        batch.put(&schema.items, &U64Be(1), &U64Be(10)).unwrap();
+        batch.commit().unwrap();
+
+        let items_ref: DbMap<U64Be, U64Be, LiveRef<'_>> =
+            DbMap::new_ref(&db, "items").unwrap();
+        assert_eq!(items_ref.get(&U64Be(1)).unwrap(), Some(U64Be(10)));
     }
 
     #[test]

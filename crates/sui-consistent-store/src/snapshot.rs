@@ -180,6 +180,28 @@ impl fmt::Debug for Snapshot {
     }
 }
 
+/// Blanket [`Reader`] impl for `&Snapshot`, the zero-`Arc`-bump
+/// counterpart to the owned [`Snapshot`] reader.
+///
+/// Use a borrowed snapshot via
+/// [`DbMap::at_ref`](crate::DbMap::at_ref) when the re-bound
+/// [`DbMap`](crate::DbMap) is scoped to a single function body and
+/// can borrow a [`Snapshot`] the caller already holds, instead of
+/// cloning it (two atomic increments) for every
+/// [`DbMap`](crate::DbMap) re-bind. Delegates to [`Snapshot`]'s
+/// own [`Reader`] impl, so the semantics are identical.
+impl sealed::Sealed for &Snapshot {}
+
+impl Reader for &Snapshot {
+    fn db(&self) -> &Db {
+        (**self).db()
+    }
+
+    fn read_options(&self) -> ReadOptions {
+        (**self).read_options()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -618,4 +640,72 @@ mod tests {
         let snap_schema = schema.at(&snap);
         assert_eq!(snap_schema.items.get(&U64Be(1)).unwrap(), Some(U64Be(100)),);
     }
+
+    #[test]
+    fn at_ref_reads_pre_snapshot_state() {
+        // SnapshotRef variant of `snapshot_sees_state_at_take_time`:
+        // re-bind the map at a borrowed snapshot instead of an
+        // owned (cloned) one, then confirm reads still see the
+        // captured state.
+        let (_dir, db, schema) = open();
+        put(&db, &schema, 1, 100);
+        db.take_snapshot(1);
+        put(&db, &schema, 1, 999);
+
+        let snap = db.at_snapshot(1).unwrap();
+        let snap_items = schema.items.at_ref(&snap);
+        assert_eq!(snap_items.get(&U64Be(1)).unwrap(), Some(U64Be(100)));
+    }
+
+    #[test]
+    fn at_ref_does_not_clone_the_snapshot() {
+        // The borrowed re-bind must not bump the SnapshotEntry's
+        // refcount. Take a snapshot, hold one extra clone (refcount
+        // = 2), re-bind via at_ref, and verify the refcount stays
+        // at 2 — proving no Arc clone happened in `at_ref`.
+        let (_dir, db, schema) = open();
+        put(&db, &schema, 1, 100);
+        db.take_snapshot(1);
+        let snap = db.at_snapshot(1).unwrap();
+        let _extra = snap.clone();
+        // The buffer also holds an Arc<SnapshotEntry>, so the
+        // entry's strong count is 3 here (snap + extra + buffer).
+        let before = std::sync::Arc::strong_count(&snap.entry);
+        let _items_ref = schema.items.at_ref(&snap);
+        let after = std::sync::Arc::strong_count(&snap.entry);
+        assert_eq!(before, after, "at_ref must not bump the entry refcount");
+    }
+
+    #[test]
+    fn at_ref_iter_yields_pre_snapshot_state() {
+        // Iteration through a SnapshotRef-bound map should produce
+        // the same view as iteration through a Snapshot-bound one.
+        let (_dir, db, schema) = open();
+        put(&db, &schema, 1, 10);
+        put(&db, &schema, 3, 30);
+        db.take_snapshot(1);
+        put(&db, &schema, 2, 20);
+
+        let snap = db.at_snapshot(1).unwrap();
+        let snap_items = schema.items.at_ref(&snap);
+        let collected: Vec<_> = snap_items.iter(..).unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            collected,
+            vec![(U64Be(1), U64Be(10)), (U64Be(3), U64Be(30))],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "snapshot was taken on a different Db")]
+    fn at_ref_panics_when_snapshot_is_from_a_different_db() {
+        // Mirrors the owned-snapshot version: cross-Db re-binding
+        // is a programmer error on the borrowed path too.
+        let (_dir_a, db_a, schema_a) = open();
+        let (_dir_b, db_b, _schema_b) = open();
+        db_b.take_snapshot(1);
+        let snap_b = db_b.at_snapshot(1).unwrap();
+        let _ = &db_a;
+        let _ = schema_a.items.at_ref(&snap_b);
+    }
+
 }

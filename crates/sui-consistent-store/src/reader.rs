@@ -1,8 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The [`Reader`] trait and its two implementations,
-//! [`Live`] and [`Snapshot`](crate::Snapshot).
+//! The [`Reader`] trait and its implementations: [`Live`] /
+//! [`LiveRef`] (live-tip) and [`Snapshot`](crate::Snapshot), plus a
+//! blanket impl on `&Snapshot` for the borrowed snapshot-bound
+//! case.
 //!
 //! Every [`DbMap<K, V, R>`](crate::DbMap) is parameterized by a
 //! [`Reader`]. The default is [`Live`], so today's call sites
@@ -39,6 +41,16 @@
 //! per-request handler that projects once and reads many times, this
 //! is amortized; for a hot path that projects on every read, project
 //! once outside the loop.
+//!
+//! [`LiveRef`] and the `&Snapshot` blanket impl are the
+//! zero-`Arc`-bump variants: they hold a borrow rather than an owned
+//! [`Db`] / [`Snapshot`](crate::Snapshot). Construct a
+//! [`LiveRef`]-bound map with [`DbMap::new_ref`](crate::DbMap::new_ref);
+//! re-bind an existing map at a borrowed snapshot with
+//! [`DbMap::at_ref`](crate::DbMap::at_ref). Use these when the
+//! returned [`DbMap`](crate::DbMap) is scoped to a single function
+//! body and can be tied to a [`Db`] or
+//! [`Snapshot`](crate::Snapshot) the caller already holds.
 
 use rocksdb::ReadOptions;
 
@@ -46,21 +58,24 @@ use crate::db::Db;
 
 /// Abstracts the read context a [`DbMap`](crate::DbMap) is bound to.
 ///
-/// Both implementations supply (1) the [`Db`] handle needed to look
-/// up the column-family handle and (2) a fresh [`ReadOptions`]
-/// tuned for the reader's consistency context. [`Live`] returns
-/// [`ReadOptions::default()`]; [`Snapshot`](crate::Snapshot) returns
-/// one with [`set_snapshot`](ReadOptions::set_snapshot) pointed at
-/// the captured snapshot.
+/// Every implementation supplies (1) the [`Db`] handle needed to
+/// look up the column-family handle and (2) a fresh [`ReadOptions`]
+/// tuned for the reader's consistency context. [`Live`] and
+/// [`LiveRef`] return [`ReadOptions::default()`];
+/// [`Snapshot`](crate::Snapshot) (and its `&Snapshot` blanket impl)
+/// return one with [`set_snapshot`](ReadOptions::set_snapshot)
+/// pointed at the captured snapshot.
 ///
 /// # Sealed
 ///
-/// The crate ships exactly two implementations, [`Live`] and
-/// [`Snapshot`](crate::Snapshot). The trait is sealed via a
-/// pub(crate) supertrait so downstream code cannot add a third — a
-/// custom reader could return [`ReadOptions`] referencing a snapshot
-/// pointer not co-owned through the [`Db`] handle story, leading
-/// to UB inside RocksDB.
+/// The crate ships three implementations — [`Live`], [`LiveRef`],
+/// and [`Snapshot`](crate::Snapshot) — plus a blanket impl on
+/// `&Snapshot` that delegates to [`Snapshot`](crate::Snapshot)'s
+/// own impl. The trait is sealed via a pub(crate) supertrait so
+/// downstream code cannot add another — a custom reader could
+/// return [`ReadOptions`] referencing a snapshot pointer not
+/// co-owned through the [`Db`] handle story, leading to UB inside
+/// RocksDB.
 pub trait Reader: sealed::Sealed {
     /// The shared database handle the column family lives on.
     fn db(&self) -> &Db;
@@ -77,6 +92,7 @@ pub trait Reader: sealed::Sealed {
 pub(crate) mod sealed {
     pub trait Sealed {}
     impl Sealed for super::Live {}
+    impl<'a> Sealed for super::LiveRef<'a> {}
 }
 
 /// Reader bound to the database's live tip.
@@ -100,6 +116,40 @@ impl Live {
 impl Reader for Live {
     fn db(&self) -> &Db {
         &self.db
+    }
+
+    fn read_options(&self) -> ReadOptions {
+        ReadOptions::default()
+    }
+}
+
+/// Borrowed counterpart to [`Live`]. Reads from the database's live
+/// tip without taking ownership of (or cloning) the underlying
+/// [`Db`] handle.
+///
+/// Construct a [`DbMap`](crate::DbMap) bound to `LiveRef` via
+/// [`DbMap::new_ref`](crate::DbMap::new_ref). Use this when the
+/// resulting handle is scoped to a single function body and can
+/// borrow a [`Db`] the caller already holds, instead of paying an
+/// extra `Arc` bump per [`DbMap`](crate::DbMap) field.
+///
+/// `LiveRef` is `Copy + Clone` (it is just a reference); cloning
+/// does no work.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveRef<'a> {
+    db: &'a Db,
+}
+
+impl<'a> LiveRef<'a> {
+    /// Construct a `LiveRef` bound to `db`.
+    pub fn new(db: &'a Db) -> Self {
+        Self { db }
+    }
+}
+
+impl<'a> Reader for LiveRef<'a> {
+    fn db(&self) -> &Db {
+        self.db
     }
 
     fn read_options(&self) -> ReadOptions {
