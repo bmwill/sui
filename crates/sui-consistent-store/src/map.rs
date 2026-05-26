@@ -71,8 +71,7 @@ use crate::iter::prefix_to_byte_bounds;
 use crate::iter::range_to_byte_bounds;
 use crate::reader::Live;
 use crate::reader::Reader;
-use crate::reader::Snapshot;
-use crate::snapshot::SnapshotHandle;
+use crate::snapshot::Snapshot;
 
 /// A typed handle to a single column family on a [`Db`], bound to a
 /// [`Reader`] that pins its consistency context.
@@ -195,12 +194,13 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     /// Re-bind this handle at a captured snapshot.
     ///
     /// Returns a new [`DbMap`] whose reader is
-    /// [`Snapshot<'s>`](crate::Snapshot), so subsequent reads see
-    /// the database state at the snapshot's checkpoint regardless
-    /// of writes that occurred after [`Db::take_snapshot`](crate::Db::take_snapshot)
-    /// was called. The returned handle owns its column-family name
-    /// (a `Box<str>` clone) and borrows from `snap` for the snapshot
-    /// reader.
+    /// [`Snapshot`](crate::Snapshot), so subsequent reads see the
+    /// database state at the snapshot's checkpoint regardless of
+    /// writes that occurred after
+    /// [`Db::take_snapshot`](crate::Db::take_snapshot) was called.
+    /// The returned handle owns its column-family name (a `Box<str>`
+    /// clone) and owns a clone of `snap` (two `Arc` bumps), so it is
+    /// self-contained and can outlive the originating `Snapshot`.
     ///
     /// # Panics
     ///
@@ -210,13 +210,13 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     /// handle's, and silently reading from the wrong CF (or hitting
     /// a `MissingColumnFamily` error one read later) would mask the
     /// underlying bug.
-    pub fn at<'s>(&self, snap: &'s SnapshotHandle) -> DbMap<K, V, Snapshot<'s>> {
+    pub fn at(&self, snap: &Snapshot) -> DbMap<K, V, Snapshot> {
         assert!(
             Arc::ptr_eq(self.reader.db(), snap.db()),
             "snapshot was taken on a different Db than this DbMap is bound to",
         );
         DbMap {
-            reader: Snapshot::new(snap),
+            reader: snap.clone(),
             cf_name: self.cf_name.clone(),
             _data: PhantomData,
         }

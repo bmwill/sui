@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The [`Reader`] trait and its two implementations,
-//! [`Live`] and [`Snapshot`].
+//! [`Live`] and [`Snapshot`](crate::Snapshot).
 //!
 //! Every [`DbMap<K, V, R>`](crate::DbMap) is parameterized by a
 //! [`Reader`]. The default is [`Live`], so today's call sites
@@ -11,14 +11,14 @@
 //! captured snapshot — via
 //! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) or
 //! [`DbMap::at`](crate::DbMap::at) — produces a parallel handle whose
-//! reader is [`Snapshot<'s>`].
+//! reader is [`Snapshot`](crate::Snapshot).
 //!
 //! # Why this exists
 //!
 //! The crate previously routed snapshot reads through an entirely
-//! separate type ([`SnapshotHandle`]'s read methods, plus a borrowed
-//! `SnapshotView`). That kept the read API duplicated and forced
-//! call sites to choose between `map.get(&k)?` (live) and
+//! separate type (the snapshot handle's read methods, plus a
+//! borrowed `SnapshotView`). That kept the read API duplicated and
+//! forced call sites to choose between `map.get(&k)?` (live) and
 //! `snap.get(&map, &k)?` (snapshot). With the reader generic, both
 //! call sites read identically: the choice of consistency context is
 //! made once, at the point the schema or map is bound, and from
@@ -27,12 +27,13 @@
 //!
 //! # Cost model
 //!
-//! `Live` owns an `Arc<Db>` (one Arc clone per [`DbMap`] field, same
-//! cost as today). `Snapshot<'s>` borrows the
-//! [`SnapshotHandle`] — zero allocation. Each call to
-//! [`DbMap::at`](crate::DbMap::at) clones the column-family name
-//! ([`Box<str>`]) once, so re-projecting an N-CF schema costs N name
-//! clones and N struct constructions per call to
+//! `Live` owns an [`Arc<Db>`] (one `Arc` clone per [`DbMap`] field,
+//! same cost as today). [`Snapshot`](crate::Snapshot) owns two
+//! `Arc`s plus a `u64`; constructing one is two atomic increments.
+//! Each call to [`DbMap::at`](crate::DbMap::at) clones the
+//! column-family name ([`Box<str>`]) once *and* clones the snapshot
+//! (two `Arc` bumps), so re-projecting an N-CF schema costs N name
+//! clones, 2N `Arc` bumps, and N struct constructions per call to
 //! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at). For a
 //! per-request handler that projects once and reads many times, this
 //! is amortized; for a hot path that projects on every read, project
@@ -43,26 +44,25 @@ use std::sync::Arc;
 use rocksdb::ReadOptions;
 
 use crate::db::Db;
-use crate::snapshot::SnapshotHandle;
 
 /// Abstracts the read context a [`DbMap`](crate::DbMap) is bound to.
 ///
 /// Both implementations supply (1) the [`Arc<Db>`] needed to look up
 /// the column-family handle and (2) a fresh [`ReadOptions`] tuned for
 /// the reader's consistency context. [`Live`] returns
-/// [`ReadOptions::default()`]; [`Snapshot`] returns one with
-/// [`set_snapshot`](ReadOptions::set_snapshot) pointed at the
-/// captured snapshot.
+/// [`ReadOptions::default()`]; [`Snapshot`](crate::Snapshot) returns
+/// one with [`set_snapshot`](ReadOptions::set_snapshot) pointed at
+/// the captured snapshot.
 ///
 /// # Sealed
 ///
 /// The crate ships exactly two implementations, [`Live`] and
-/// [`Snapshot`]. The trait is sealed via a private supertrait so
-/// downstream code cannot add a third — a custom reader could
-/// return [`ReadOptions`] referencing a snapshot pointer not
-/// co-owned through the [`Arc<Db>`] story, leading to UB inside
-/// RocksDB.
-pub trait Reader: private::Sealed {
+/// [`Snapshot`](crate::Snapshot). The trait is sealed via a
+/// pub(crate) supertrait so downstream code cannot add a third — a
+/// custom reader could return [`ReadOptions`] referencing a snapshot
+/// pointer not co-owned through the [`Arc<Db>`] story, leading to UB
+/// inside RocksDB.
+pub trait Reader: sealed::Sealed {
     /// The shared database handle the column family lives on.
     fn db(&self) -> &Arc<Db>;
 
@@ -75,10 +75,9 @@ pub trait Reader: private::Sealed {
     fn read_options(&self) -> ReadOptions;
 }
 
-mod private {
+pub(crate) mod sealed {
     pub trait Sealed {}
     impl Sealed for super::Live {}
-    impl Sealed for super::Snapshot<'_> {}
 }
 
 /// Reader bound to the database's live tip.
@@ -106,45 +105,5 @@ impl Reader for Live {
 
     fn read_options(&self) -> ReadOptions {
         ReadOptions::default()
-    }
-}
-
-/// Reader bound to a captured snapshot.
-///
-/// Borrows the [`SnapshotHandle`] so the projection's lifetime is
-/// tied to the caller's handle. Constructed via
-/// [`DbMap::at`](crate::DbMap::at) or
-/// [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) rather than
-/// directly.
-///
-/// All reads through a [`DbMap`](crate::DbMap) parameterized by
-/// `Snapshot<'s>` see the database state captured by
-/// [`Db::take_snapshot`](crate::Db::take_snapshot), regardless of
-/// writes that occur after the snapshot was taken.
-#[derive(Debug, Clone, Copy)]
-pub struct Snapshot<'s> {
-    handle: &'s SnapshotHandle,
-}
-
-impl<'s> Snapshot<'s> {
-    pub(crate) fn new(handle: &'s SnapshotHandle) -> Self {
-        Self { handle }
-    }
-
-    /// The underlying [`SnapshotHandle`] this reader borrows.
-    pub fn handle(&self) -> &'s SnapshotHandle {
-        self.handle
-    }
-}
-
-impl<'s> Reader for Snapshot<'s> {
-    fn db(&self) -> &Arc<Db> {
-        self.handle.db()
-    }
-
-    fn read_options(&self) -> ReadOptions {
-        let mut opts = ReadOptions::default();
-        opts.set_snapshot(self.handle.entry().as_snapshot());
-        opts
     }
 }

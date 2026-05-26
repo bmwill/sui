@@ -10,7 +10,7 @@
 //!
 //! `Db` also holds the in-memory snapshot buffer used to serve
 //! consistent reads at a given checkpoint. See [`take_snapshot`],
-//! [`at_snapshot`], and [`SnapshotHandle`](crate::SnapshotHandle).
+//! [`at_snapshot`], and [`Snapshot`](crate::Snapshot).
 //!
 //! RocksDB is internally thread-safe; the only external locking the
 //! crate adds is a [`parking_lot::RwLock`] over the snapshot buffer.
@@ -40,7 +40,7 @@ use crate::restore_state::RestoreState;
 use crate::schema::CfDescriptor;
 use crate::schema::RestoreMode;
 use crate::schema::Schema;
-use crate::snapshot::SnapshotHandle;
+use crate::snapshot::Snapshot;
 
 /// Configuration for opening a [`Db`].
 ///
@@ -133,10 +133,10 @@ pub struct Db {
 /// 1. `Db::inner` is declared after `Db::snapshots`, so `inner` is
 ///    dropped only after every retained snapshot has dropped (and
 ///    released its borrow).
-/// 2. Outstanding [`SnapshotHandle`]s co-own the same [`Arc<Db>`],
-///    so `Db` cannot drop while a handle exists. Field ordering
-///    inside `SnapshotHandle` ensures the `Arc<SnapshotEntry>` drops
-///    before the `Arc<Db>`.
+/// 2. Outstanding [`Snapshot`](crate::Snapshot) values co-own the
+///    same [`Arc<Db>`], so `Db` cannot drop while a `Snapshot`
+///    exists. Field ordering inside `Snapshot` ensures the
+///    `Arc<SnapshotEntry>` drops before the `Arc<Db>`.
 pub(crate) struct SnapshotEntry {
     snapshot: rocksdb::Snapshot<'static>,
 }
@@ -327,11 +327,11 @@ impl Db {
         // and overwrite a fresher snapshot.
         let mut snaps = self.snapshots.write();
         let snapshot = self.inner.snapshot();
-        // SAFETY: `Snapshot::<'_, rocksdb::DB>::'_` is a borrow of
+        // SAFETY: `rocksdb::Snapshot<'_>` is a borrow of
         // `self.inner`. The transmute to `'static` is sound because
         // (1) `Db::inner` is declared after `Db::snapshots`, so
         // `inner` outlives every snapshot retained in the map; and
-        // (2) `SnapshotHandle`s co-own `Arc<Db>` and drop their
+        // (2) `Snapshot`s co-own `Arc<Db>` and drop their
         // `Arc<SnapshotEntry>` before their `Arc<Db>`, so no
         // snapshot can survive a `Db` drop.
         let snapshot: rocksdb::Snapshot<'static> = unsafe { std::mem::transmute(snapshot) };
@@ -346,12 +346,12 @@ impl Db {
     /// Look up the snapshot stored at `checkpoint`.
     ///
     /// Returns `None` if no snapshot exists at that checkpoint.
-    /// Cloning the returned [`SnapshotHandle`] is cheap; clones share
-    /// the same underlying snapshot.
-    pub fn at_snapshot(self: &Arc<Self>, checkpoint: u64) -> Option<SnapshotHandle> {
+    /// Cloning the returned [`Snapshot`](crate::Snapshot) is cheap;
+    /// clones share the same underlying snapshot.
+    pub fn at_snapshot(self: &Arc<Self>, checkpoint: u64) -> Option<Snapshot> {
         let snaps = self.snapshots.read();
         let entry = snaps.get(&checkpoint)?.clone();
-        Some(SnapshotHandle::new(self.clone(), entry, checkpoint))
+        Some(Snapshot::new(self.clone(), entry, checkpoint))
     }
 
     /// Look up the snapshot with the highest checkpoint number in
@@ -361,14 +361,10 @@ impl Db {
     /// been evicted or dropped). Equivalent to
     /// [`at_snapshot`](Self::at_snapshot) called with the upper
     /// bound of [`snapshot_range`](Self::snapshot_range).
-    pub fn latest_snapshot(self: &Arc<Self>) -> Option<SnapshotHandle> {
+    pub fn latest_snapshot(self: &Arc<Self>) -> Option<Snapshot> {
         let snaps = self.snapshots.read();
         let (checkpoint, entry) = snaps.iter().next_back()?;
-        Some(SnapshotHandle::new(
-            self.clone(),
-            entry.clone(),
-            *checkpoint,
-        ))
+        Some(Snapshot::new(self.clone(), entry.clone(), *checkpoint))
     }
 
     /// Returns the inclusive range of checkpoints covered by the
@@ -678,9 +674,9 @@ impl Db {
     /// Drop the snapshot at `checkpoint`. Returns `true` if a
     /// snapshot was removed.
     ///
-    /// Outstanding [`SnapshotHandle`]s for this checkpoint remain
-    /// usable until they themselves drop; only the buffer's
-    /// reference is released.
+    /// Outstanding [`Snapshot`](crate::Snapshot) values for this
+    /// checkpoint remain usable until they themselves drop; only the
+    /// buffer's reference is released.
     pub fn drop_snapshot(&self, checkpoint: u64) -> bool {
         self.snapshots.write().remove(&checkpoint).is_some()
     }

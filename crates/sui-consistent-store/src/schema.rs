@@ -18,7 +18,7 @@
 //! struct from an opened database ([`Schema::open`]).
 //!
 //! [`SchemaAtSnapshot`] is a separate trait the schema author opts
-//! into; it declares a `MySchema<Snapshot<'s>>` projection and a
+//! into; it declares a `MySchema<Snapshot>` projection and a
 //! one-line constructor that re-binds each field via
 //! [`DbMap::at`](crate::DbMap::at).
 //!
@@ -36,7 +36,6 @@
 //! use sui_consistent_store::Schema;
 //! use sui_consistent_store::SchemaAtSnapshot;
 //! use sui_consistent_store::Snapshot;
-//! use sui_consistent_store::SnapshotHandle;
 //! use sui_consistent_store::error::OpenError;
 //!
 //! struct MySchema<R: Reader = Live> {
@@ -58,8 +57,8 @@
 //! }
 //!
 //! impl SchemaAtSnapshot for MySchema<Live> {
-//!     type At<'s> = MySchema<Snapshot<'s>>;
-//!     fn at<'s>(&'s self, _snap: &'s SnapshotHandle) -> Self::At<'s> {
+//!     type At = MySchema<Snapshot>;
+//!     fn at(&self, _snap: &Snapshot) -> Self::At {
 //!         MySchema {
 //!             _reader: std::marker::PhantomData,
 //!             _db: self._db.clone(),
@@ -75,7 +74,7 @@ use std::sync::Arc;
 
 use crate::db::Db;
 use crate::error::OpenError;
-use crate::snapshot::SnapshotHandle;
+use crate::snapshot::Snapshot;
 
 /// Declares the column families a database needs and constructs the
 /// typed handle struct against an opened database at the live tip.
@@ -239,9 +238,9 @@ impl CfDescriptor {
     }
 }
 
-/// Re-binds a [`Schema`] at a captured [`SnapshotHandle`].
+/// Re-binds a [`Schema`] at a captured [`Snapshot`].
 ///
-/// The schema author declares the projection's body type as `At<'s>`
+/// The schema author declares the projection's body type as `At`
 /// and writes a one-line constructor that re-binds each field via
 /// [`DbMap::at`](crate::DbMap::at). The trait is independent of
 /// [`Schema`] so authors who never need snapshot-bound reads can
@@ -250,24 +249,28 @@ impl CfDescriptor {
 /// # Cost
 ///
 /// Each call to [`at`](Self::at) constructs a fresh schema struct
-/// containing a [`DbMap<_, _, Snapshot<'s>>`](crate::DbMap) per
-/// field. Each per-field re-bind clones the column-family name (a
-/// `Box<str>` allocation). For an N-CF schema this is N allocations
-/// per re-bind. Re-bind once per request handler and read many
-/// times against the same projection.
+/// containing a [`DbMap<_, _, Snapshot>`](crate::DbMap) per field.
+/// Each per-field re-bind clones the column-family name (a
+/// `Box<str>` allocation) and clones the [`Snapshot`] (two `Arc`
+/// bumps). For an N-CF schema this is N allocations and 2N `Arc`
+/// bumps per re-bind. Re-bind once per request handler and read
+/// many times against the same projection.
 pub trait SchemaAtSnapshot {
-    /// The projected schema body — typically `MySchema<Snapshot<'s>>`
+    /// The projected schema body — typically `MySchema<Snapshot>`
     /// when the schema is parameterized by a [`Reader`](crate::Reader).
-    type At<'s>
-    where
-        Self: 's;
+    ///
+    /// Because [`Snapshot`] is an owned, lifetime-free reader, the
+    /// projection is self-contained: it can be stored in a struct
+    /// or moved into a spawned task without dragging a borrow on
+    /// the originating [`Snapshot`] value.
+    type At;
 
     /// Re-bind this schema at `snap`.
     ///
     /// The returned projection's reads see the database state
     /// captured by the snapshot, regardless of writes that occur
     /// after [`Db::take_snapshot`](crate::Db::take_snapshot) was
-    /// called. The projection borrows from both `self` and `snap`;
-    /// either ending its borrow ends the projection.
-    fn at<'s>(&'s self, snap: &'s SnapshotHandle) -> Self::At<'s>;
+    /// called. The projection owns clones of `snap` (one per field)
+    /// and is independent of `self` after construction.
+    fn at(&self, snap: &Snapshot) -> Self::At;
 }

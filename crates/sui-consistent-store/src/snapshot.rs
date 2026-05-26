@@ -3,28 +3,30 @@
 
 //! Consistent reads against a captured snapshot.
 //!
-//! [`SnapshotHandle`] is a cheap-to-clone token returned by
+//! [`Snapshot`] is a cheap-to-clone token returned by
 //! [`Db::at_snapshot`](crate::Db::at_snapshot) (or
-//! [`Db::latest_snapshot`](crate::Db::latest_snapshot)). It is the
-//! borrow point used to construct snapshot-bound reads via
+//! [`Db::latest_snapshot`](crate::Db::latest_snapshot)) that doubles
+//! as a [`Reader`](crate::Reader) for snapshot-bound reads. It is
+//! the token used to construct snapshot-bound projections via
 //! [`DbMap::at`](crate::DbMap::at) (single CF) or
 //! [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) (whole
-//! schema). The handle itself does not expose read methods — reads
-//! always go through a [`DbMap<_, _, Snapshot<'_>>`](crate::DbMap)
+//! schema). The token itself does not expose read methods — reads
+//! always go through a [`DbMap<_, _, Snapshot>`](crate::DbMap)
 //! produced by re-binding.
 //!
-//! # Lifetimes and ownership
+//! # Ownership
 //!
-//! The handle co-owns an [`Arc<Db>`] and an [`Arc<SnapshotEntry>`]
+//! `Snapshot` co-owns an [`Arc<Db>`] and an [`Arc<SnapshotEntry>`]
 //! ([`SnapshotEntry`](crate::db::SnapshotEntry) is private). As long
-//! as a handle (or any clone of it) exists, the underlying snapshot
-//! is kept alive even if [`Db::drop_snapshot`](crate::Db::drop_snapshot)
-//! has been called for that checkpoint or the snapshot has been
-//! evicted from the buffer by capacity pressure.
+//! as a `Snapshot` (or any clone of it) exists, the underlying
+//! snapshot is kept alive even if
+//! [`Db::drop_snapshot`](crate::Db::drop_snapshot) has been called
+//! for that checkpoint or the snapshot has been evicted from the
+//! buffer by capacity pressure.
 //!
-//! Snapshot-bound [`DbMap`](crate::DbMap)s constructed from a handle
-//! borrow from it; the handle must outlive any such re-binding (and
-//! the iterators those re-bindings produce).
+//! Snapshot-bound [`DbMap`](crate::DbMap)s constructed from a
+//! `Snapshot` own their own clone of it; the originating value need
+//! not outlive the projection or any iterators built from it.
 //!
 //! # Examples
 //!
@@ -106,34 +108,38 @@
 use std::fmt;
 use std::sync::Arc;
 
+use rocksdb::ReadOptions;
+
 use crate::db::Db;
 use crate::db::SnapshotEntry;
+use crate::reader::Reader;
+use crate::reader::sealed;
 
 /// A cheap-to-clone token referencing a single snapshot of the
-/// database.
+/// database that doubles as a [`Reader`].
 ///
 /// Returned by [`Db::at_snapshot`](crate::Db::at_snapshot) and
 /// [`Db::latest_snapshot`](crate::Db::latest_snapshot). Pass a
-/// reference to a [`SnapshotHandle`] to
-/// [`DbMap::at`](crate::DbMap::at) or
+/// reference to a `Snapshot` to [`DbMap::at`](crate::DbMap::at) or
 /// [`SchemaAtSnapshot::at`](crate::SchemaAtSnapshot::at) to obtain
-/// snapshot-bound read handles. Clones share the same underlying
-/// snapshot; cloning is an `Arc` increment and a small struct copy.
-pub struct SnapshotHandle {
+/// snapshot-bound read projections. Clones share the same
+/// underlying snapshot; cloning is two `Arc` increments and a small
+/// struct copy.
+pub struct Snapshot {
     // Field declaration order is load-bearing: `entry` must drop
-    // before `_db` so that the contained `rocksdb::Snapshot`
+    // before `db` so that the contained `rocksdb::Snapshot`
     // releases its borrow on `Db::inner` before the `Arc<Db>` ref
     // is decremented.
     entry: Arc<SnapshotEntry>,
-    _db: Arc<Db>,
+    db: Arc<Db>,
     checkpoint: u64,
 }
 
-impl SnapshotHandle {
+impl Snapshot {
     pub(crate) fn new(db: Arc<Db>, entry: Arc<SnapshotEntry>, checkpoint: u64) -> Self {
         Self {
             entry,
-            _db: db,
+            db,
             checkpoint,
         }
     }
@@ -142,37 +148,35 @@ impl SnapshotHandle {
     pub fn checkpoint(&self) -> u64 {
         self.checkpoint
     }
+}
 
-    /// The shared database handle this snapshot is taken against.
-    /// Used by the [`Reader`](crate::Reader) implementation for
-    /// [`Snapshot`](crate::Snapshot) to look up column-family
-    /// handles.
-    pub(crate) fn db(&self) -> &Arc<Db> {
-        &self._db
+impl sealed::Sealed for Snapshot {}
+
+impl Reader for Snapshot {
+    fn db(&self) -> &Arc<Db> {
+        &self.db
     }
 
-    /// The retained [`SnapshotEntry`] backing this handle. Used by
-    /// the [`Reader`](crate::Reader) implementation for
-    /// [`Snapshot`](crate::Snapshot) to install the snapshot pointer
-    /// on a fresh [`ReadOptions`](rocksdb::ReadOptions).
-    pub(crate) fn entry(&self) -> &Arc<SnapshotEntry> {
-        &self.entry
+    fn read_options(&self) -> ReadOptions {
+        let mut opts = ReadOptions::default();
+        opts.set_snapshot(self.entry.as_snapshot());
+        opts
     }
 }
 
-impl Clone for SnapshotHandle {
+impl Clone for Snapshot {
     fn clone(&self) -> Self {
         Self {
             entry: self.entry.clone(),
-            _db: self._db.clone(),
+            db: self.db.clone(),
             checkpoint: self.checkpoint,
         }
     }
 }
 
-impl fmt::Debug for SnapshotHandle {
+impl fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SnapshotHandle")
+        f.debug_struct("Snapshot")
             .field("checkpoint", &self.checkpoint)
             .finish_non_exhaustive()
     }
@@ -233,8 +237,8 @@ mod tests {
     }
 
     impl SchemaAtSnapshot for TestSchema<Live> {
-        type At<'s> = TestSchema<Snapshot<'s>>;
-        fn at<'s>(&'s self, snap: &'s SnapshotHandle) -> Self::At<'s> {
+        type At = TestSchema<Snapshot>;
+        fn at(&self, snap: &Snapshot) -> Self::At {
             TestSchema {
                 items: self.items.at(snap),
             }
@@ -487,12 +491,12 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_handle_survives_drop_snapshot() {
+    fn snapshot_survives_drop_snapshot() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
         db.take_snapshot(1);
         let snap = db.at_snapshot(1).unwrap();
-        // Remove the snapshot from the buffer; the handle still works.
+        // Remove the snapshot from the buffer; the token still works.
         assert!(db.drop_snapshot(1));
         assert!(db.at_snapshot(1).is_none());
         assert_eq!(
@@ -502,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_handle_clones_share_underlying_snapshot() {
+    fn snapshot_clones_share_underlying_snapshot() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
         db.take_snapshot(1);
@@ -522,12 +526,12 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_handle_outlives_schema() {
+    fn snapshot_outlives_schema() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
         db.take_snapshot(1);
         let snap = db.at_snapshot(1).unwrap();
-        // Schema (and its DbMap) drops; the snapshot handle still
+        // Schema (and its DbMap) drops; the snapshot token still
         // co-owns Arc<Db>, so the underlying database is alive.
         // We re-open a temporary DbMap pointed at the same CF and
         // re-bind it at the snapshot to exercise reads.
@@ -553,21 +557,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_handle_keeps_underlying_snapshot_alive_through_eviction() {
-        // Mirrors alt's test_iteration_snapshot_keepalive. A handle
-        // (here standing in for an iterator built from the handle)
+    fn snapshot_keeps_underlying_snapshot_alive_through_eviction() {
+        // Mirrors alt's test_iteration_snapshot_keepalive. A
+        // `Snapshot` (here standing in for an iterator built from it)
         // co-owns the SnapshotEntry; capacity-based eviction of the
-        // buffer must not break reads through the handle.
+        // buffer must not break reads through the token.
         let (_dir, db, schema) = open_with_capacity(2);
         put(&db, &schema, 1, 100);
         db.take_snapshot(1);
-        // Hold a handle (and through it, an Arc<SnapshotEntry>).
+        // Hold a Snapshot (and through it, an Arc<SnapshotEntry>).
         let snap = db.at_snapshot(1).unwrap();
         // Push two more snapshots so checkpoint 1 evicts.
         db.take_snapshot(2);
         db.take_snapshot(3);
         assert!(db.at_snapshot(1).is_none(), "snapshot 1 should evict");
-        // Reads through the held handle still work.
+        // Reads through the held Snapshot still work.
         assert_eq!(
             schema.items.at(&snap).get(&U64Be(1)).unwrap(),
             Some(U64Be(100)),
@@ -578,8 +582,8 @@ mod tests {
     fn iterator_keeps_snapshot_alive_through_eviction() {
         // Stronger version of the above: an active Iter built from
         // the snapshot survives buffer eviction. The Iter borrows
-        // from the snapshot-bound DbMap, which borrows from the
-        // SnapshotHandle, which holds an Arc<SnapshotEntry>.
+        // from the snapshot-bound DbMap, which owns a clone of the
+        // `Snapshot`, which holds an Arc<SnapshotEntry>.
         let (_dir, db, schema) = open_with_capacity(2);
         put(&db, &schema, 1, 10);
         put(&db, &schema, 2, 20);
