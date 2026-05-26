@@ -1416,12 +1416,24 @@ mod tests {
                 .unwrap();
 
             let marker = crate::RestoreState::Complete { restored_at: 42 };
-            db.stage_restore_state(finalize.write_batch_mut(), "p", &marker)
+            let fw = crate::FrameworkSchema::new(db.clone());
+            fw.restore
+                .stage_put(
+                    finalize.write_batch_mut(),
+                    &crate::PipelineTaskKey::new("p"),
+                    &marker,
+                )
                 .unwrap();
             finalize.commit().unwrap();
 
             assert_eq!(schema.counters.get(&U64Be(1)).unwrap(), Some(U64Be(7)));
-            assert_eq!(db.restore_state("p").unwrap(), Some(marker));
+            assert_eq!(
+                db.framework()
+                    .restore
+                    .get(&crate::PipelineTaskKey::new("p"))
+                    .unwrap(),
+                Some(marker),
+            );
         }
     }
 }

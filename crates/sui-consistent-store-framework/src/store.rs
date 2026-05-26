@@ -51,7 +51,11 @@ use anyhow::bail;
 use async_trait::async_trait;
 use scoped_futures::ScopedBoxFuture;
 use sui_consistent_store::Batch;
+use sui_consistent_store::ChainId;
 use sui_consistent_store::Db;
+use sui_consistent_store::FrameworkSchema;
+use sui_consistent_store::PipelineTaskKey;
+use sui_consistent_store::Watermark;
 use sui_indexer_alt_framework_store_traits::CommitterWatermark;
 use sui_indexer_alt_framework_store_traits::InitWatermark;
 use sui_indexer_alt_framework_store_traits::SequentialConnection;
@@ -60,25 +64,31 @@ use sui_indexer_alt_framework_store_traits::Store as _;
 use sui_indexer_alt_framework_store_traits::{self as store_traits};
 use tokio::task::JoinSet;
 
-use crate::schema::ChainId;
-use crate::schema::FrameworkSchema;
-use crate::schema::PipelineTaskKey;
 use crate::synchronizer::Queue;
 use crate::synchronizer::Synchronizer;
-use crate::watermark::Watermark;
+use crate::watermark;
 
 /// Framework-side wrapper around a [`Db`] handle plus a
-/// [`FrameworkSchema`] and a consumer-supplied user schema `S`.
+/// consumer-supplied user schema `S`.
 ///
 /// `Store<S>` is `Clone` (cheap, [`Arc`]-backed) so the framework
-/// can hand it out to every pipeline's processor task.
+/// can hand it out to every pipeline's processor task. The
+/// auto-registered [`FrameworkSchema`] (watermarks, chain ids,
+/// restore state) is cached internally so writes through
+/// [`SequentialStore::transaction`] do not pay a re-construction
+/// cost; reads are exposed via [`Db::framework`] on the
+/// underlying handle.
 pub struct Store<S> {
     inner: Arc<Inner<S>>,
 }
 
 struct Inner<S> {
     db: Db,
-    framework: Arc<FrameworkSchema>,
+    /// Owned, cached framework schema. Holds the typed
+    /// [`DbMap`](sui_consistent_store::DbMap)s the connection
+    /// uses for watermark and chain-id writes. Identical to
+    /// `db.framework()` but owned (no `Arc` bumps per access).
+    framework: FrameworkSchema,
     user: Arc<S>,
     /// Per-pipeline write queues, set once when
     /// [`Store::install_sync`] runs a [`Synchronizer`]. If
@@ -89,15 +99,15 @@ struct Inner<S> {
 }
 
 impl<S> Store<S> {
-    /// Build a store from its three constituent pieces.
+    /// Build a store from a [`Db`] and a consumer-supplied schema.
     ///
-    /// `db` is the opened RocksDB database. `framework` is the
-    /// framework's own [`FrameworkSchema`] opened against `db`.
-    /// `user` is the consumer pipeline's schema (often the same
-    /// `Arc` is shared across pipelines, but the choice is the
-    /// caller's). All three must have been opened against the same
-    /// underlying database.
-    pub fn new(db: Db, framework: Arc<FrameworkSchema>, user: Arc<S>) -> Self {
+    /// The framework's own bookkeeping CFs (watermarks, chain
+    /// ids, restore state) are auto-registered by
+    /// [`Db::open`](sui_consistent_store::Db::open), so the
+    /// caller does not pass them in — the store constructs an
+    /// owned [`FrameworkSchema`] from `db` internally.
+    pub fn new(db: Db, user: Arc<S>) -> Self {
+        let framework = FrameworkSchema::new(db.clone());
         Self {
             inner: Arc::new(Inner {
                 db,
@@ -137,14 +147,12 @@ impl<S> Store<S> {
         Ok(join_set)
     }
 
-    /// Borrow the underlying [`Db`] handle.
+    /// Borrow the underlying [`Db`] handle. Use
+    /// [`Db::framework`](sui_consistent_store::Db::framework) on
+    /// the returned handle for borrowed access to the framework
+    /// schema.
     pub fn db(&self) -> &Db {
         &self.inner.db
-    }
-
-    /// Borrow the [`FrameworkSchema`] this store reads from / writes to.
-    pub fn framework_schema(&self) -> &FrameworkSchema {
-        &self.inner.framework
     }
 
     /// Borrow the consumer pipeline's schema.
@@ -305,7 +313,7 @@ impl<S: Send + Sync> store_traits::Connection for Connection<'_, S> {
             .framework
             .watermarks
             .get(&key)?
-            .map(Into::into))
+            .map(watermark::to_committer))
     }
 
     async fn set_committer_watermark(
@@ -316,7 +324,10 @@ impl<S: Send + Sync> store_traits::Connection for Connection<'_, S> {
         // Defer the write until `transaction` commits, so the
         // watermark advance and the user's data writes land
         // atomically.
-        self.watermark = Some((pipeline_task.to_string(), watermark.into()));
+        self.watermark = Some((
+            pipeline_task.to_string(),
+            crate::watermark::from_committer(watermark),
+        ));
         Ok(true)
     }
 }
@@ -386,35 +397,12 @@ mod tests {
         }
     }
 
-    /// Combined schema: framework + user CFs against one database.
-    /// The framework expects both sets of CFs to be registered on
-    /// the same `Db::open` call, so production code wires them
-    /// together via a composite schema like this.
-    #[derive(Debug)]
-    struct Combined {
-        framework: FrameworkSchema,
-        user: UserSchema,
-    }
-
-    impl Schema for Combined {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
-            let mut cfs = FrameworkSchema::cfs(base_options);
-            cfs.extend(UserSchema::cfs(base_options));
-            cfs
-        }
-
-        fn open(db: &Db) -> Result<Self, OpenError> {
-            Ok(Self {
-                framework: FrameworkSchema::open(db)?,
-                user: UserSchema::open(db)?,
-            })
-        }
-    }
-
     fn setup() -> (TempDir, Store<UserSchema>) {
         let dir = TempDir::new().unwrap();
-        let (db, schema) = Db::open::<Combined>(dir.path(), DbOptions::default()).unwrap();
-        let store = Store::new(db, Arc::new(schema.framework), Arc::new(schema.user));
+        // The framework's bookkeeping CFs are auto-registered by
+        // `Db::open`, so the user schema declares only its own CFs.
+        let (db, schema) = Db::open::<UserSchema>(dir.path(), DbOptions::default()).unwrap();
+        let store = Store::new(db, Arc::new(schema));
         (dir, store)
     }
 

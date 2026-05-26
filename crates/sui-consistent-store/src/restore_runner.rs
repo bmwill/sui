@@ -85,7 +85,9 @@ use tracing::debug;
 use tracing::info;
 
 use crate::Db;
+use crate::FrameworkSchema;
 use crate::Pipeline;
+use crate::PipelineTaskKey;
 use crate::RestoreState;
 use crate::error::Error;
 
@@ -102,6 +104,10 @@ use crate::error::Error;
 /// in [`Arc<P>`] so `&self` calls can spread across threads.
 pub struct RestoreRunner<P: Pipeline> {
     db: Db,
+    /// Cached owned [`FrameworkSchema`] for typed access to the
+    /// `__restore` CF. Avoids the per-call construction cost that
+    /// `db.framework()` would pay for staged writes.
+    framework: FrameworkSchema,
     pipeline: Arc<P>,
     schema: Arc<P::Schema>,
     target_checkpoint: u64,
@@ -136,8 +142,10 @@ impl<P: Pipeline> RestoreRunner<P> {
         staging_dir: PathBuf,
         sst_options: rocksdb::Options,
     ) -> Self {
+        let framework = FrameworkSchema::new(db.clone());
         Self {
             db,
+            framework,
             pipeline,
             schema,
             target_checkpoint,
@@ -145,6 +153,19 @@ impl<P: Pipeline> RestoreRunner<P> {
             sst_options,
             state_lock: Mutex::new(()),
         }
+    }
+
+    /// Read the current persisted [`RestoreState`] for this
+    /// runner's pipeline.
+    fn read_state(&self) -> Result<Option<RestoreState>, Error> {
+        self.framework.restore.get(&PipelineTaskKey::new(P::NAME))
+    }
+
+    /// Write `state` for this runner's pipeline (commit immediately).
+    fn write_state(&self, state: &RestoreState) -> Result<(), Error> {
+        let mut batch = self.db.batch();
+        batch.put(&self.framework.restore, &PipelineTaskKey::new(P::NAME), state)?;
+        batch.commit()
     }
 
     /// Initialize the runner's `__restore` entry and return the
@@ -160,15 +181,12 @@ impl<P: Pipeline> RestoreRunner<P> {
     ///   `target_checkpoint` — refuse to mix two restore runs.
     pub fn begin(&self) -> anyhow::Result<BTreeSet<Vec<u8>>> {
         let _guard = self.state_lock.lock();
-        match self.db.restore_state(P::NAME)? {
+        match self.read_state()? {
             None => {
-                self.db.set_restore_state(
-                    P::NAME,
-                    &RestoreState::InProgress {
-                        target_checkpoint: self.target_checkpoint,
-                        partitions_complete: BTreeSet::new(),
-                    },
-                )?;
+                self.write_state(&RestoreState::InProgress {
+                    target_checkpoint: self.target_checkpoint,
+                    partitions_complete: BTreeSet::new(),
+                })?;
                 info!(
                     pipeline = P::NAME,
                     target_checkpoint = self.target_checkpoint,
@@ -215,7 +233,7 @@ impl<P: Pipeline> RestoreRunner<P> {
     /// with [`begin`](Self::begin) returning.
     pub fn already_complete(&self, partition_id: &[u8]) -> anyhow::Result<bool> {
         let _guard = self.state_lock.lock();
-        match self.db.restore_state(P::NAME)? {
+        match self.read_state()? {
             Some(RestoreState::InProgress {
                 partitions_complete,
                 ..
@@ -284,8 +302,11 @@ impl<P: Pipeline> RestoreRunner<P> {
         {
             let _guard = self.state_lock.lock();
             let next_state = self.next_partition_state(partition_id)?;
-            self.db
-                .stage_restore_state(finalize.write_batch_mut(), P::NAME, &next_state)?;
+            self.framework.restore.stage_put(
+                finalize.write_batch_mut(),
+                &PipelineTaskKey::new(P::NAME),
+                &next_state,
+            )?;
             // 5. Atomic commit: SSTs ingest first; if a crash
             // happens between ingest and write_batch commit, the
             // marker never lands, the shard re-runs on resume, and
@@ -324,12 +345,9 @@ impl<P: Pipeline> RestoreRunner<P> {
     /// driver owns that list.
     pub fn finish(&self) -> anyhow::Result<()> {
         let _guard = self.state_lock.lock();
-        self.db.set_restore_state(
-            P::NAME,
-            &RestoreState::Complete {
-                restored_at: self.target_checkpoint,
-            },
-        )?;
+        self.write_state(&RestoreState::Complete {
+            restored_at: self.target_checkpoint,
+        })?;
         info!(
             pipeline = P::NAME,
             restored_at = self.target_checkpoint,
@@ -356,7 +374,7 @@ impl<P: Pipeline> RestoreRunner<P> {
     /// concurrent shard processors do not race on the
     /// read-modify-write of `partitions_complete`.
     fn next_partition_state(&self, partition_id: &[u8]) -> Result<RestoreState, Error> {
-        let current = self.db.restore_state(P::NAME)?;
+        let current = self.read_state()?;
         let mut partitions_complete = match current {
             Some(RestoreState::InProgress {
                 target_checkpoint,
@@ -417,6 +435,28 @@ mod tests {
     use crate::error::DecodeError;
     use crate::error::EncodeError;
     use crate::error::OpenError;
+
+    /// Test helper: read the persisted `RestoreState` for
+    /// `pipeline`. Mirrors the production
+    /// `runner.read_state()` but takes the pipeline name as an
+    /// argument so tests can poke at arbitrary entries.
+    fn read_restore_state(db: &Db, pipeline: &str) -> Option<RestoreState> {
+        db.framework()
+            .restore
+            .get(&PipelineTaskKey::new(pipeline))
+            .unwrap()
+    }
+
+    /// Test helper: write `state` for `pipeline` (commit
+    /// immediately).
+    fn write_restore_state(db: &Db, pipeline: &str, state: &RestoreState) {
+        let fw = FrameworkSchema::new(db.clone());
+        let mut batch = db.batch();
+        batch
+            .put(&fw.restore, &PipelineTaskKey::new(pipeline), state)
+            .unwrap();
+        batch.commit().unwrap();
+    }
 
     /// Big-endian `ObjectID` key newtype.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,7 +684,7 @@ mod tests {
         let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
         let skip = runner.begin().unwrap();
         assert!(skip.is_empty());
-        match db.restore_state("versions").unwrap() {
+        match read_restore_state(&db, "versions") {
             Some(RestoreState::InProgress {
                 target_checkpoint,
                 partitions_complete,
@@ -663,14 +703,14 @@ mod tests {
         let mut prior = BTreeSet::new();
         prior.insert(vec![0xAAu8]);
         prior.insert(vec![0xBBu8]);
-        db.set_restore_state(
+        write_restore_state(
+            &db,
             "versions",
             &RestoreState::InProgress {
                 target_checkpoint: 100,
                 partitions_complete: prior.clone(),
             },
-        )
-        .unwrap();
+        );
 
         let skip = runner.begin().unwrap();
         assert_eq!(skip, prior);
@@ -679,14 +719,14 @@ mod tests {
     #[test]
     fn begin_refuses_target_mismatch() {
         let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
-        db.set_restore_state(
+        write_restore_state(
+            &db,
             "versions",
             &RestoreState::InProgress {
                 target_checkpoint: 200,
                 partitions_complete: BTreeSet::new(),
             },
-        )
-        .unwrap();
+        );
         let err = runner.begin().unwrap_err();
         assert!(format!("{err}").contains("mid-restore at checkpoint 200"));
     }
@@ -694,8 +734,11 @@ mod tests {
     #[test]
     fn begin_refuses_already_complete() {
         let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
-        db.set_restore_state("versions", &RestoreState::Complete { restored_at: 50 })
-            .unwrap();
+        write_restore_state(
+            &db,
+            "versions",
+            &RestoreState::Complete { restored_at: 50 },
+        );
         let err = runner.begin().unwrap_err();
         assert!(format!("{err}").contains("already restored"));
     }
@@ -729,7 +772,7 @@ mod tests {
         );
 
         // Partition is recorded.
-        match db.restore_state("versions").unwrap() {
+        match read_restore_state(&db, "versions") {
             Some(RestoreState::InProgress {
                 partitions_complete,
                 ..
@@ -748,14 +791,14 @@ mod tests {
         // Pre-mark shard-0 as complete.
         let mut done = BTreeSet::new();
         done.insert(b"shard-0".to_vec());
-        db.set_restore_state(
+        write_restore_state(
+            &db,
             "versions",
             &RestoreState::InProgress {
                 target_checkpoint: 100,
                 partitions_complete: done,
             },
-        )
-        .unwrap();
+        );
 
         // Running shard-0 again must not write anything new.
         runner.process_shard(b"shard-0", vec![Ok(obj(1))]).unwrap();
@@ -776,7 +819,7 @@ mod tests {
         runner
             .process_shard(b"empty", Vec::<anyhow::Result<Object>>::new())
             .unwrap();
-        match db.restore_state("versions").unwrap() {
+        match read_restore_state(&db, "versions") {
             Some(RestoreState::InProgress {
                 partitions_complete,
                 ..
@@ -800,7 +843,7 @@ mod tests {
         let err = runner.process_shard(b"bad", stream).unwrap_err();
         assert!(format!("{err}").contains("source-side IO failed"));
 
-        match db.restore_state("versions").unwrap() {
+        match read_restore_state(&db, "versions") {
             Some(RestoreState::InProgress {
                 partitions_complete,
                 ..
@@ -862,7 +905,7 @@ mod tests {
         );
 
         // Restore is marked complete.
-        match db.restore_state("counters").unwrap() {
+        match read_restore_state(&db, "counters") {
             Some(RestoreState::Complete { restored_at }) => assert_eq!(restored_at, 42),
             other => panic!("expected Complete, got {other:?}"),
         }
@@ -874,7 +917,7 @@ mod tests {
         runner.begin().unwrap();
         runner.process_shard(b"only", vec![Ok(obj(1))]).unwrap();
         runner.finish().unwrap();
-        match db.restore_state("versions").unwrap() {
+        match read_restore_state(&db, "versions") {
             Some(RestoreState::Complete { restored_at }) => assert_eq!(restored_at, 100),
             other => panic!("expected Complete, got {other:?}"),
         }
@@ -910,7 +953,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        match db.restore_state("versions").unwrap() {
+        match read_restore_state(&db, "versions") {
             Some(RestoreState::InProgress {
                 partitions_complete,
                 ..
@@ -1106,7 +1149,7 @@ mod tests {
 
             // Partition marked complete atomically with the counters
             // writes.
-            match db.restore_state("hybrid").unwrap() {
+            match read_restore_state(&db, "hybrid") {
                 Some(RestoreState::InProgress {
                     partitions_complete,
                     ..
@@ -1175,11 +1218,17 @@ mod tests {
                     s
                 },
             };
-            db.stage_restore_state(finalize.write_batch_mut(), HybridPipeline::NAME, &marker)
+            let fw = FrameworkSchema::new(db.clone());
+            fw.restore
+                .stage_put(
+                    finalize.write_batch_mut(),
+                    &PipelineTaskKey::new(HybridPipeline::NAME),
+                    &marker,
+                )
                 .unwrap();
 
             // Pre-commit: marker is absent and counter is absent.
-            assert!(db.restore_state(HybridPipeline::NAME).unwrap().is_none());
+            assert!(read_restore_state(&db, HybridPipeline::NAME).is_none());
             assert!(
                 schema
                     .counters
@@ -1192,7 +1241,7 @@ mod tests {
 
             // Post-commit: both visible.
             assert_eq!(
-                db.restore_state(HybridPipeline::NAME).unwrap(),
+                read_restore_state(&db, HybridPipeline::NAME),
                 Some(marker)
             );
             assert_eq!(

@@ -161,6 +161,19 @@ struct PinnedOwner {
 }
 
 impl<K, V, R: Reader> DbMap<K, V, R> {
+    /// Like [`DbMap::new`], but skips the existence check on
+    /// `cf_name`. Crate-internal; used to construct typed handles
+    /// against column families known to be registered (auto-created
+    /// by [`Db::open`]), avoiding a redundant
+    /// [`cf_handle`](Db::cf_handle) lookup per construction.
+    pub(crate) fn new_unchecked(reader: R, cf_name: &'static str) -> Self {
+        Self {
+            reader,
+            cf_name,
+            _data: PhantomData,
+        }
+    }
+
     /// Construct a typed handle for the column family named `cf_name`
     /// on `reader`'s database.
     ///
@@ -271,6 +284,84 @@ impl<K, V, R: Reader> DbMap<K, V, R> {
     /// The name of the column family this handle is bound to.
     pub(crate) fn cf_name(&self) -> &'static str {
         self.cf_name
+    }
+}
+
+impl<K, V> DbMap<K, V, Db>
+where
+    K: Encode,
+{
+    /// Stage a typed `put` against this map's column family into
+    /// `write_batch` (a raw [`rocksdb::WriteBatch`]).
+    ///
+    /// Useful for callers that need to mix typed writes into a
+    /// pre-existing [`rocksdb::WriteBatch`] — for example, restore
+    /// drivers staging a partition-complete marker into the same
+    /// batch that holds the shard's merge-mode writes (see
+    /// [`Batch::finalize_for_shard`](crate::Batch::finalize_for_shard)).
+    /// The write does not become visible until the caller commits
+    /// `write_batch` themselves; for the routine "stage and commit"
+    /// path use [`Batch::put`](crate::Batch::put) instead.
+    ///
+    /// Constrained to a [`Db`]-bound handle: writes always land at
+    /// the live tip.
+    pub fn stage_put(
+        &self,
+        write_batch: &mut rocksdb::WriteBatch,
+        key: &K,
+        value: &V,
+    ) -> Result<(), Error>
+    where
+        V: Encode,
+    {
+        let cf = self.cf()?;
+        with_encode_buf(|buf| -> Result<(), Error> {
+            key.encode_into(buf)?;
+            let k_end = buf.len();
+            value.encode_into(buf)?;
+            let bytes = buf.as_slice();
+            write_batch.put_cf(&cf, &bytes[..k_end], &bytes[k_end..]);
+            Ok(())
+        })
+    }
+
+    /// Stage a typed `delete` against this map's column family
+    /// into `write_batch`. See [`stage_put`](Self::stage_put) for
+    /// the use case.
+    pub fn stage_delete(
+        &self,
+        write_batch: &mut rocksdb::WriteBatch,
+        key: &K,
+    ) -> Result<(), Error> {
+        let cf = self.cf()?;
+        with_encode_buf(|buf| -> Result<(), Error> {
+            key.encode_into(buf)?;
+            write_batch.delete_cf(&cf, buf.as_slice());
+            Ok(())
+        })
+    }
+
+    /// Stage a typed `merge` against this map's column family into
+    /// `write_batch`. See [`stage_put`](Self::stage_put) for the
+    /// use case.
+    pub fn stage_merge(
+        &self,
+        write_batch: &mut rocksdb::WriteBatch,
+        key: &K,
+        operand: &V,
+    ) -> Result<(), Error>
+    where
+        V: Encode,
+    {
+        let cf = self.cf()?;
+        with_encode_buf(|buf| -> Result<(), Error> {
+            key.encode_into(buf)?;
+            let k_end = buf.len();
+            operand.encode_into(buf)?;
+            let bytes = buf.as_slice();
+            write_batch.merge_cf(&cf, &bytes[..k_end], &bytes[k_end..]);
+            Ok(())
+        })
     }
 }
 

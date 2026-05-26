@@ -22,8 +22,8 @@
 //! # Lifecycle
 //!
 //! 1. [`Synchronizer::new`] creates the service with a database,
-//!    framework schema, snapshot stride, and per-pipeline channel
-//!    buffer size.
+//!    snapshot stride, and per-pipeline channel buffer size. The
+//!    framework schema is read off `db` on demand.
 //! 2. [`register_pipeline`](Synchronizer::register_pipeline) reads
 //!    the pipeline's existing watermark (if any) from the
 //!    framework schema and records it as that pipeline's resume
@@ -46,15 +46,13 @@ use anyhow::bail;
 use anyhow::ensure;
 use sui_consistent_store::Batch;
 use sui_consistent_store::Db;
+use sui_consistent_store::PipelineTaskKey;
+use sui_consistent_store::Watermark;
 use tokio::sync::Barrier;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::debug;
 use tracing::info;
-
-use crate::FrameworkSchema;
-use crate::schema::PipelineTaskKey;
-use crate::watermark::Watermark;
 
 /// Write-side handle to the per-pipeline channels each
 /// [`Synchronizer`] task reads from. Held inside the
@@ -70,7 +68,6 @@ pub(crate) type Queue = HashMap<String, mpsc::Sender<(Watermark, Batch)>>;
 /// [`Queue`] + a [`JoinSet`] driving the per-pipeline tasks.
 pub struct Synchronizer {
     db: Db,
-    framework: Arc<FrameworkSchema>,
     last_watermarks: HashMap<String, Option<Watermark>>,
     first_checkpoint: u64,
     stride: u64,
@@ -80,9 +77,10 @@ pub struct Synchronizer {
 impl Synchronizer {
     /// Construct a synchronizer over `db`.
     ///
-    /// `framework` is the framework schema opened against the same
-    /// database (used to read existing watermarks during
-    /// [`register_pipeline`](Self::register_pipeline)).
+    /// The framework schema lives on `db` (auto-registered by
+    /// [`Db::open`](sui_consistent_store::Db::open)); the
+    /// synchronizer reads existing watermarks through it during
+    /// [`register_pipeline`](Self::register_pipeline).
     ///
     /// `stride` is the number of checkpoints between snapshots
     /// (snapshots are taken before the write of checkpoint
@@ -98,14 +96,12 @@ impl Synchronizer {
     /// to `0`.
     pub fn new(
         db: Db,
-        framework: Arc<FrameworkSchema>,
         stride: u64,
         buffer_size: usize,
         first_checkpoint: Option<u64>,
     ) -> Self {
         Self {
             db,
-            framework,
             last_watermarks: HashMap::new(),
             first_checkpoint: first_checkpoint.unwrap_or(0),
             stride,
@@ -126,7 +122,8 @@ impl Synchronizer {
         let pipeline_task = pipeline_task.into();
         let key = PipelineTaskKey::new(pipeline_task.clone());
         let watermark = self
-            .framework
+            .db
+            .framework()
             .watermarks
             .get(&key)
             .with_context(|| format!("reading initial watermark for {pipeline_task}"))?;
@@ -274,6 +271,7 @@ async fn synchronizer_task(
 mod tests {
     use sui_consistent_store::Db;
     use sui_consistent_store::DbOptions;
+    use sui_consistent_store::FrameworkSchema;
     use sui_consistent_store::Schema;
     use sui_consistent_store::error::OpenError;
     use sui_consistent_store::rocksdb;
@@ -281,39 +279,41 @@ mod tests {
 
     use super::*;
 
-    /// Schema with just the framework's CFs — enough for the
-    /// synchronizer to look up watermarks during
-    /// `register_pipeline`.
+    /// Minimal user schema (no extra CFs); the framework's CFs are
+    /// auto-registered by `Db::open`, so all the synchronizer
+    /// tests need is a database with the default + framework CFs.
     #[derive(Debug)]
-    struct OnlyFramework(FrameworkSchema);
+    struct EmptySchema;
 
-    impl Schema for OnlyFramework {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
-            FrameworkSchema::cfs(base_options)
+    impl Schema for EmptySchema {
+        fn cfs(_: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
+            vec![]
         }
 
-        fn open(db: &Db) -> Result<Self, OpenError> {
-            Ok(Self(FrameworkSchema::open(db)?))
+        fn open(_: &Db) -> Result<Self, OpenError> {
+            Ok(Self)
         }
     }
 
-    fn open() -> (TempDir, Db, Arc<FrameworkSchema>) {
+    fn open() -> (TempDir, Db) {
         let dir = TempDir::new().unwrap();
-        let (db, schema) = Db::open::<OnlyFramework>(dir.path(), DbOptions::default()).unwrap();
-        (dir, db, Arc::new(schema.0))
+        let (db, _schema) = Db::open::<EmptySchema>(dir.path(), DbOptions::default()).unwrap();
+        (dir, db)
     }
 
     #[test]
     fn register_pipeline_with_no_watermark_succeeds() {
-        let (_dir, db, framework) = open();
-        let mut sync = Synchronizer::new(db, framework, 8, 4, None);
+        let (_dir, db) = open();
+        let mut sync = Synchronizer::new(db, 8, 4, None);
         sync.register_pipeline("p").unwrap();
     }
 
     #[test]
     fn register_pipeline_reads_existing_watermark() {
-        let (_dir, db, framework) = open();
-        // Persist an existing watermark via the typed schema.
+        let (_dir, db) = open();
+        // Persist an existing watermark via the auto-registered
+        // framework schema.
+        let framework = FrameworkSchema::new(db.clone());
         let mut wb = db.batch();
         let key = PipelineTaskKey::new("p".to_string());
         let w = Watermark {
@@ -323,7 +323,7 @@ mod tests {
         wb.put(&framework.watermarks, &key, &w).unwrap();
         wb.commit().unwrap();
 
-        let mut sync = Synchronizer::new(db, framework, 8, 4, None);
+        let mut sync = Synchronizer::new(db, 8, 4, None);
         sync.register_pipeline("p").unwrap();
         assert_eq!(
             sync.last_watermarks
@@ -336,16 +336,16 @@ mod tests {
 
     #[test]
     fn run_refuses_no_pipelines() {
-        let (_dir, db, framework) = open();
-        let sync = Synchronizer::new(db, framework, 8, 4, None);
+        let (_dir, db) = open();
+        let sync = Synchronizer::new(db, 8, 4, None);
         let err = sync.run().unwrap_err();
         assert!(format!("{err:#}").contains("no pipelines registered"));
     }
 
     #[tokio::test]
     async fn run_returns_one_queue_entry_per_pipeline() {
-        let (_dir, db, framework) = open();
-        let mut sync = Synchronizer::new(db, framework, 8, 4, None);
+        let (_dir, db) = open();
+        let mut sync = Synchronizer::new(db, 8, 4, None);
         sync.register_pipeline("a").unwrap();
         sync.register_pipeline("b").unwrap();
         let (mut joinset, queue) = sync.run().unwrap();
@@ -366,7 +366,8 @@ mod tests {
         // 20 (first multiple of 5 greater than 17). Verified by
         // observing that the synchronizer task accepts checkpoint
         // 18, 19, and then waits at the barrier for 20.
-        let (_dir, db, framework) = open();
+        let (_dir, db) = open();
+        let framework = FrameworkSchema::new(db.clone());
         let mut wb = db.batch();
         wb.put(
             &framework.watermarks,
@@ -379,7 +380,7 @@ mod tests {
         .unwrap();
         wb.commit().unwrap();
 
-        let mut sync = Synchronizer::new(db.clone(), framework, 5, 4, None);
+        let mut sync = Synchronizer::new(db.clone(), 5, 4, None);
         sync.register_pipeline("p").unwrap();
         let (mut joinset, queue) = sync.run().unwrap();
 
@@ -412,8 +413,8 @@ mod tests {
 
     #[tokio::test]
     async fn synchronizer_rejects_out_of_order_batch() {
-        let (_dir, db, framework) = open();
-        let mut sync = Synchronizer::new(db.clone(), framework, 100, 4, None);
+        let (_dir, db) = open();
+        let mut sync = Synchronizer::new(db.clone(), 100, 4, None);
         sync.register_pipeline("p").unwrap();
         let (mut joinset, queue) = sync.run().unwrap();
 
@@ -441,8 +442,8 @@ mod tests {
         // Single pipeline with stride 1 → snapshot after every
         // checkpoint. Send checkpoint 0, observe the snapshot
         // buffer contain a snapshot at 0.
-        let (_dir, db, framework) = open();
-        let mut sync = Synchronizer::new(db.clone(), framework, 1, 4, None);
+        let (_dir, db) = open();
+        let mut sync = Synchronizer::new(db.clone(), 1, 4, None);
         sync.register_pipeline("p").unwrap();
         let (mut joinset, queue) = sync.run().unwrap();
 

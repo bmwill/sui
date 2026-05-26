@@ -189,10 +189,30 @@ mod tests {
     use crate::DbOptions;
     use crate::Decode;
     use crate::Encode;
+    use crate::FrameworkSchema;
+    use crate::PipelineTaskKey;
+    use crate::RestoreState;
     use crate::Schema;
     use crate::error::DecodeError;
     use crate::error::EncodeError;
     use crate::error::OpenError;
+
+    /// Test helpers around the auto-registered `__restore` CF.
+    fn read_restore_state(db: &Db, pipeline: &str) -> Option<RestoreState> {
+        db.framework()
+            .restore
+            .get(&PipelineTaskKey::new(pipeline))
+            .unwrap()
+    }
+
+    fn write_restore_state(db: &Db, pipeline: &str, state: &RestoreState) {
+        let fw = FrameworkSchema::new(db.clone());
+        let mut batch = db.batch();
+        batch
+            .put(&fw.restore, &PipelineTaskKey::new(pipeline), state)
+            .unwrap();
+        batch.commit().unwrap();
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct ObjectIdKey([u8; ObjectID::LENGTH]);
@@ -411,7 +431,7 @@ mod tests {
         assert_eq!(ranges.len(), 32);
 
         // Restore state is Complete.
-        match db.restore_state("versions").unwrap() {
+        match read_restore_state(&db, "versions") {
             Some(crate::RestoreState::Complete { restored_at }) => {
                 assert_eq!(restored_at, 42);
             }
@@ -457,7 +477,7 @@ mod tests {
         ));
 
         restore_pipeline_from_object_source(runner, &source, 3).unwrap();
-        match db.restore_state("versions").unwrap() {
+        match read_restore_state(&db, "versions") {
             Some(crate::RestoreState::Complete { restored_at }) => assert_eq!(restored_at, 7),
             other => panic!("expected Complete, got {other:?}"),
         }
@@ -525,14 +545,14 @@ mod tests {
         // ingested.
         let mut done = BTreeSet::new();
         done.insert(partition_id(0, 1).to_vec());
-        db.set_restore_state(
+        write_restore_state(
+            &db,
             "versions",
-            &crate::RestoreState::InProgress {
+            &RestoreState::InProgress {
                 target_checkpoint: 42,
                 partitions_complete: done,
             },
-        )
-        .unwrap();
+        );
 
         restore_pipeline_from_object_source(runner, &source, 1).unwrap();
 

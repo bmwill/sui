@@ -563,11 +563,34 @@ mod tests {
         use crate::DbOptions;
         use crate::Decode;
         use crate::Encode;
+        use crate::FrameworkSchema;
+        use crate::PipelineTaskKey;
+        use crate::RestoreState;
         use crate::Schema;
         use crate::error::DecodeError;
         use crate::error::EncodeError;
         use crate::error::OpenError;
         use crate::snapshot_format::FileCompression;
+
+        /// Test helper: read the persisted `RestoreState` for
+        /// `pipeline` via the auto-registered framework schema.
+        fn read_restore_state(db: &Db, pipeline: &str) -> Option<RestoreState> {
+            db.framework()
+                .restore
+                .get(&PipelineTaskKey::new(pipeline))
+                .unwrap()
+        }
+
+        /// Test helper: write `state` for `pipeline` (commit
+        /// immediately).
+        fn write_restore_state(db: &Db, pipeline: &str, state: &RestoreState) {
+            let fw = FrameworkSchema::new(db.clone());
+            let mut batch = db.batch();
+            batch
+                .put(&fw.restore, &PipelineTaskKey::new(pipeline), state)
+                .unwrap();
+            batch.commit().unwrap();
+        }
 
         /// Big-endian `ObjectID` key newtype.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -735,8 +758,8 @@ mod tests {
             }
 
             // Restore state is Complete at the snapshot's epoch.
-            match db.restore_state("versions").unwrap() {
-                Some(crate::RestoreState::Complete { restored_at }) => {
+            match read_restore_state(&db, "versions") {
+                Some(RestoreState::Complete { restored_at }) => {
                     assert_eq!(restored_at, 42);
                 }
                 other => panic!("expected Complete, got {other:?}"),
@@ -788,14 +811,14 @@ mod tests {
                 digest: [0u8; 32],
             });
             done.insert(p0.to_vec());
-            db.set_restore_state(
+            write_restore_state(
+                &db,
                 "versions",
-                &crate::RestoreState::InProgress {
+                &RestoreState::InProgress {
                     target_checkpoint: 7,
                     partitions_complete: done,
                 },
-            )
-            .unwrap();
+            );
 
             // Resume the restore. Only partition 1 should be
             // fetched and ingested.

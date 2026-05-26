@@ -136,7 +136,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::FrameworkSchema;
 
     // --- Pipeline scaffolding ---
 
@@ -206,27 +205,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct Combined {
-        framework: FrameworkSchema,
-        user: VersionsSchema,
-    }
-
-    impl Schema for Combined {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
-            let mut cfs = FrameworkSchema::cfs(base_options);
-            cfs.extend(VersionsSchema::cfs(base_options));
-            cfs
-        }
-
-        fn open(db: &Db) -> Result<Self, OpenError> {
-            Ok(Self {
-                framework: FrameworkSchema::open(db)?,
-                user: VersionsSchema::open(db)?,
-            })
-        }
-    }
-
     /// Test pipeline: tracks the highest version seen per object.
     struct VersionsPipeline;
 
@@ -277,8 +255,10 @@ mod tests {
 
     fn setup() -> (TempDir, Store<VersionsSchema>) {
         let dir = TempDir::new().unwrap();
-        let (db, schema) = Db::open::<Combined>(dir.path(), DbOptions::default()).unwrap();
-        let store = Store::new(db, Arc::new(schema.framework), Arc::new(schema.user));
+        // Framework CFs are auto-registered, so the user schema
+        // declares only its own.
+        let (db, schema) = Db::open::<VersionsSchema>(dir.path(), DbOptions::default()).unwrap();
+        let store = Store::new(db, Arc::new(schema));
         (dir, store)
     }
 

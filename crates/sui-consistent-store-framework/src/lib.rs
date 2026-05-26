@@ -30,16 +30,11 @@
 //! free of indexer-alt-specific concerns.
 
 pub mod alt_adapter;
-pub mod schema;
 pub mod store;
 pub mod synchronizer;
 pub mod watermark;
 
 pub use crate::alt_adapter::AltAdapter;
-pub use crate::schema::CHAIN_ID_CF;
-pub use crate::schema::FrameworkSchema;
-pub use crate::schema::WATERMARK_CF;
 pub use crate::store::Connection;
 pub use crate::store::Store;
 pub use crate::synchronizer::Synchronizer;
-pub use crate::watermark::Watermark;

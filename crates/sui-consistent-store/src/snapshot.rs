@@ -145,6 +145,17 @@ impl Snapshot {
     pub fn checkpoint(&self) -> u64 {
         self.checkpoint
     }
+
+    /// Borrowed handle to the auto-registered
+    /// [`FrameworkSchema`](crate::FrameworkSchema), bound to this
+    /// snapshot.
+    ///
+    /// Returns a `FrameworkSchema<&Snapshot>` borrowing `self`.
+    /// Zero `Arc` bumps; the returned schema reads the framework
+    /// CFs at the snapshot's captured state.
+    pub fn framework(&self) -> crate::FrameworkSchema<&Snapshot> {
+        crate::FrameworkSchema::new(self)
+    }
 }
 
 impl sealed::Sealed for Snapshot {}

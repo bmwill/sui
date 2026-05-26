@@ -261,7 +261,12 @@ mod tests {
         assert!(got_ids.is_empty());
 
         // Restore is marked Complete.
-        match db.restore_state("versions").unwrap() {
+        let restore_state = db
+            .framework()
+            .restore
+            .get(&sui_consistent_store::PipelineTaskKey::new("versions"))
+            .unwrap();
+        match restore_state {
             Some(RestoreState::Complete { restored_at }) => assert_eq!(restored_at, 7),
             other => panic!("expected Complete, got {other:?}"),
         }
