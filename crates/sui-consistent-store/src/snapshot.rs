@@ -277,8 +277,7 @@ mod tests {
     fn open_with_capacity(capacity: usize) -> (TempDir, Db, TestSchema) {
         let dir = TempDir::new().unwrap();
         let opts = DbOptions {
-            snapshot_capacity: std::num::NonZeroUsize::new(capacity)
-                .expect("test capacity must be > 0"),
+            snapshot_capacity: capacity,
             ..DbOptions::default()
         };
         let (db, schema) = Db::open::<TestSchema>(dir.path(), opts).unwrap();
@@ -364,6 +363,17 @@ mod tests {
         db.take_snapshot(10);
         db.take_snapshot(5);
         assert_eq!(db.snapshot_range(), Some(3..=10));
+    }
+
+    #[test]
+    fn snapshot_capacity_zero_disables_snapshotting() {
+        let (_dir, db, _schema) = open_with_capacity(0);
+        db.take_snapshot(1);
+        db.take_snapshot(2);
+        assert!(db.at_snapshot(1).is_none());
+        assert!(db.at_snapshot(2).is_none());
+        assert!(db.latest_snapshot().is_none());
+        assert!(db.snapshot_range().is_none());
     }
 
     #[test]

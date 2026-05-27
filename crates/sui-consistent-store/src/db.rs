@@ -23,7 +23,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
@@ -70,10 +69,9 @@ pub struct DbOptions {
     /// window the application requires; long-lived snapshots pressure
     /// RocksDB compaction, so this is not free.
     ///
-    /// Capacity is a [`NonZeroUsize`] so a zero buffer (which would
-    /// silently drop every snapshot the moment it was taken) is
-    /// structurally impossible.
-    pub snapshot_capacity: NonZeroUsize,
+    /// Set to `0` to disable snapshotting entirely: [`Db::take_snapshot`]
+    /// becomes a no-op and no snapshot-related work is performed.
+    pub snapshot_capacity: usize,
 }
 
 /// An opened RocksDB database.
@@ -128,7 +126,7 @@ pub struct Db {
 /// freed.
 struct DbInner {
     snapshots: RwLock<BTreeMap<u64, Arc<SnapshotEntry>>>,
-    snapshot_capacity: NonZeroUsize,
+    snapshot_capacity: usize,
     /// Per-CF restore mode, captured at open time from
     /// [`Schema::cfs`]. Used by shard-backed [`Batch`]es to dispatch
     /// per-CF writes between SST bulk ingestion and the
@@ -169,7 +167,7 @@ impl Default for DbOptions {
         db_options.create_missing_column_families(true);
         Self {
             db_options,
-            snapshot_capacity: NonZeroUsize::new(32).expect("32 != 0"),
+            snapshot_capacity: 32,
         }
     }
 }
@@ -363,8 +361,13 @@ impl Db {
     /// If a snapshot already exists at `checkpoint`, it is replaced.
     /// If the buffer is at
     /// [`DbOptions::snapshot_capacity`](crate::DbOptions::snapshot_capacity),
-    /// the snapshot with the lowest checkpoint number is evicted.
+    /// the snapshot with the lowest checkpoint number is evicted. If
+    /// capacity is `0`, snapshotting is disabled and this call is a
+    /// no-op.
     pub fn take_snapshot(&self, checkpoint: u64) {
+        if self.inner.snapshot_capacity == 0 {
+            return;
+        }
         // The rocksdb snapshot is captured *inside* the lock so that
         // two concurrent `take_snapshot(N)` calls cannot land in
         // checkpoint-N → older-state order: with the capture outside
@@ -384,7 +387,7 @@ impl Db {
         let entry = Arc::new(SnapshotEntry { snapshot });
 
         snaps.insert(checkpoint, entry);
-        while snaps.len() > self.inner.snapshot_capacity.get() {
+        while snaps.len() > self.inner.snapshot_capacity {
             snaps.pop_first();
         }
     }
