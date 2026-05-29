@@ -299,7 +299,7 @@ mod tests {
 
         fn process(
             &self,
-            _: &sui_types::full_checkpoint_content::CheckpointData,
+            _: &sui_types::full_checkpoint_content::Checkpoint,
         ) -> anyhow::Result<Vec<Self::Value>> {
             Ok(vec![])
         }

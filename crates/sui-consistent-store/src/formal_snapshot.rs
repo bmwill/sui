@@ -550,7 +550,7 @@ mod tests {
         use bytes::BufMut;
         use object_store::local::LocalFileSystem;
         use sui_types::base_types::ObjectID;
-        use sui_types::full_checkpoint_content::CheckpointData;
+        use sui_types::full_checkpoint_content::Checkpoint;
         use sui_types::object::Object;
         use tempfile::TempDir;
 
@@ -681,7 +681,7 @@ mod tests {
                 Ok(())
             }
 
-            fn process(&self, _: &CheckpointData) -> anyhow::Result<Vec<Self::Value>> {
+            fn process(&self, _: &Checkpoint) -> anyhow::Result<Vec<Self::Value>> {
                 Ok(vec![])
             }
 

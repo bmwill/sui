@@ -33,9 +33,9 @@
 //!   its own accumulator; the driver feeds it to
 //!   [`commit`](Pipeline::commit) when the shard is done.
 //! - [`process`](Pipeline::process) is called once per checkpoint
-//!   to extract typed rows from a [`CheckpointData`]. Pure
-//!   function; called from worker threads under the framework's
-//!   processor stage and from the validator's checkpoint executor.
+//!   to extract typed rows from a [`Checkpoint`]. Pure function;
+//!   called from worker threads under the framework's processor
+//!   stage and from the validator's checkpoint executor.
 //! - [`batch`](Pipeline::batch) folds rows from one or more
 //!   consecutive checkpoints into the pipeline's accumulator. The
 //!   driver decides how many checkpoints to fold per commit, up to
@@ -53,7 +53,7 @@
 //! free conversion via `?` because [`crate::error::Error`]
 //! implements [`std::error::Error`].
 
-use sui_types::full_checkpoint_content::CheckpointData;
+use sui_types::full_checkpoint_content::Checkpoint;
 use sui_types::object::Object;
 
 use crate::Batch;
@@ -130,7 +130,7 @@ pub trait Pipeline: Send + Sync + 'static {
     /// transient failures. Permanently un-processable input
     /// (malformed objects, protocol-violating data) should panic so
     /// the indexer halts and an operator is alerted.
-    fn process(&self, checkpoint: &CheckpointData) -> anyhow::Result<Vec<Self::Value>>;
+    fn process(&self, checkpoint: &Checkpoint) -> anyhow::Result<Vec<Self::Value>>;
 
     /// Fold values from one or more checkpoints into the running
     /// accumulator.
@@ -286,10 +286,10 @@ mod tests {
             Ok(())
         }
 
-        fn process(&self, checkpoint: &CheckpointData) -> anyhow::Result<Vec<Self::Value>> {
+        fn process(&self, checkpoint: &Checkpoint) -> anyhow::Result<Vec<Self::Value>> {
             let mut rows = vec![];
             for tx in &checkpoint.transactions {
-                for object in &tx.output_objects {
+                for object in tx.output_objects(&checkpoint.object_set) {
                     rows.push(VersionRow {
                         id: object.id(),
                         version: object.version().value(),
@@ -400,12 +400,12 @@ mod tests {
             .create_owned_object(1)
             .create_owned_object(2)
             .finish_transaction();
-        let cp1: CheckpointData = builder.build_checkpoint().into();
+        let cp1: Checkpoint = builder.build_checkpoint();
         builder = builder
             .start_transaction(0)
             .mutate_owned_object(1)
             .finish_transaction();
-        let cp2: CheckpointData = builder.build_checkpoint().into();
+        let cp2: Checkpoint = builder.build_checkpoint();
 
         let values1 = pipeline.process(&cp1).unwrap();
         let values2 = pipeline.process(&cp2).unwrap();

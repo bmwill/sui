@@ -9,9 +9,8 @@
 //! sequence:
 //!
 //! 1. [`Processor::process`] takes a fetched
-//!    [`Checkpoint`](sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint),
-//!    converts it to [`CheckpointData`] (the form the consumer
-//!    pipeline takes), and forwards to
+//!    [`Checkpoint`](sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint)
+//!    and forwards it to
 //!    [`Pipeline::process`](sui_consistent_store::Pipeline::process).
 //! 2. [`sequential::Handler::batch`] folds the resulting
 //!    [`Pipeline::Value`] entries into the pipeline's typed
@@ -34,7 +33,6 @@ use sui_consistent_store::Pipeline;
 use sui_indexer_alt_framework::pipeline::Processor;
 use sui_indexer_alt_framework::pipeline::sequential;
 use sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint;
-use sui_indexer_alt_framework::types::full_checkpoint_content::CheckpointData;
 
 use crate::Connection;
 use crate::Store;
@@ -66,14 +64,7 @@ impl<P: Pipeline> Processor for AltAdapter<P> {
     type Value = P::Value;
 
     async fn process(&self, checkpoint: &Arc<Checkpoint>) -> anyhow::Result<Vec<Self::Value>> {
-        // The framework feeds us the newer `Checkpoint` type; the
-        // consumer pipeline takes the canonical `CheckpointData`.
-        // Convert via the `From` impl. The conversion materializes
-        // per-tx input/output object lists from the effects, which
-        // is the work the per-checkpoint cost is dominated by; it
-        // is unavoidable when bridging the two type families.
-        let cp_data: CheckpointData = (**checkpoint).clone().into();
-        self.0.process(&cp_data)
+        self.0.process(checkpoint)
     }
 }
 
@@ -218,10 +209,10 @@ mod tests {
             Ok(())
         }
 
-        fn process(&self, checkpoint: &CheckpointData) -> anyhow::Result<Vec<Self::Value>> {
+        fn process(&self, checkpoint: &Checkpoint) -> anyhow::Result<Vec<Self::Value>> {
             let mut out = vec![];
             for tx in &checkpoint.transactions {
-                for o in &tx.output_objects {
+                for o in tx.output_objects(&checkpoint.object_set) {
                     out.push((o.id(), o.version().value()));
                 }
             }

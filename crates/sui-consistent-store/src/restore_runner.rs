@@ -484,7 +484,7 @@ mod tests {
 
         fn process(
             &self,
-            _checkpoint: &sui_types::full_checkpoint_content::CheckpointData,
+            _checkpoint: &sui_types::full_checkpoint_content::Checkpoint,
         ) -> anyhow::Result<Vec<Self::Value>> {
             Ok(vec![])
         }
@@ -559,7 +559,7 @@ mod tests {
 
         fn process(
             &self,
-            _checkpoint: &sui_types::full_checkpoint_content::CheckpointData,
+            _checkpoint: &sui_types::full_checkpoint_content::Checkpoint,
         ) -> anyhow::Result<Vec<Self::Value>> {
             Ok(vec![])
         }

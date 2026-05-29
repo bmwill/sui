@@ -56,7 +56,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use parking_lot::Mutex;
-use sui_types::full_checkpoint_content::CheckpointData;
+use sui_types::full_checkpoint_content::Checkpoint;
 
 use crate::Batch;
 use crate::Db;
@@ -88,7 +88,7 @@ trait TipPipeline: Send + Sync + 'static {
     /// returned boxed as `dyn Any` for storage in the staging map.
     fn process_into_batch(
         &self,
-        checkpoint: &CheckpointData,
+        checkpoint: &Checkpoint,
     ) -> anyhow::Result<Box<dyn Any + Send>>;
 
     /// Drain the staged accumulator (originally returned by
@@ -118,7 +118,7 @@ impl<P: Pipeline> TipPipeline for PipelineAdapter<P> {
 
     fn process_into_batch(
         &self,
-        checkpoint: &CheckpointData,
+        checkpoint: &Checkpoint,
     ) -> anyhow::Result<Box<dyn Any + Send>> {
         let values = self
             .pipeline
@@ -207,8 +207,8 @@ impl CheckpointExecutorAdapter {
     /// Errors from any pipeline's
     /// [`process`](crate::Pipeline::process) abort the call before
     /// any staging happens — there is no partial-stage state.
-    pub fn index_checkpoint(&self, checkpoint: &CheckpointData) -> anyhow::Result<()> {
-        let seq = checkpoint.checkpoint_summary.sequence_number;
+    pub fn index_checkpoint(&self, checkpoint: &Checkpoint) -> anyhow::Result<()> {
+        let seq = checkpoint.summary.sequence_number;
 
         // Build every pipeline's accumulator before touching the
         // pending map, so a mid-way failure does not leave
@@ -404,10 +404,10 @@ mod tests {
             Ok(())
         }
 
-        fn process(&self, checkpoint: &CheckpointData) -> anyhow::Result<Vec<Self::Value>> {
+        fn process(&self, checkpoint: &Checkpoint) -> anyhow::Result<Vec<Self::Value>> {
             let mut out = vec![];
             for tx in &checkpoint.transactions {
-                for object in &tx.output_objects {
+                for object in tx.output_objects(&checkpoint.object_set) {
                     out.push((object.id(), object.version().value()));
                 }
             }
@@ -453,10 +453,10 @@ mod tests {
             Ok(())
         }
 
-        fn process(&self, checkpoint: &CheckpointData) -> anyhow::Result<Vec<Self::Value>> {
+        fn process(&self, checkpoint: &Checkpoint) -> anyhow::Result<Vec<Self::Value>> {
             let mut out = vec![];
             for tx in &checkpoint.transactions {
-                for object in &tx.output_objects {
+                for object in tx.output_objects(&checkpoint.object_set) {
                     out.push(object.id());
                 }
             }
@@ -494,15 +494,14 @@ mod tests {
         (dir, db, schema, adapter)
     }
 
-    /// Build a single-checkpoint `CheckpointData` that creates one
+    /// Build a single-checkpoint `Checkpoint` that creates one
     /// owned object with the given id.
-    fn checkpoint_with_object(checkpoint_seq: u64, object_idx: u64) -> CheckpointData {
+    fn checkpoint_with_object(checkpoint_seq: u64, object_idx: u64) -> Checkpoint {
         TestCheckpointBuilder::new(checkpoint_seq)
             .start_transaction(0)
             .create_owned_object(object_idx)
             .finish_transaction()
             .build_checkpoint()
-            .into()
     }
 
     #[test]
@@ -516,7 +515,7 @@ mod tests {
         let expected_objects = cp
             .transactions
             .iter()
-            .flat_map(|tx| &tx.output_objects)
+            .flat_map(|tx| tx.output_objects(&cp.object_set))
             .count();
         adapter.index_checkpoint(&cp).unwrap();
         assert_eq!(adapter.pending_checkpoint_count(), 1);
@@ -544,8 +543,11 @@ mod tests {
         // is the same id reused).
         let all_ids: std::collections::BTreeSet<ObjectID> = [&cp1, &cp2, &cp3]
             .iter()
-            .flat_map(|cp| cp.transactions.iter())
-            .flat_map(|tx| &tx.output_objects)
+            .flat_map(|cp| {
+                cp.transactions
+                    .iter()
+                    .flat_map(|tx| tx.output_objects(&cp.object_set))
+            })
             .map(|o| o.id())
             .collect();
 
@@ -607,13 +609,13 @@ mod tests {
         let second_ids: std::collections::BTreeSet<ObjectID> = cp2
             .transactions
             .iter()
-            .flat_map(|tx| &tx.output_objects)
+            .flat_map(|tx| tx.output_objects(&cp2.object_set))
             .map(|o| o.id())
             .collect();
         let first_only_id = cp1
             .transactions
             .iter()
-            .flat_map(|tx| &tx.output_objects)
+            .flat_map(|tx| tx.output_objects(&cp1.object_set))
             .map(|o| o.id())
             .find(|id| !second_ids.contains(id));
 
