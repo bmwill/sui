@@ -4,12 +4,10 @@
 //! Foundational, type-safe wrapper around RocksDB for Sui's on-disk
 //! indexes.
 //!
-//! See `PLAN.md` at the crate root for the design and the
-//! implementation roadmap. The crate is in active build-out: the
-//! encoding traits, the database wrapper, typed point reads, atomic
-//! batched writes, typed iteration, and the in-memory snapshot
-//! model have landed; typed merge operators and a filesystem
-//! checkpoint helper follow.
+//! Provides the encoding traits, the database wrapper, typed point
+//! reads, atomic batched writes, typed iteration, in-memory
+//! snapshots, and the [`Pipeline`] trait that downstream indexing
+//! crates build on.
 //!
 //! [`rocksdb`] is re-exported so consumers can construct the
 //! [`rocksdb::Options`] / [`rocksdb::WriteOptions`] values our
