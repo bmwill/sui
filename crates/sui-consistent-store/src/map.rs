@@ -295,13 +295,11 @@ where
     /// `write_batch` (a raw [`rocksdb::WriteBatch`]).
     ///
     /// Useful for callers that need to mix typed writes into a
-    /// pre-existing [`rocksdb::WriteBatch`] — for example, restore
-    /// drivers staging a partition-complete marker into the same
-    /// batch that holds the shard's merge-mode writes (see
-    /// [`Batch::finalize_for_shard`](crate::Batch::finalize_for_shard)).
-    /// The write does not become visible until the caller commits
-    /// `write_batch` themselves; for the routine "stage and commit"
-    /// path use [`Batch::put`](crate::Batch::put) instead.
+    /// pre-existing [`rocksdb::WriteBatch`] supplied from outside
+    /// this crate. The write does not become visible until the
+    /// caller commits `write_batch` themselves; for the routine
+    /// "stage and commit" path use [`Batch::put`](crate::Batch::put)
+    /// instead.
     ///
     /// Constrained to a [`Db`]-bound handle: writes always land at
     /// the live tip.

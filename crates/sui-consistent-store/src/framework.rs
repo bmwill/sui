@@ -103,10 +103,9 @@ impl Decode for PipelineTaskKey {
 /// 1. `None` → `InProgress { partitions_complete: empty, target_checkpoint: T }`
 ///    when restore begins.
 /// 2. `InProgress` → `InProgress` with one more partition marked
-///    complete, after each `Db::ingest_files_cf` for that
-///    partition succeeds.
+///    complete, atomically with each shard's data writes.
 /// 3. `InProgress` → `Complete { restored_at: T }` when every
-///    partition has been ingested.
+///    partition has been committed.
 ///
 /// Tip indexing for a pipeline must wait until its state reaches
 /// `Complete`. Drivers check this on startup.

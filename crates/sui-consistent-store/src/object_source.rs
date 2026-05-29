@@ -53,8 +53,8 @@ use crate::RestoreRunner;
 /// in shape and so different impls can return different concrete
 /// iterator types without leaking the type through the public
 /// surface. Per-object boxing cost is one vtable indirection per
-/// `next()` call, which is negligible relative to the SST building
-/// work per object on the consumer side.
+/// `next()` call, which is negligible relative to the per-object
+/// pipeline work on the consumer side.
 ///
 /// The trait requires `Send + Sync` on the source itself so the
 /// parallel driver can share `&self` across worker threads. The
@@ -402,14 +402,11 @@ mod tests {
         let expected_ids: BTreeSet<ObjectID> = objects.iter().map(|o| o.id()).collect();
         let source = MockSource::new(objects);
 
-        let staging = TempDir::new().unwrap();
         let runner = Arc::new(RestoreRunner::new(
             db.clone(),
             Arc::new(VersionsPipeline),
             schema.clone(),
             42,
-            staging.path().to_path_buf(),
-            rocksdb::Options::default(),
         ));
 
         restore_pipeline_from_object_source(runner.clone(), &source, 5).unwrap();
@@ -445,14 +442,11 @@ mod tests {
         let objects = vec![obj_with_first_byte(0), obj_with_first_byte(255)];
         let source = MockSource::new(objects);
 
-        let staging = TempDir::new().unwrap();
         let runner = Arc::new(RestoreRunner::new(
             db.clone(),
             Arc::new(VersionsPipeline),
             schema.clone(),
             1,
-            staging.path().to_path_buf(),
-            rocksdb::Options::default(),
         ));
 
         // shard_bits = 1 → 2 shards covering [0x00..0x7F] and
@@ -466,14 +460,11 @@ mod tests {
     fn restore_with_empty_source_still_marks_complete() {
         let (_dir, db, schema) = open_db();
         let source = MockSource::new(vec![]);
-        let staging = TempDir::new().unwrap();
         let runner = Arc::new(RestoreRunner::new(
             db.clone(),
             Arc::new(VersionsPipeline),
             schema.clone(),
             7,
-            staging.path().to_path_buf(),
-            rocksdb::Options::default(),
         ));
 
         restore_pipeline_from_object_source(runner, &source, 3).unwrap();
@@ -487,14 +478,11 @@ mod tests {
     fn restore_rejects_shard_bits_zero() {
         let (_dir, db, schema) = open_db();
         let source = MockSource::new(vec![]);
-        let staging = TempDir::new().unwrap();
         let runner = Arc::new(RestoreRunner::new(
             db.clone(),
             Arc::new(VersionsPipeline),
             schema.clone(),
             1,
-            staging.path().to_path_buf(),
-            rocksdb::Options::default(),
         ));
         let err = restore_pipeline_from_object_source(runner, &source, 0).unwrap_err();
         assert!(format!("{err:#}").contains("shard_bits"));
@@ -504,14 +492,11 @@ mod tests {
     fn restore_rejects_shard_bits_too_large() {
         let (_dir, db, schema) = open_db();
         let source = MockSource::new(vec![]);
-        let staging = TempDir::new().unwrap();
         let runner = Arc::new(RestoreRunner::new(
             db.clone(),
             Arc::new(VersionsPipeline),
             schema.clone(),
             1,
-            staging.path().to_path_buf(),
-            rocksdb::Options::default(),
         ));
         let err = restore_pipeline_from_object_source(runner, &source, 9).unwrap_err();
         assert!(format!("{err:#}").contains("shard_bits"));
@@ -530,14 +515,11 @@ mod tests {
         let objects = vec![obj_with_first_byte(0x00), obj_with_first_byte(0xFF)];
         let source = MockSource::new(objects);
 
-        let staging = TempDir::new().unwrap();
         let runner = Arc::new(RestoreRunner::new(
             db.clone(),
             Arc::new(VersionsPipeline),
             schema.clone(),
             42,
-            staging.path().to_path_buf(),
-            rocksdb::Options::default(),
         ));
 
         // Pre-mark partition id [1, 0] (shard_bits=1, index=0) as

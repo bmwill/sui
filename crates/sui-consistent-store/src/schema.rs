@@ -94,11 +94,10 @@ pub trait Schema: Sized {
     ///
     /// Each entry is a [`CfDescriptor`] carrying a column-family
     /// name (a `&'static str` so the schema's CF set is fixed at
-    /// compile time), its [`rocksdb::Options`] applied at create
-    /// time, and a [`RestoreMode`] that controls how restore-time
-    /// shard writes are routed for the CF. `base_options` is
-    /// supplied by [`Db::open`] and is the database-level options
-    /// configured on [`DbOptions::db_options`](crate::DbOptions::db_options);
+    /// compile time) and its [`rocksdb::Options`] applied at create
+    /// time. `base_options` is supplied by [`Db::open`] and is the
+    /// database-level options configured on
+    /// [`DbOptions::db_options`](crate::DbOptions::db_options);
     /// implementations typically clone it as the starting point for
     /// each CF and layer per-CF tweaks (merge operators, compaction
     /// filters, custom block sizes) on top.
@@ -118,90 +117,23 @@ pub trait Schema: Sized {
     fn open(db: &Db) -> Result<Self, OpenError>;
 }
 
-/// How restore-time shard writes are routed for a column family.
-///
-/// Restore drivers process objects in shards (a partition of the
-/// `ObjectID` space, or a partition of a formal snapshot). Each
-/// shard's writes finalize either into a sorted SST atomically
-/// ingested at the bottommost LSM level, or into a
-/// [`rocksdb::WriteBatch`] committed through the memtable + WAL
-/// path. CFs choose the mode in [`Schema::cfs`] via their
-/// [`CfDescriptor`].
-///
-/// # Trade-offs
-///
-/// - [`BulkIngest`](Self::BulkIngest): the default. Restore writes
-///   accumulate in a per-CF sorted in-memory buffer, finalized into
-///   a single SST per shard, and atomically ingested. Bypasses the
-///   memtable, the WAL, and L0 entirely. *Constraint:* one
-///   operation per key per shard, because an SST file rejects
-///   duplicate consecutive keys. Pipelines must fold by key in
-///   their accumulator before emitting writes.
-///
-/// - [`MergeViaWriteBatch`](Self::MergeViaWriteBatch): restore
-///   writes route into a [`rocksdb::WriteBatch`], committed
-///   atomically alongside the shard's partition-complete marker.
-///   *No per-key constraint:* the pipeline can emit many
-///   [`merge`](crate::Batch::merge) operands for the same key per
-///   shard, and the registered merge operator combines them. Goes
-///   through the memtable + WAL like a regular write — slower than
-///   bulk ingest, but correct for CFs whose merge semantics require
-///   accumulation of many operands per key without an external
-///   fold.
-///
-/// # Atomicity
-///
-/// Within a single shard's commit, [`BulkIngest`](Self::BulkIngest)
-/// SSTs are ingested *first*; the
-/// [`MergeViaWriteBatch`](Self::MergeViaWriteBatch) operations and
-/// the shard's partition-complete marker land together in a single
-/// [`rocksdb::WriteBatch`] commit *second*. A crash between the two
-/// steps leaves the shard not marked complete, so resume re-runs
-/// the shard from scratch: SST re-ingest is idempotent (last write
-/// wins for puts), and merge-mode writes from the prior run never
-/// committed, so no double-merge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RestoreMode {
-    /// SST bulk ingestion. The default; suitable for CFs without
-    /// merge operators (or with merge operators whose restore-time
-    /// values are pre-folded by the pipeline). One op per key per
-    /// shard.
-    #[default]
-    BulkIngest,
-
-    /// Routed through a [`rocksdb::WriteBatch`]. Suitable for CFs
-    /// with merge operators that require many operands per key per
-    /// shard. Slower than bulk ingest but allows ordinary merge
-    /// semantics.
-    MergeViaWriteBatch,
-}
-
 /// Describes one column family in a [`Schema`].
 ///
-/// Construct via [`CfDescriptor::new`]; layer optional behavior
-/// (restore mode, etc.) via the builder methods.
+/// Construct via [`CfDescriptor::new`].
 ///
 /// # Examples
 ///
 /// ```
 /// use sui_consistent_store::CfDescriptor;
-/// use sui_consistent_store::RestoreMode;
 ///
 /// let opts = rocksdb::Options::default();
-/// // CFs without a merge operator use bulk ingestion by default.
-/// let owners = CfDescriptor::new("owners", opts.clone());
-/// // CFs whose merge operator should accept many operands per key
-/// // per shard during restore opt into the WriteBatch mode.
-/// let balances = CfDescriptor::new("balances", opts)
-///     .with_restore_mode(RestoreMode::MergeViaWriteBatch);
+/// let owners = CfDescriptor::new("owners", opts);
 /// ```
 pub struct CfDescriptor {
     /// Column-family name.
     pub name: &'static str,
     /// Per-CF RocksDB options applied at create time.
     pub options: rocksdb::Options,
-    /// How restore-time shard writes are routed for this CF.
-    pub restore_mode: RestoreMode,
 }
 
 impl std::fmt::Debug for CfDescriptor {
@@ -209,26 +141,14 @@ impl std::fmt::Debug for CfDescriptor {
         // `rocksdb::Options` does not implement Debug, so summarize.
         f.debug_struct("CfDescriptor")
             .field("name", &self.name)
-            .field("restore_mode", &self.restore_mode)
             .finish_non_exhaustive()
     }
 }
 
 impl CfDescriptor {
-    /// Construct a descriptor with the default
-    /// [`RestoreMode::BulkIngest`].
+    /// Construct a descriptor.
     pub fn new(name: &'static str, options: rocksdb::Options) -> Self {
-        Self {
-            name,
-            options,
-            restore_mode: RestoreMode::default(),
-        }
-    }
-
-    /// Set the restore-time write-routing mode for this CF.
-    pub fn with_restore_mode(mut self, mode: RestoreMode) -> Self {
-        self.restore_mode = mode;
-        self
+        Self { name, options }
     }
 }
 

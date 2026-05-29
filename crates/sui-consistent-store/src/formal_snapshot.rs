@@ -223,7 +223,8 @@ impl FormalSnapshot {
 /// 2. Hands the parsed objects to
 ///    [`runner.process_shard`](RestoreRunner::process_shard) in a
 ///    blocking task — `process_shard` is sync because the per-shard
-///    work is CPU-bound SST building, not I/O.
+///    work is CPU-bound (folding into the accumulator and encoding
+///    into a [`Batch`](crate::Batch)), not I/O.
 ///
 /// On success, calls [`runner.finish()`](RestoreRunner::finish) to
 /// transition the pipeline to
@@ -265,9 +266,9 @@ pub async fn restore_pipeline_from_formal_snapshot<P: Pipeline>(
                         meta.bucket, meta.partition,
                     )
                 })?;
-                // `process_shard` is CPU-bound (SST building) and
-                // sync; run it on a blocking pool so the async
-                // executor stays responsive.
+                // `process_shard` is CPU-bound (folding + batch
+                // encoding) and sync; run it on a blocking pool so
+                // the async executor stays responsive.
                 tokio::task::spawn_blocking(move || {
                     runner.process_shard(&partition_id, parsed.objects.into_iter().map(Ok))
                 })
@@ -705,7 +706,6 @@ mod tests {
             // 1..=3 and 4..=6.
             let snapshot_dir = TempDir::new().unwrap();
             let db_dir = TempDir::new().unwrap();
-            let staging = TempDir::new().unwrap();
 
             build_snapshot(
                 snapshot_dir.path(),
@@ -742,8 +742,6 @@ mod tests {
                 Arc::new(VersionsPipeline),
                 schema.clone(),
                 snapshot.epoch(),
-                staging.path().to_path_buf(),
-                rocksdb::Options::default(),
             ));
             restore_pipeline_from_formal_snapshot(runner, snapshot, 2)
                 .await
@@ -774,7 +772,6 @@ mod tests {
             // complete and write nothing for it.
             let snapshot_dir = TempDir::new().unwrap();
             let db_dir = TempDir::new().unwrap();
-            let staging = TempDir::new().unwrap();
 
             build_snapshot(
                 snapshot_dir.path(),
@@ -828,8 +825,6 @@ mod tests {
                 Arc::new(VersionsPipeline),
                 schema.clone(),
                 snapshot.epoch(),
-                staging.path().to_path_buf(),
-                rocksdb::Options::default(),
             ));
             restore_pipeline_from_formal_snapshot(runner, snapshot, 1)
                 .await

@@ -12,9 +12,9 @@
 //! checkpoint helper follow.
 //!
 //! [`rocksdb`] is re-exported so consumers can construct the
-//! [`rocksdb::Options`] / [`rocksdb::IngestExternalFileOptions`] /
-//! [`rocksdb::WriteOptions`] values our public API takes without
-//! adding a direct rocksdb dependency themselves.
+//! [`rocksdb::Options`] / [`rocksdb::WriteOptions`] values our
+//! public API takes without adding a direct rocksdb dependency
+//! themselves.
 pub use rocksdb;
 
 pub mod batch;
@@ -34,7 +34,6 @@ pub mod restore_runner;
 pub mod schema;
 pub mod snapshot;
 pub mod snapshot_format;
-pub mod sst_writer;
 pub mod storage;
 
 pub use crate::batch::Batch;
@@ -59,8 +58,6 @@ pub use crate::pipeline::Pipeline;
 pub use crate::reader::Reader;
 pub use crate::restore_runner::RestoreRunner;
 pub use crate::schema::CfDescriptor;
-pub use crate::schema::RestoreMode;
 pub use crate::schema::Schema;
 pub use crate::schema::SchemaAtSnapshot;
 pub use crate::snapshot::Snapshot;
-pub use crate::sst_writer::SstWriter;

@@ -44,22 +44,6 @@
 //!   a [`Batch`]. The driver commits the batch atomically alongside
 //!   any other state it owns (watermarks, restore markers).
 //!
-//! # Why an accumulator-style `restore`
-//!
-//! The restore driver finalizes each shard's writes into an SST
-//! file ingested via
-//! [`Db::ingest_files_cf`](crate::Db::ingest_files_cf). An SST
-//! rejects duplicate consecutive keys (it must be strictly sorted),
-//! so a shard cannot emit more than one operation per key.
-//! Accumulator-style restore — fold per-object updates into a
-//! key-keyed accumulator, then emit one op per key in
-//! [`commit`](Pipeline::commit) — makes that invariant a natural
-//! consequence of the pipeline's data structure rather than a
-//! constraint the runner has to police. Cross-shard merges still
-//! work: two shards that touch the same key produce two SSTs each
-//! with one merge entry, and the merge operator combines them at
-//! read or compaction time.
-//!
 //! # Why `anyhow::Error` rather than [`crate::error::Error`]
 //!
 //! Existing indexer-alt pipelines return [`anyhow::Error`] from
@@ -128,15 +112,15 @@ pub trait Pipeline: Send + Sync + 'static {
     /// to [`RESTORE_FANOUT`](Self::RESTORE_FANOUT) in parallel per
     /// pipeline. Each worker owns its own `accumulator`; objects
     /// may arrive in any order within a worker's slice. The
-    /// pipeline must fold (combine deltas, dedup by key) so that
-    /// when the driver later calls [`commit`](Self::commit) the
-    /// accumulator yields at most one operation per key — the
-    /// invariant SST ingestion requires.
+    /// pipeline is free to fold (combine deltas, dedup by key)
+    /// before [`commit`](Self::commit) emits writes — this avoids
+    /// staging redundant operations in the shard's
+    /// [`Batch`](crate::Batch).
     ///
     /// Cross-shard collisions are RocksDB's concern: two shards
-    /// that both touch the same key each produce one merge entry
-    /// in their respective SSTs, and the registered merge operator
-    /// combines them after ingest.
+    /// that both touch the same key each emit their own ops, and
+    /// the registered merge operator (for merge-CFs) or last-write
+    /// semantics (for put-CFs) reconcile them.
     fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()>;
 
     /// Extract typed values from a checkpoint.
@@ -385,10 +369,9 @@ mod tests {
 
     #[test]
     fn restore_dedups_repeated_objects_into_one_accumulator_entry() {
-        // Two restore calls for the same object id (same shard) fold
-        // into the accumulator: one entry, the highest version wins.
-        // This is the invariant SST ingestion depends on — at most
-        // one operation per key per shard's commit.
+        // Two restore calls for the same object id (same shard)
+        // fold into the accumulator: one entry, the highest
+        // version wins.
         let pipeline = ObjectVersionPipeline;
         let id = ObjectID::from_single_byte(7);
         let obj = Object::immutable_with_id_for_testing(id);

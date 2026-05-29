@@ -15,7 +15,7 @@
 //! # Lifecycle
 //!
 //! ```text
-//! RestoreRunner::new(db, pipeline, schema, target_checkpoint, …)
+//! RestoreRunner::new(db, pipeline, schema, target_checkpoint)
 //!     ↓
 //! runner.begin()  →  Set { partitions already complete from a prior run }
 //!     ↓
@@ -23,31 +23,20 @@
 //! in parallel:
 //!     runner.process_shard(partition_id, objects)
 //!         1. fold objects into Pipeline::Batch via Pipeline::restore
-//!         2. drain into a shard-backed Batch via Pipeline::commit
-//!         3. finalize into a ShardFinalize (per-CF SSTs +
-//!            merge-mode WriteBatch)
-//!         4. stage the partition-complete marker into the WriteBatch
-//!         5. ShardFinalize::commit() — ingest SSTs first, then
-//!            commit the WriteBatch (atomic with the marker)
+//!         2. drain into a Db::batch() via Pipeline::commit
+//!         3. stage the partition-complete marker into the same batch
+//!         4. Batch::commit() — atomic across pipeline data and marker
 //!     ↓
 //! runner.finish()  →  RestoreState::Complete { restored_at }
 //! ```
 //!
-//! # Atomicity across the two write paths
+//! # Atomicity and resumability
 //!
-//! Step 5 ingests SSTs before committing the WriteBatch. A crash
-//! between the two leaves the partition-complete marker unwritten,
-//! so resume re-runs the shard from scratch:
-//!
-//! - Re-ingest of a freshly built SST against an existing one for
-//!   the same key range is idempotent for puts (last-write-wins)
-//!   and tombstones; the bottom-most level converges to the same
-//!   observable state.
-//! - The merge-mode WriteBatch never committed on the first run,
-//!   so no merge operands landed — re-running the shard does not
-//!   double-merge.
-//!
-//! # Resumability
+//! Each shard's pipeline writes and its partition-complete marker
+//! land in a single [`rocksdb::WriteBatch`] commit. A crash before
+//! the commit leaves the marker unwritten *and* the data writes
+//! unwritten, so resume re-runs the shard from scratch with no
+//! double-application of merges or duplicate puts.
 //!
 //! [`begin`](RestoreRunner::begin) inspects the existing
 //! [`RestoreState`] for the pipeline:
@@ -76,7 +65,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -111,8 +99,6 @@ pub struct RestoreRunner<P: Pipeline> {
     pipeline: Arc<P>,
     schema: Arc<P::Schema>,
     target_checkpoint: u64,
-    staging_dir: PathBuf,
-    sst_options: rocksdb::Options,
     /// Serializes read-modify-write of the persisted `__restore`
     /// state across concurrent shard processors. Updates are
     /// once-per-shard and small, so the contention is minimal.
@@ -121,26 +107,11 @@ pub struct RestoreRunner<P: Pipeline> {
 
 impl<P: Pipeline> RestoreRunner<P> {
     /// Create a new runner.
-    ///
-    /// `staging_dir` should be a directory dedicated to this
-    /// restore (typically created with [`tempfile::TempDir`] or
-    /// otherwise unique per run). The runner creates per-shard
-    /// subdirectories underneath it, and removes them on shard
-    /// success. The parent directory is the caller's responsibility
-    /// to clean up.
-    ///
-    /// `sst_options` is the [`rocksdb::Options`] used to construct
-    /// per-shard [`SstWriter`](crate::SstWriter) instances. The
-    /// default comparator (byte-wise) must match the target CFs;
-    /// schemas using non-default comparators must supply matching
-    /// options here.
     pub fn new(
         db: Db,
         pipeline: Arc<P>,
         schema: Arc<P::Schema>,
         target_checkpoint: u64,
-        staging_dir: PathBuf,
-        sst_options: rocksdb::Options,
     ) -> Self {
         let framework = FrameworkSchema::new(db.clone());
         Self {
@@ -149,8 +120,6 @@ impl<P: Pipeline> RestoreRunner<P> {
             pipeline,
             schema,
             target_checkpoint,
-            staging_dir,
-            sst_options,
             state_lock: Mutex::new(()),
         }
     }
@@ -244,19 +213,16 @@ impl<P: Pipeline> RestoreRunner<P> {
     }
 
     /// Process one shard: fold its objects into the accumulator,
-    /// drain into a shard-backed batch, finalize into per-CF SSTs
-    /// plus a merge-mode WriteBatch, and atomically commit (SSTs
-    /// first, then WriteBatch carrying the partition-complete
-    /// marker).
+    /// drain into a typed [`Batch`](crate::Batch), stage the
+    /// partition-complete marker into the same batch, and commit
+    /// atomically.
     ///
     /// `partition_id` is the opaque driver-supplied identifier
-    /// that distinguishes shards in the persisted progress set;
-    /// it is also hex-encoded into the staging subdirectory name
-    /// so each shard's SST files live in their own scratch space.
+    /// that distinguishes shards in the persisted progress set.
     ///
     /// `objects` is an iterator of fallible objects. Iterator
-    /// errors abort the shard before any SST is written, so partial
-    /// state never lands in the database.
+    /// errors abort the shard before the batch is committed, so
+    /// partial state never lands in the database.
     pub fn process_shard<I>(&self, partition_id: &[u8], objects: I) -> anyhow::Result<()>
     where
         I: IntoIterator<Item = anyhow::Result<Object>>,
@@ -280,49 +246,26 @@ impl<P: Pipeline> RestoreRunner<P> {
             object_count += 1;
         }
 
-        // 2. Drain the accumulator into a shard-backed Batch. The
-        // batch routes per-CF: BulkIngest CFs buffer into per-CF
-        // sorted maps (one op per key); MergeViaWriteBatch CFs
-        // stream into an internal rocksdb::WriteBatch.
-        let mut batch = self.db.shard_batch();
+        // 2. Drain the accumulator into a Batch.
+        let mut batch = self.db.batch();
         let row_count = self.pipeline.commit(&self.schema, &acc, &mut batch)?;
         drop(acc);
 
-        // 3. Finalize. Even an empty batch produces a ShardFinalize
-        // (with zero SSTs and an empty WriteBatch) — we still need
-        // to stage and commit the partition-complete marker.
-        let shard_dir = self.shard_staging_dir(partition_id);
-        std::fs::create_dir_all(&shard_dir)?;
-        let mut finalize = batch.finalize_for_shard(&shard_dir, &self.sst_options)?;
-
-        // 4. Stage the partition-complete marker into the same
-        // WriteBatch. Done under `state_lock` so the
-        // read-modify-write of `partitions_complete` is serialized
-        // with concurrent shard processors.
+        // 3. Stage the partition-complete marker into the same
+        // batch, then commit. The state-lock guard serializes the
+        // read-modify-write of `partitions_complete` against
+        // concurrent shard processors, and the WriteBatch's
+        // atomicity ensures the marker and data writes either both
+        // land or neither does.
         {
             let _guard = self.state_lock.lock();
             let next_state = self.next_partition_state(partition_id)?;
-            self.framework.restore.stage_put(
-                finalize.write_batch_mut(),
+            batch.put(
+                &self.framework.restore,
                 &PipelineTaskKey::new(P::NAME),
                 &next_state,
             )?;
-            // 5. Atomic commit: SSTs ingest first; if a crash
-            // happens between ingest and write_batch commit, the
-            // marker never lands, the shard re-runs on resume, and
-            // (a) SST re-ingest is idempotent, (b) merge-mode ops
-            // never committed so no double-merge.
-            finalize.commit()?;
-        }
-
-        // 6. Best-effort: remove the (now-empty) shard staging dir.
-        if let Err(e) = std::fs::remove_dir_all(&shard_dir) {
-            debug!(
-                pipeline = P::NAME,
-                partition = %hex_encode(partition_id),
-                error = %e,
-                "Failed to remove shard staging dir (non-fatal)",
-            );
+            batch.commit()?;
         }
 
         debug!(
@@ -356,19 +299,12 @@ impl<P: Pipeline> RestoreRunner<P> {
         Ok(())
     }
 
-    /// The path used to stage SSTs for `partition_id`. Exposed so
-    /// tests and drivers can introspect the layout if needed.
-    fn shard_staging_dir(&self, partition_id: &[u8]) -> PathBuf {
-        self.staging_dir
-            .join(format!("{}_{}", P::NAME, hex_encode(partition_id)))
-    }
-
     /// Compute the next persisted [`RestoreState`] for this
     /// pipeline given that `partition_id` is about to be marked
     /// complete.
     ///
     /// Callers stage the returned state into the same
-    /// [`rocksdb::WriteBatch`] that holds the shard's merge-mode
+    /// [`Batch`](crate::Batch) that holds the shard's pipeline
     /// writes, so the marker lands atomically with the writes.
     /// Must be invoked under [`state_lock`](Self::state_lock) so
     /// concurrent shard processors do not race on the
@@ -405,8 +341,8 @@ impl<P: Pipeline> RestoreRunner<P> {
 }
 
 /// Hex-encode a byte slice for use in human-readable identifiers
-/// (log fields, staging-directory names). The crate does not
-/// otherwise depend on `hex`, and the implementation is small.
+/// (log fields). The crate does not otherwise depend on `hex`, and
+/// the implementation is small.
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -595,13 +531,7 @@ mod tests {
         fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
             let mut opts = base_options.clone();
             opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
-            // Merge-operator CF — opt into the WriteBatch shard mode
-            // so the pipeline's per-shard accumulator can emit many
-            // operands per key without DuplicateShardOp firing.
-            vec![
-                crate::CfDescriptor::new("counters", opts)
-                    .with_restore_mode(crate::RestoreMode::MergeViaWriteBatch),
-            ]
+            vec![crate::CfDescriptor::new("counters", opts)]
         }
 
         fn open(db: &Db) -> Result<Self, OpenError> {
@@ -649,19 +579,17 @@ mod tests {
         }
     }
 
-    /// Build a runner against a fresh database and a fresh staging
-    /// dir. Returns the runner plus the lifetime-extending temp dirs.
+    /// Build a runner against a fresh database. Returns the runner
+    /// plus the lifetime-extending temp dir.
     fn setup_versions(
         target_checkpoint: u64,
     ) -> (
-        TempDir,
         TempDir,
         Db,
         Arc<VersionsSchema>,
         RestoreRunner<VersionsPipeline>,
     ) {
         let db_dir = TempDir::new().unwrap();
-        let staging = TempDir::new().unwrap();
         let (db, schema) = Db::open::<VersionsSchema>(db_dir.path(), DbOptions::default()).unwrap();
         let schema = Arc::new(schema);
         let runner = RestoreRunner::new(
@@ -669,10 +597,8 @@ mod tests {
             Arc::new(VersionsPipeline),
             schema.clone(),
             target_checkpoint,
-            staging.path().to_path_buf(),
-            rocksdb::Options::default(),
         );
-        (db_dir, staging, db, schema, runner)
+        (db_dir, db, schema, runner)
     }
 
     fn obj(id: u8) -> Object {
@@ -681,7 +607,7 @@ mod tests {
 
     #[test]
     fn begin_initializes_state_when_none() {
-        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let (_db_dir, db, _schema, runner) = setup_versions(100);
         let skip = runner.begin().unwrap();
         assert!(skip.is_empty());
         match read_restore_state(&db, "versions") {
@@ -698,7 +624,7 @@ mod tests {
 
     #[test]
     fn begin_returns_completed_partitions_from_prior_run() {
-        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let (_db_dir, db, _schema, runner) = setup_versions(100);
         // Simulate a prior partial run.
         let mut prior = BTreeSet::new();
         prior.insert(vec![0xAAu8]);
@@ -718,7 +644,7 @@ mod tests {
 
     #[test]
     fn begin_refuses_target_mismatch() {
-        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let (_db_dir, db, _schema, runner) = setup_versions(100);
         write_restore_state(
             &db,
             "versions",
@@ -733,7 +659,7 @@ mod tests {
 
     #[test]
     fn begin_refuses_already_complete() {
-        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let (_db_dir, db, _schema, runner) = setup_versions(100);
         write_restore_state(
             &db,
             "versions",
@@ -745,7 +671,7 @@ mod tests {
 
     #[test]
     fn process_shard_writes_data_and_marks_partition_complete() {
-        let (_db_dir, _staging, db, schema, runner) = setup_versions(100);
+        let (_db_dir, db, schema, runner) = setup_versions(100);
         runner.begin().unwrap();
 
         let o1 = obj(1);
@@ -785,7 +711,7 @@ mod tests {
 
     #[test]
     fn process_shard_skips_already_complete_partitions() {
-        let (_db_dir, _staging, db, schema, runner) = setup_versions(100);
+        let (_db_dir, db, schema, runner) = setup_versions(100);
         runner.begin().unwrap();
 
         // Pre-mark shard-0 as complete.
@@ -814,7 +740,7 @@ mod tests {
 
     #[test]
     fn process_shard_with_empty_object_stream_still_marks_partition_complete() {
-        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let (_db_dir, db, _schema, runner) = setup_versions(100);
         runner.begin().unwrap();
         runner
             .process_shard(b"empty", Vec::<anyhow::Result<Object>>::new())
@@ -832,7 +758,7 @@ mod tests {
 
     #[test]
     fn process_shard_propagates_object_stream_error_and_does_not_mark_complete() {
-        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let (_db_dir, db, _schema, runner) = setup_versions(100);
         runner.begin().unwrap();
 
         let stream: Vec<anyhow::Result<Object>> = vec![
@@ -859,9 +785,9 @@ mod tests {
         // End-to-end exercise of the design's restore story using
         // the merge-operator pipeline. Two shards each touch the
         // same object id; the runner emits one merge per shard's
-        // SST, and the registered operator combines them on read.
+        // commit, and the registered operator combines them on
+        // read.
         let db_dir = TempDir::new().unwrap();
-        let staging = TempDir::new().unwrap();
         let (db, schema) = Db::open::<CountersSchema>(db_dir.path(), DbOptions::default()).unwrap();
         let schema = Arc::new(schema);
         let runner = RestoreRunner::new(
@@ -869,8 +795,6 @@ mod tests {
             Arc::new(CountersPipeline),
             schema.clone(),
             42,
-            staging.path().to_path_buf(),
-            rocksdb::Options::default(),
         );
 
         runner.begin().unwrap();
@@ -913,7 +837,7 @@ mod tests {
 
     #[test]
     fn finish_transitions_to_complete() {
-        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let (_db_dir, db, _schema, runner) = setup_versions(100);
         runner.begin().unwrap();
         runner.process_shard(b"only", vec![Ok(obj(1))]).unwrap();
         runner.finish().unwrap();
@@ -925,7 +849,7 @@ mod tests {
 
     #[test]
     fn already_complete_returns_true_after_finish() {
-        let (_db_dir, _staging, _db, _schema, runner) = setup_versions(100);
+        let (_db_dir, _db, _schema, runner) = setup_versions(100);
         runner.begin().unwrap();
         runner.finish().unwrap();
         assert!(runner.already_complete(b"anything").unwrap());
@@ -937,7 +861,7 @@ mod tests {
         // RestoreState updates must serialize so every shard's
         // partition id ends up recorded.
         use std::thread;
-        let (_db_dir, _staging, db, _schema, runner) = setup_versions(100);
+        let (_db_dir, db, _schema, runner) = setup_versions(100);
         runner.begin().unwrap();
 
         let runner = Arc::new(runner);
@@ -973,394 +897,5 @@ mod tests {
         assert_eq!(super::hex_encode(&[0]), "00");
         assert_eq!(super::hex_encode(&[0xAB, 0xCD]), "abcd");
         assert_eq!(super::hex_encode(&[0xFF; 4]), "ffffffff");
-    }
-
-    /// Tests for the hybrid restore mode: pipelines that write to a
-    /// mix of [`crate::RestoreMode::BulkIngest`] and
-    /// [`crate::RestoreMode::MergeViaWriteBatch`] CFs in the same
-    /// shard.
-    mod hybrid {
-        use super::*;
-
-        /// Schema with two CFs: `versions` (plain put, BulkIngest)
-        /// and `counters` (merge operator, MergeViaWriteBatch).
-        #[derive(Debug)]
-        struct HybridSchema {
-            versions: DbMap<ObjectIdKey, U64Be>,
-            counters: DbMap<ObjectIdKey, U64Be>,
-        }
-
-        impl Schema for HybridSchema {
-            fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
-                let mut counter_opts = base_options.clone();
-                counter_opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
-                vec![
-                    crate::CfDescriptor::new("versions", base_options.clone()),
-                    crate::CfDescriptor::new("counters", counter_opts)
-                        .with_restore_mode(crate::RestoreMode::MergeViaWriteBatch),
-                ]
-            }
-
-            fn open(db: &Db) -> Result<Self, OpenError> {
-                Ok(Self {
-                    versions: DbMap::new(db.clone(), "versions")?,
-                    counters: DbMap::new(db.clone(), "counters")?,
-                })
-            }
-        }
-
-        /// Pipeline that writes both CFs: per object emit one
-        /// `versions` put (folded by id) plus one `counters` merge
-        /// operand per observation. With repeated observations in a
-        /// shard the pipeline emits *many* merges per id —
-        /// previously rejected by DuplicateShardOp; now allowed by
-        /// the WriteBatch backing for the `counters` CF.
-        struct HybridPipeline;
-
-        impl Pipeline for HybridPipeline {
-            const NAME: &'static str = "hybrid";
-            type Schema = HybridSchema;
-            type Value = (ObjectID, u64);
-            // Two accumulators: versions (fold by id), counters
-            // (preserve per-observation deltas as a Vec).
-            type Batch = HybridBatch;
-
-            fn restore(
-                &self,
-                accumulator: &mut Self::Batch,
-                object: &Object,
-            ) -> anyhow::Result<()> {
-                let id = object.id();
-                let v = object.version().value();
-                accumulator
-                    .versions
-                    .entry(id)
-                    .and_modify(|hi| {
-                        if v > *hi {
-                            *hi = v;
-                        }
-                    })
-                    .or_insert(v);
-                accumulator.counters.push((id, 1));
-                Ok(())
-            }
-
-            fn process(
-                &self,
-                _: &sui_types::full_checkpoint_content::CheckpointData,
-            ) -> anyhow::Result<Vec<Self::Value>> {
-                Ok(vec![])
-            }
-
-            fn batch(&self, _: &mut Self::Batch, _: std::vec::IntoIter<Self::Value>) {}
-
-            fn commit(
-                &self,
-                schema: &Self::Schema,
-                batch: &Self::Batch,
-                write_batch: &mut Batch,
-            ) -> anyhow::Result<usize> {
-                for (id, version) in &batch.versions {
-                    write_batch.put(&schema.versions, &ObjectIdKey::new(*id), &U64Be(*version))?;
-                }
-                // Many merges per id allowed because `counters` is
-                // MergeViaWriteBatch.
-                for (id, delta) in &batch.counters {
-                    write_batch.merge(&schema.counters, &ObjectIdKey::new(*id), &U64Be(*delta))?;
-                }
-                Ok(batch.versions.len() + batch.counters.len())
-            }
-        }
-
-        #[derive(Default)]
-        struct HybridBatch {
-            versions: BTreeMap<ObjectID, u64>,
-            counters: Vec<(ObjectID, u64)>,
-        }
-
-        fn setup_hybrid(
-            target_checkpoint: u64,
-        ) -> (
-            TempDir,
-            TempDir,
-            Db,
-            Arc<HybridSchema>,
-            RestoreRunner<HybridPipeline>,
-        ) {
-            let db_dir = TempDir::new().unwrap();
-            let staging = TempDir::new().unwrap();
-            let (db, schema) =
-                Db::open::<HybridSchema>(db_dir.path(), DbOptions::default()).unwrap();
-            let schema = Arc::new(schema);
-            let runner = RestoreRunner::new(
-                db.clone(),
-                Arc::new(HybridPipeline),
-                schema.clone(),
-                target_checkpoint,
-                staging.path().to_path_buf(),
-                rocksdb::Options::default(),
-            );
-            (db_dir, staging, db, schema, runner)
-        }
-
-        #[test]
-        fn shard_with_mixed_cfs_writes_both_correctly() {
-            // One shard with three objects (two distinct ids).
-            // Versions: 2 puts. Counters: 3 merges (with two for
-            // the same id — only legal because counters is
-            // MergeViaWriteBatch).
-            let (_db_dir, _staging, db, schema, runner) = setup_hybrid(7);
-            runner.begin().unwrap();
-            runner
-                .process_shard(b"shard-0", vec![Ok(obj(1)), Ok(obj(1)), Ok(obj(2))])
-                .unwrap();
-
-            // Versions: highest observed per id.
-            assert_eq!(
-                schema
-                    .versions
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
-                    .unwrap(),
-                Some(U64Be(obj(1).version().value())),
-            );
-            assert_eq!(
-                schema
-                    .versions
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(2)))
-                    .unwrap(),
-                Some(U64Be(obj(2).version().value())),
-            );
-
-            // Counters: two merges for id 1 (sum=2), one for id 2.
-            assert_eq!(
-                schema
-                    .counters
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
-                    .unwrap(),
-                Some(U64Be(2)),
-            );
-            assert_eq!(
-                schema
-                    .counters
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(2)))
-                    .unwrap(),
-                Some(U64Be(1)),
-            );
-
-            // Partition marked complete atomically with the counters
-            // writes.
-            match read_restore_state(&db, "hybrid") {
-                Some(RestoreState::InProgress {
-                    partitions_complete,
-                    ..
-                }) => assert!(partitions_complete.contains(b"shard-0".as_slice())),
-                other => panic!("expected InProgress, got {other:?}"),
-            }
-        }
-
-        #[test]
-        fn cross_shard_merges_combine_via_operator() {
-            // Two shards each contribute multiple merges for the
-            // same id. WriteBatch commits combine within a shard
-            // (operator-summed) and across shards (operator-summed
-            // again at read).
-            let (_db_dir, _staging, _db, schema, runner) = setup_hybrid(7);
-            runner.begin().unwrap();
-            runner
-                .process_shard(b"shard-A", vec![Ok(obj(1)), Ok(obj(1)), Ok(obj(1))])
-                .unwrap();
-            runner
-                .process_shard(b"shard-B", vec![Ok(obj(1)), Ok(obj(1))])
-                .unwrap();
-            runner.finish().unwrap();
-
-            // 3 + 2 = 5 merges for id 1, each operand = 1.
-            assert_eq!(
-                schema
-                    .counters
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
-                    .unwrap(),
-                Some(U64Be(5)),
-            );
-        }
-
-        #[test]
-        fn partition_marker_is_atomic_with_merge_writes() {
-            // Manually drive a single shard through the same surface
-            // the runner uses, but commit the WriteBatch carrying
-            // the marker only at the very end. Until then, no merges
-            // are visible.
-            let (_db_dir, staging, db, schema, _runner) = setup_hybrid(7);
-
-            // Mid-restore state: we'd normally have begun via the
-            // runner, but the marker we stage below replaces any
-            // existing entry, so this is fine.
-            let pipeline = HybridPipeline;
-            let mut acc = HybridBatch::default();
-            pipeline.restore(&mut acc, &obj(1)).unwrap();
-            pipeline.restore(&mut acc, &obj(1)).unwrap();
-
-            let mut wb_batch = db.shard_batch();
-            pipeline.commit(&*schema, &acc, &mut wb_batch).unwrap();
-
-            let shard_dir = staging.path().join("manual");
-            std::fs::create_dir_all(&shard_dir).unwrap();
-            let mut finalize = wb_batch
-                .finalize_for_shard(&shard_dir, &rocksdb::Options::default())
-                .unwrap();
-
-            // Stage marker but do not commit yet.
-            let marker = RestoreState::InProgress {
-                target_checkpoint: 7,
-                partitions_complete: {
-                    let mut s = BTreeSet::new();
-                    s.insert(b"manual".to_vec());
-                    s
-                },
-            };
-            let fw = FrameworkSchema::new(db.clone());
-            fw.restore
-                .stage_put(
-                    finalize.write_batch_mut(),
-                    &PipelineTaskKey::new(HybridPipeline::NAME),
-                    &marker,
-                )
-                .unwrap();
-
-            // Pre-commit: marker is absent and counter is absent.
-            assert!(read_restore_state(&db, HybridPipeline::NAME).is_none());
-            assert!(
-                schema
-                    .counters
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
-                    .unwrap()
-                    .is_none(),
-            );
-
-            finalize.commit().unwrap();
-
-            // Post-commit: both visible.
-            assert_eq!(
-                read_restore_state(&db, HybridPipeline::NAME),
-                Some(marker)
-            );
-            assert_eq!(
-                schema
-                    .counters
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
-                    .unwrap(),
-                Some(U64Be(2)),
-            );
-        }
-
-        #[test]
-        fn resume_does_not_double_merge_after_simulated_crash() {
-            // Simulate the crash-between-ingest-and-marker scenario.
-            // We do this in two ways the runner could be interrupted
-            // and verify the resume doesn't double-apply merges.
-            //
-            // Approach: drive the first shard halfway — finalize the
-            // batch, ingest SSTs, but DROP the ShardFinalize without
-            // committing its WriteBatch (so merges never land and
-            // the marker never lands). Then drive again from scratch
-            // through the runner; the partition is not complete, so
-            // it re-runs end-to-end. Verify the final merge result
-            // equals exactly one run, not two.
-            let (_db_dir, staging, db, schema, runner) = setup_hybrid(7);
-            runner.begin().unwrap();
-
-            // First "interrupted" run: finalize but don't commit.
-            {
-                let pipeline = HybridPipeline;
-                let mut acc = HybridBatch::default();
-                for _ in 0..3 {
-                    pipeline.restore(&mut acc, &obj(1)).unwrap();
-                }
-                let mut wb_batch = db.shard_batch();
-                pipeline.commit(&*schema, &acc, &mut wb_batch).unwrap();
-                let shard_dir = staging.path().join("interrupted_shard-X");
-                std::fs::create_dir_all(&shard_dir).unwrap();
-                let mut finalize = wb_batch
-                    .finalize_for_shard(&shard_dir, &rocksdb::Options::default())
-                    .unwrap();
-                // Ingest the SSTs only (simulates a crash *between*
-                // SST ingest and WriteBatch commit).
-                let ssts = finalize.take_ssts();
-                for (cf, path) in ssts {
-                    db.ingest_files_cf(&cf, vec![path]).unwrap();
-                }
-                // Drop `finalize` (with its WriteBatch) without
-                // committing. The marker never lands and the
-                // `counters` merges never apply.
-                drop(finalize);
-            }
-
-            // The partition is still not marked complete, so resume
-            // re-runs the shard. counters should reflect exactly one
-            // successful run (3 merges = 3), not two (6).
-            runner
-                .process_shard(b"shard-X", vec![Ok(obj(1)), Ok(obj(1)), Ok(obj(1))])
-                .unwrap();
-            runner.finish().unwrap();
-
-            assert_eq!(
-                schema
-                    .counters
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
-                    .unwrap(),
-                Some(U64Be(3)),
-                "merges from the failed first run must not double-apply on resume",
-            );
-            // Versions (BulkIngest) reflect the successful run.
-            assert_eq!(
-                schema
-                    .versions
-                    .get(&ObjectIdKey::new(ObjectID::from_single_byte(1)))
-                    .unwrap(),
-                Some(U64Be(obj(1).version().value())),
-            );
-        }
-
-        #[test]
-        fn duplicate_put_in_bulk_ingest_cf_still_errors() {
-            // Hybrid mode preserves the SST one-op-per-key invariant
-            // for BulkIngest CFs. The pipeline can't emit two puts
-            // for the same id in a single shard's `versions` write.
-            let (_db_dir, _staging, db, schema, _runner) = setup_hybrid(7);
-            let mut batch = db.shard_batch();
-            batch
-                .put(
-                    &schema.versions,
-                    &ObjectIdKey::new(ObjectID::from_single_byte(1)),
-                    &U64Be(1),
-                )
-                .unwrap();
-            let err = batch
-                .put(
-                    &schema.versions,
-                    &ObjectIdKey::new(ObjectID::from_single_byte(1)),
-                    &U64Be(2),
-                )
-                .unwrap_err();
-            assert!(matches!(err, crate::error::Error::DuplicateShardOp { .. }));
-        }
-
-        #[test]
-        fn many_merges_per_key_in_merge_mode_cf_succeed() {
-            // Counterpart to the above: many merges per key per
-            // shard succeed in MergeViaWriteBatch CFs.
-            let (_db_dir, _staging, db, schema, _runner) = setup_hybrid(7);
-            let mut batch = db.shard_batch();
-            for _ in 0..10 {
-                batch
-                    .merge(
-                        &schema.counters,
-                        &ObjectIdKey::new(ObjectID::from_single_byte(1)),
-                        &U64Be(1),
-                    )
-                    .unwrap();
-            }
-            assert_eq!(batch.len(), 10);
-        }
     }
 }
