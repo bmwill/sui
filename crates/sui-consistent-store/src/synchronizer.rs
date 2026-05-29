@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`Synchronizer`] — coordinates writes from multiple pipelines
-//! into a single [`Db`](sui_consistent_store::Db), taking
+//! into a single [`Db`](crate::Db), taking
 //! cross-pipeline snapshots at stride boundaries.
 //!
 //! The framework's `SequentialStore::transaction` ships each
@@ -12,7 +12,7 @@
 //! against the shared database. At stride boundaries, every
 //! pipeline's task pauses on a shared [`tokio::sync::Barrier`];
 //! one elected leader calls
-//! [`Db::take_snapshot`](sui_consistent_store::Db::take_snapshot)
+//! [`Db::take_snapshot`](crate::Db::take_snapshot)
 //! while the others wait, then everyone resumes.
 //!
 //! This guarantees that a snapshot at checkpoint `C` captures
@@ -44,10 +44,10 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use anyhow::bail;
 use anyhow::ensure;
-use sui_consistent_store::Batch;
-use sui_consistent_store::Db;
-use sui_consistent_store::PipelineTaskKey;
-use sui_consistent_store::Watermark;
+use crate::Batch;
+use crate::Db;
+use crate::PipelineTaskKey;
+use crate::Watermark;
 use tokio::sync::Barrier;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -78,7 +78,7 @@ impl Synchronizer {
     /// Construct a synchronizer over `db`.
     ///
     /// The framework schema lives on `db` (auto-registered by
-    /// [`Db::open`](sui_consistent_store::Db::open)); the
+    /// [`Db::open`](crate::Db::open)); the
     /// synchronizer reads existing watermarks through it during
     /// [`register_pipeline`](Self::register_pipeline).
     ///
@@ -269,12 +269,12 @@ async fn synchronizer_task(
 
 #[cfg(test)]
 mod tests {
-    use sui_consistent_store::Db;
-    use sui_consistent_store::DbOptions;
-    use sui_consistent_store::FrameworkSchema;
-    use sui_consistent_store::Schema;
-    use sui_consistent_store::error::OpenError;
-    use sui_consistent_store::rocksdb;
+    use crate::Db;
+    use crate::DbOptions;
+    use crate::FrameworkSchema;
+    use crate::Schema;
+    use crate::error::OpenError;
+    use crate::rocksdb;
     use tempfile::TempDir;
 
     use super::*;
@@ -286,7 +286,7 @@ mod tests {
     struct EmptySchema;
 
     impl Schema for EmptySchema {
-        fn cfs(_: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
+        fn cfs(_: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
             vec![]
         }
 

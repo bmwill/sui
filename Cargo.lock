@@ -14452,21 +14452,25 @@ dependencies = [
 
 [[package]]
 name = "sui-consistent-store"
-version = "1.72.0"
+version = "1.74.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "parking_lot 0.12.3",
  "rocksdb",
+ "scoped-futures",
+ "sui-indexer-alt-framework-store-traits",
  "sui-types",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "sui-consistent-store-formal-snapshot"
-version = "1.72.0"
+version = "1.74.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14488,24 +14492,6 @@ dependencies = [
  "tracing",
  "url",
  "zstd 0.12.3+zstd.1.5.2",
-]
-
-[[package]]
-name = "sui-consistent-store-framework"
-version = "1.72.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "scoped-futures",
- "sui-consistent-store",
- "sui-indexer-alt-framework",
- "sui-indexer-alt-framework-store-traits",
- "sui-types",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]

@@ -1,18 +1,19 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conversion helpers between [`sui_consistent_store::Watermark`]
-//! (the on-disk representation persisted in
-//! [`WATERMARK_CF`](sui_consistent_store::WATERMARK_CF)) and
-//! [`CommitterWatermark`](sui_indexer_alt_framework_store_traits::CommitterWatermark)
-//! (the indexer framework's per-pipeline progress type).
+//! Conversion helpers between [`Watermark`] (the on-disk
+//! representation persisted in the framework's watermark CF) and
+//! [`CommitterWatermark`] (the indexer-alt framework's
+//! per-pipeline progress type).
 //!
 //! The two types share the same four fields. We can't supply `From`
-//! impls because neither type is local to this crate (orphan rule),
-//! so the conversion is exposed as plain functions instead.
+//! impls because [`CommitterWatermark`] is not local to this crate
+//! (orphan rule), so the conversion is exposed as plain functions
+//! instead.
 
-use sui_consistent_store::Watermark;
 use sui_indexer_alt_framework_store_traits::CommitterWatermark;
+
+use crate::Watermark;
 
 /// Convert an on-disk [`Watermark`] into the framework's
 /// [`CommitterWatermark`].

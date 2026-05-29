@@ -22,8 +22,8 @@
 //! For each shard not in the skip set, in any order, possibly
 //! in parallel:
 //!     runner.process_shard(partition_id, objects)
-//!         1. fold objects into Pipeline::Batch via Pipeline::restore
-//!         2. drain into a Db::batch() via Pipeline::commit
+//!         1. fold objects into Restore::Batch via Restore::restore
+//!         2. drain into a Db::batch() via Restore::commit
 //!         3. stage the partition-complete marker into the same batch
 //!         4. Batch::commit() — atomic across pipeline data and marker
 //!     ↓
@@ -70,8 +70,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use sui_consistent_store::Db;
 use sui_consistent_store::FrameworkSchema;
-use sui_consistent_store::Pipeline;
 use sui_consistent_store::PipelineTaskKey;
+use sui_consistent_store::Restore;
 use sui_consistent_store::RestoreState;
 use sui_consistent_store::error::Error;
 use sui_types::object::Object;
@@ -86,10 +86,10 @@ use tracing::info;
 /// `&self` and internally synchronizes updates to the persisted
 /// `__restore` state.
 ///
-/// The pipeline's [`Schema`](crate::Pipeline::Schema) is shared
+/// The pipeline's [`Schema`](crate::Restore::Schema) is shared
 /// across workers as `&Self::Schema`; the pipeline itself is wrapped
 /// in [`Arc<P>`] so `&self` calls can spread across threads.
-pub struct RestoreRunner<P: Pipeline> {
+pub struct RestoreRunner<P: Restore> {
     db: Db,
     /// Cached owned [`FrameworkSchema`] for typed access to the
     /// `__restore` CF. Avoids the per-call construction cost that
@@ -104,7 +104,7 @@ pub struct RestoreRunner<P: Pipeline> {
     state_lock: Mutex<()>,
 }
 
-impl<P: Pipeline> RestoreRunner<P> {
+impl<P: Restore> RestoreRunner<P> {
     /// Create a new runner.
     pub fn new(
         db: Db,
@@ -465,11 +465,10 @@ mod tests {
     /// keeps the highest version observed per id.
     struct VersionsPipeline;
 
-    impl Pipeline for VersionsPipeline {
+    impl Restore for VersionsPipeline {
         const NAME: &'static str = "versions";
 
         type Schema = VersionsSchema;
-        type Value = (ObjectID, u64);
         type Batch = BTreeMap<ObjectID, u64>;
 
         fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()> {
@@ -483,15 +482,6 @@ mod tests {
                 .or_insert(object.version().value());
             Ok(())
         }
-
-        fn process(
-            &self,
-            _checkpoint: &sui_types::full_checkpoint_content::Checkpoint,
-        ) -> anyhow::Result<Vec<Self::Value>> {
-            Ok(vec![])
-        }
-
-        fn batch(&self, _: &mut Self::Batch, _: std::vec::IntoIter<Self::Value>) {}
 
         fn commit(
             &self,
@@ -547,26 +537,16 @@ mod tests {
     /// Uses a merge operator so cross-shard merges combine.
     struct CountersPipeline;
 
-    impl Pipeline for CountersPipeline {
+    impl Restore for CountersPipeline {
         const NAME: &'static str = "counters";
 
         type Schema = CountersSchema;
-        type Value = ObjectID;
         type Batch = BTreeMap<ObjectID, u64>;
 
         fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()> {
             *accumulator.entry(object.id()).or_insert(0) += 1;
             Ok(())
         }
-
-        fn process(
-            &self,
-            _checkpoint: &sui_types::full_checkpoint_content::Checkpoint,
-        ) -> anyhow::Result<Vec<Self::Value>> {
-            Ok(vec![])
-        }
-
-        fn batch(&self, _: &mut Self::Batch, _: std::vec::IntoIter<Self::Value>) {}
 
         fn commit(
             &self,

@@ -32,7 +32,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use object_store::path::Path;
-use sui_consistent_store::Pipeline;
+use sui_consistent_store::Restore;
 use tracing::info;
 
 use crate::RestoreRunner;
@@ -232,7 +232,7 @@ impl FormalSnapshot {
 /// The runner is wrapped in [`Arc`] because the per-partition
 /// futures spawn blocking tasks that may outlive the immediate
 /// `await` frame.
-pub async fn restore_pipeline_from_formal_snapshot<P: Pipeline>(
+pub async fn restore_pipeline_from_formal_snapshot<P: Restore>(
     runner: Arc<RestoreRunner<P>>,
     snapshot: Arc<FormalSnapshot>,
     partition_concurrency: usize,
@@ -549,7 +549,6 @@ mod tests {
         use bytes::BufMut;
         use object_store::local::LocalFileSystem;
         use sui_types::base_types::ObjectID;
-        use sui_types::full_checkpoint_content::Checkpoint;
         use sui_types::object::Object;
         use tempfile::TempDir;
 
@@ -664,10 +663,9 @@ mod tests {
 
         struct VersionsPipeline;
 
-        impl Pipeline for VersionsPipeline {
+        impl Restore for VersionsPipeline {
             const NAME: &'static str = "versions";
             type Schema = VersionsSchema;
-            type Value = (ObjectID, u64);
             type Batch = BTreeMap<ObjectID, u64>;
 
             fn restore(
@@ -685,12 +683,6 @@ mod tests {
                     .or_insert(object.version().value());
                 Ok(())
             }
-
-            fn process(&self, _: &Checkpoint) -> anyhow::Result<Vec<Self::Value>> {
-                Ok(vec![])
-            }
-
-            fn batch(&self, _: &mut Self::Batch, _: std::vec::IntoIter<Self::Value>) {}
 
             fn commit(
                 &self,

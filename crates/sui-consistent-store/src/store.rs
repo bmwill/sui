@@ -1,16 +1,17 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`Store`] and [`Connection`] — the framework-side handles that
-//! satisfy [`sui_indexer_alt_framework_store_traits`]'s `Store` /
+//! [`Store`] and [`Connection`] — the indexer-alt-framework
+//! handles that satisfy
+//! [`sui_indexer_alt_framework_store_traits`]'s `Store` /
 //! `Connection` / `SequentialStore` / `SequentialConnection`.
 //!
-//! The store wraps a triple — a [`Db`] handle from
-//! [`sui_consistent_store`], an [`Arc<FrameworkSchema>`] holding
-//! the framework's internal watermark and chain-id CFs, and an
-//! `Arc<S>` holding the consumer's own schema. The connection
-//! type owns a pending [`Batch`] plus the watermark write
-//! deferred until [`transaction`](sui_indexer_alt_framework_store_traits::SequentialStore::transaction)
+//! The store wraps a triple — a [`Db`] handle, an owned
+//! [`FrameworkSchema`] holding the bookkeeping watermark and
+//! chain-id CFs, and an `Arc<S>` holding the consumer's own
+//! schema. The connection type owns a pending [`Batch`] plus the
+//! watermark write deferred until
+//! [`transaction`](sui_indexer_alt_framework_store_traits::SequentialStore::transaction)
 //! commits.
 //!
 //! # Atomicity model
@@ -20,7 +21,7 @@
 //! `set_committer_watermark` calls (which are deferred, not
 //! committed eagerly), then writes the watermark to the framework
 //! schema and commits the batch in one atomic
-//! [`Batch::commit`](sui_consistent_store::Batch::commit). The
+//! [`Batch::commit`](crate::Batch::commit). The
 //! consumer pipeline's data writes and the watermark advance
 //! become visible together or not at all.
 //!
@@ -33,13 +34,13 @@
 //!
 //! # Synchronizer integration
 //!
-//! Today the framework adapter commits directly from
-//! `transaction`. The cross-pipeline snapshot
-//! [`Synchronizer`](crate::synchronizer) — which receives
-//! `(watermark, Batch)` pairs and coordinates stride-aligned
-//! snapshots across pipelines — lands in a follow-up commit; at
-//! that point this module's `transaction` will route through the
-//! synchronizer's per-pipeline queue rather than committing
+//! When [`install_sync`](Store::install_sync) has been called,
+//! [`transaction`](SequentialStore::transaction) routes each
+//! pipeline's `(Watermark, Batch)` pair through the corresponding
+//! per-pipeline queue owned by the [`Synchronizer`](crate::synchronizer);
+//! the synchronizer commits the batch and coordinates with peer
+//! pipelines at stride boundaries to take cross-pipeline
+//! snapshots. With no synchronizer installed, transactions commit
 //! inline.
 
 use std::sync::Arc;
@@ -50,12 +51,6 @@ use anyhow::anyhow;
 use anyhow::bail;
 use async_trait::async_trait;
 use scoped_futures::ScopedBoxFuture;
-use sui_consistent_store::Batch;
-use sui_consistent_store::ChainId;
-use sui_consistent_store::Db;
-use sui_consistent_store::FrameworkSchema;
-use sui_consistent_store::PipelineTaskKey;
-use sui_consistent_store::Watermark;
 use sui_indexer_alt_framework_store_traits::CommitterWatermark;
 use sui_indexer_alt_framework_store_traits::InitWatermark;
 use sui_indexer_alt_framework_store_traits::SequentialConnection;
@@ -64,9 +59,15 @@ use sui_indexer_alt_framework_store_traits::Store as _;
 use sui_indexer_alt_framework_store_traits::{self as store_traits};
 use tokio::task::JoinSet;
 
+use crate::Batch;
+use crate::ChainId;
+use crate::Db;
+use crate::FrameworkSchema;
+use crate::PipelineTaskKey;
+use crate::Watermark;
+use crate::committer_watermark;
 use crate::synchronizer::Queue;
 use crate::synchronizer::Synchronizer;
-use crate::watermark;
 
 /// Framework-side wrapper around a [`Db`] handle plus a
 /// consumer-supplied user schema `S`.
@@ -85,7 +86,7 @@ pub struct Store<S> {
 struct Inner<S> {
     db: Db,
     /// Owned, cached framework schema. Holds the typed
-    /// [`DbMap`](sui_consistent_store::DbMap)s the connection
+    /// [`DbMap`](crate::DbMap)s the connection
     /// uses for watermark and chain-id writes. Identical to
     /// `db.framework()` but owned (no `Arc` bumps per access).
     framework: FrameworkSchema,
@@ -103,7 +104,7 @@ impl<S> Store<S> {
     ///
     /// The framework's own bookkeeping CFs (watermarks, chain
     /// ids, restore state) are auto-registered by
-    /// [`Db::open`](sui_consistent_store::Db::open), so the
+    /// [`Db::open`](crate::Db::open), so the
     /// caller does not pass them in — the store constructs an
     /// owned [`FrameworkSchema`] from `db` internally.
     pub fn new(db: Db, user: Arc<S>) -> Self {
@@ -148,7 +149,7 @@ impl<S> Store<S> {
     }
 
     /// Borrow the underlying [`Db`] handle. Use
-    /// [`Db::framework`](sui_consistent_store::Db::framework) on
+    /// [`Db::framework`](crate::Db::framework) on
     /// the returned handle for borrowed access to the framework
     /// schema.
     pub fn db(&self) -> &Db {
@@ -313,7 +314,7 @@ impl<S: Send + Sync> store_traits::Connection for Connection<'_, S> {
             .framework
             .watermarks
             .get(&key)?
-            .map(watermark::to_committer))
+            .map(committer_watermark::to_committer))
     }
 
     async fn set_committer_watermark(
@@ -326,7 +327,7 @@ impl<S: Send + Sync> store_traits::Connection for Connection<'_, S> {
         // atomically.
         self.watermark = Some((
             pipeline_task.to_string(),
-            crate::watermark::from_committer(watermark),
+            committer_watermark::from_committer(watermark),
         ));
         Ok(true)
     }
@@ -338,19 +339,20 @@ impl<S: Send + Sync> SequentialConnection for Connection<'_, S> {}
 #[cfg(test)]
 mod tests {
     use scoped_futures::ScopedFutureExt;
-    use sui_consistent_store::Db;
-    use sui_consistent_store::DbMap;
-    use sui_consistent_store::DbOptions;
-    use sui_consistent_store::Encode;
-    use sui_consistent_store::Schema;
-    use sui_consistent_store::error::EncodeError;
-    use sui_consistent_store::error::OpenError;
-    use sui_consistent_store::rocksdb;
     use sui_indexer_alt_framework_store_traits::Connection as _;
     use sui_indexer_alt_framework_store_traits::Store as _;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::CfDescriptor;
+    use crate::Decode;
+    use crate::DbMap;
+    use crate::DbOptions;
+    use crate::Encode;
+    use crate::Schema;
+    use crate::error::DecodeError;
+    use crate::error::EncodeError;
+    use crate::error::OpenError;
 
     /// Minimal consumer schema with one CF used by the transaction
     /// tests below.
@@ -369,25 +371,18 @@ mod tests {
         }
     }
 
-    impl sui_consistent_store::Decode for U64Be {
-        fn decode<B: bytes::Buf>(
-            buf: &mut B,
-        ) -> Result<Self, sui_consistent_store::error::DecodeError> {
+    impl Decode for U64Be {
+        fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
             if buf.remaining() != 8 {
-                return Err(sui_consistent_store::error::DecodeError::msg(
-                    "expected 8 bytes",
-                ));
+                return Err(DecodeError::msg("expected 8 bytes"));
             }
             Ok(Self(buf.get_u64()))
         }
     }
 
     impl Schema for UserSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<sui_consistent_store::CfDescriptor> {
-            vec![sui_consistent_store::CfDescriptor::new(
-                "items",
-                base_options.clone(),
-            )]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
+            vec![CfDescriptor::new("items", base_options.clone())]
         }
 
         fn open(db: &Db) -> Result<Self, OpenError> {
