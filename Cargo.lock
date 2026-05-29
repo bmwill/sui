@@ -14455,6 +14455,21 @@ name = "sui-consistent-store"
 version = "1.72.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "parking_lot 0.12.3",
+ "rocksdb",
+ "sui-types",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sui-consistent-store-formal-snapshot"
+version = "1.72.0"
+dependencies = [
+ "anyhow",
  "async-trait",
  "bcs",
  "bytes",
@@ -14462,15 +14477,13 @@ dependencies = [
  "futures",
  "integer-encoding",
  "object_store 0.13.0",
- "parking_lot 0.12.3",
  "reqwest",
- "rocksdb",
  "serde",
  "serde_json",
+ "sui-consistent-store",
  "sui-storage",
  "sui-types",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
  "url",

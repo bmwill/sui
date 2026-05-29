@@ -13,8 +13,8 @@
 //! that dep tree is already paid for.
 //!
 //! The companion restore source — fetched-per-partition formal
-//! snapshots — uses its own driver in [`formal_snapshot`](crate::formal_snapshot),
-//! because partitions there come from the producer's bucket /
+//! snapshots — lives in the `sui-consistent-store-formal-snapshot`
+//! crate; partitions there come from the producer's bucket /
 //! partition numbering rather than a key-range slicing.
 //!
 //! # Partitioning

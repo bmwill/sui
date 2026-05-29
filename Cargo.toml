@@ -110,6 +110,7 @@ members = [
     "crates/sui-cluster-test",
     "crates/sui-config",
     "crates/sui-consistent-store",
+    "crates/sui-consistent-store-formal-snapshot",
     "crates/sui-consistent-store-framework",
     "crates/sui-core",
     "crates/sui-cost",
@@ -670,6 +671,7 @@ sui-bridge-schema = { path = "crates/sui-bridge-schema" }
 sui-cluster-test = { path = "crates/sui-cluster-test" }
 sui-config = { path = "crates/sui-config" }
 sui-consistent-store = { path = "crates/sui-consistent-store" }
+sui-consistent-store-formal-snapshot = { path = "crates/sui-consistent-store-formal-snapshot" }
 sui-consistent-store-framework = { path = "crates/sui-consistent-store-framework" }
 sui-core = { path = "crates/sui-core" }
 sui-cost = { path = "crates/sui-cost" }

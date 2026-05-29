@@ -22,8 +22,8 @@
 //!
 //! Higher layers can iterate `partition_metadata`, fetch each in
 //! whatever parallelism strategy fits their environment, and feed
-//! the resulting objects to a [`RestoreRunner`](crate::RestoreRunner).
-//! A turnkey single-pipeline helper lands in a follow-up commit.
+//! the resulting objects to a
+//! [`RestoreRunner`](sui_consistent_store::RestoreRunner).
 
 use std::sync::Arc;
 
@@ -33,10 +33,10 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use object_store::path::Path;
+use sui_consistent_store::Pipeline;
+use sui_consistent_store::RestoreRunner;
 use tracing::info;
 
-use crate::Pipeline;
-use crate::RestoreRunner;
 use crate::snapshot_format::EpochManifest;
 use crate::snapshot_format::FileMetadata;
 use crate::snapshot_format::FileType;
@@ -161,8 +161,9 @@ impl FormalSnapshot {
 
     /// Canonical 8-byte encoding of a partition's identifier,
     /// suitable as the opaque partition-id bytes used by
-    /// [`RestoreRunner`](crate::RestoreRunner) and persisted in the
-    /// `__restore` CF's [`RestoreState::InProgress`](crate::RestoreState::InProgress)
+    /// [`RestoreRunner`](sui_consistent_store::RestoreRunner) and
+    /// persisted in the `__restore` CF's
+    /// [`RestoreState::InProgress`](sui_consistent_store::RestoreState::InProgress)
     /// entry.
     ///
     /// Layout: `[bucket u32 big-endian][partition u32 big-endian]`.
@@ -224,11 +225,11 @@ impl FormalSnapshot {
 ///    [`runner.process_shard`](RestoreRunner::process_shard) in a
 ///    blocking task — `process_shard` is sync because the per-shard
 ///    work is CPU-bound (folding into the accumulator and encoding
-///    into a [`Batch`](crate::Batch)), not I/O.
+///    into a [`Batch`](sui_consistent_store::Batch)), not I/O.
 ///
 /// On success, calls [`runner.finish()`](RestoreRunner::finish) to
 /// transition the pipeline to
-/// [`RestoreState::Complete`](crate::RestoreState::Complete).
+/// [`RestoreState::Complete`](sui_consistent_store::RestoreState::Complete).
 ///
 /// The runner is wrapped in [`Arc`] because the per-partition
 /// futures spawn blocking tasks that may outlive the immediate
@@ -558,19 +559,20 @@ mod tests {
         use super::PartitionFixture;
         use super::build_snapshot;
         use super::obj;
-        use crate::Batch;
-        use crate::Db;
-        use crate::DbMap;
-        use crate::DbOptions;
-        use crate::Decode;
-        use crate::Encode;
-        use crate::FrameworkSchema;
-        use crate::PipelineTaskKey;
-        use crate::RestoreState;
-        use crate::Schema;
-        use crate::error::DecodeError;
-        use crate::error::EncodeError;
-        use crate::error::OpenError;
+        use sui_consistent_store::Batch;
+        use sui_consistent_store::Db;
+        use sui_consistent_store::DbMap;
+        use sui_consistent_store::DbOptions;
+        use sui_consistent_store::Decode;
+        use sui_consistent_store::Encode;
+        use sui_consistent_store::FrameworkSchema;
+        use sui_consistent_store::PipelineTaskKey;
+        use sui_consistent_store::RestoreState;
+        use sui_consistent_store::Schema;
+        use sui_consistent_store::error::DecodeError;
+        use sui_consistent_store::error::EncodeError;
+        use sui_consistent_store::error::OpenError;
+
         use crate::snapshot_format::FileCompression;
 
         /// Test helper: read the persisted `RestoreState` for
@@ -646,8 +648,13 @@ mod tests {
         }
 
         impl Schema for VersionsSchema {
-            fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
-                vec![crate::CfDescriptor::new("versions", base_options.clone())]
+            fn cfs(
+                base_options: &sui_consistent_store::rocksdb::Options,
+            ) -> Vec<sui_consistent_store::CfDescriptor> {
+                vec![sui_consistent_store::CfDescriptor::new(
+                    "versions",
+                    base_options.clone(),
+                )]
             }
 
             fn open(db: &Db) -> Result<Self, OpenError> {
