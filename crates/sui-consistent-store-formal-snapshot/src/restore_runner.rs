@@ -68,16 +68,15 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use sui_consistent_store::Db;
+use sui_consistent_store::FrameworkSchema;
+use sui_consistent_store::Pipeline;
+use sui_consistent_store::PipelineTaskKey;
+use sui_consistent_store::RestoreState;
+use sui_consistent_store::error::Error;
 use sui_types::object::Object;
 use tracing::debug;
 use tracing::info;
-
-use crate::Db;
-use crate::FrameworkSchema;
-use crate::Pipeline;
-use crate::PipelineTaskKey;
-use crate::RestoreState;
-use crate::error::Error;
 
 /// Drives one pipeline's restore from a stream of objects.
 ///
@@ -213,7 +212,7 @@ impl<P: Pipeline> RestoreRunner<P> {
     }
 
     /// Process one shard: fold its objects into the accumulator,
-    /// drain into a typed [`Batch`](crate::Batch), stage the
+    /// drain into a typed [`Batch`](sui_consistent_store::Batch), stage the
     /// partition-complete marker into the same batch, and commit
     /// atomically.
     ///
@@ -304,7 +303,7 @@ impl<P: Pipeline> RestoreRunner<P> {
     /// complete.
     ///
     /// Callers stage the returned state into the same
-    /// [`Batch`](crate::Batch) that holds the shard's pipeline
+    /// [`Batch`](sui_consistent_store::Batch) that holds the shard's pipeline
     /// writes, so the marker lands atomically with the writes.
     /// Must be invoked under [`state_lock`](Self::state_lock) so
     /// concurrent shard processors do not race on the
@@ -361,16 +360,19 @@ mod tests {
     use sui_types::object::Object;
     use tempfile::TempDir;
 
+    use sui_consistent_store::Batch;
+    use sui_consistent_store::CfDescriptor;
+    use sui_consistent_store::DbMap;
+    use sui_consistent_store::DbOptions;
+    use sui_consistent_store::Decode;
+    use sui_consistent_store::Encode;
+    use sui_consistent_store::Schema;
+    use sui_consistent_store::error::DecodeError;
+    use sui_consistent_store::error::EncodeError;
+    use sui_consistent_store::error::OpenError;
+    use sui_consistent_store::rocksdb;
+
     use super::*;
-    use crate::Batch;
-    use crate::DbMap;
-    use crate::DbOptions;
-    use crate::Decode;
-    use crate::Encode;
-    use crate::Schema;
-    use crate::error::DecodeError;
-    use crate::error::EncodeError;
-    use crate::error::OpenError;
 
     /// Test helper: read the persisted `RestoreState` for
     /// `pipeline`. Mirrors the production
@@ -448,8 +450,8 @@ mod tests {
     }
 
     impl Schema for VersionsSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
-            vec![crate::CfDescriptor::new("versions", base_options.clone())]
+        fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
+            vec![CfDescriptor::new("versions", base_options.clone())]
         }
 
         fn open(db: &Db) -> Result<Self, OpenError> {
@@ -528,10 +530,10 @@ mod tests {
     }
 
     impl Schema for CountersSchema {
-        fn cfs(base_options: &rocksdb::Options) -> Vec<crate::CfDescriptor> {
+        fn cfs(base_options: &rocksdb::Options) -> Vec<CfDescriptor> {
             let mut opts = base_options.clone();
             opts.set_merge_operator_associative("u64-add", add_u64_merge_op);
-            vec![crate::CfDescriptor::new("counters", opts)]
+            vec![CfDescriptor::new("counters", opts)]
         }
 
         fn open(db: &Db) -> Result<Self, OpenError> {

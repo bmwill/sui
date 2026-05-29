@@ -22,8 +22,7 @@
 //!
 //! Higher layers can iterate `partition_metadata`, fetch each in
 //! whatever parallelism strategy fits their environment, and feed
-//! the resulting objects to a
-//! [`RestoreRunner`](sui_consistent_store::RestoreRunner).
+//! the resulting objects to a [`RestoreRunner`](crate::RestoreRunner).
 
 use std::sync::Arc;
 
@@ -34,9 +33,9 @@ use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use object_store::path::Path;
 use sui_consistent_store::Pipeline;
-use sui_consistent_store::RestoreRunner;
 use tracing::info;
 
+use crate::RestoreRunner;
 use crate::snapshot_format::EpochManifest;
 use crate::snapshot_format::FileMetadata;
 use crate::snapshot_format::FileType;
@@ -161,8 +160,7 @@ impl FormalSnapshot {
 
     /// Canonical 8-byte encoding of a partition's identifier,
     /// suitable as the opaque partition-id bytes used by
-    /// [`RestoreRunner`](sui_consistent_store::RestoreRunner) and
-    /// persisted in the `__restore` CF's
+    /// [`RestoreRunner`] and persisted in the `__restore` CF's
     /// [`RestoreState::InProgress`](sui_consistent_store::RestoreState::InProgress)
     /// entry.
     ///

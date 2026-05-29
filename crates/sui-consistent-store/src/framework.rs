@@ -10,8 +10,8 @@
 //! cheaply-constructible [`FrameworkSchema`] handle:
 //!
 //! - [`RESTORE_CF`] (`PipelineTaskKey → RestoreState`) — per-pipeline
-//!   restore progress; used by [`RestoreRunner`](crate::RestoreRunner)
-//!   to skip already-ingested partitions on resume.
+//!   restore progress; consumed by external restore drivers to
+//!   skip already-ingested partitions on resume.
 //! - [`WATERMARK_CF`] (`PipelineTaskKey → Watermark`) — per-pipeline
 //!   committer watermark; used by tip-mode drivers to learn what
 //!   checkpoint each pipeline resumes from.
