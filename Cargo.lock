@@ -14573,7 +14573,6 @@ dependencies = [
  "strum_macros 0.27.1",
  "sui-authority-aggregation",
  "sui-config",
- "sui-consistent-store",
  "sui-execution",
  "sui-framework",
  "sui-genesis-builder",
