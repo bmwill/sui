@@ -41,6 +41,7 @@
 //! use sui_consistent_store::Encode;
 //! use sui_consistent_store::Reader;
 //! use sui_consistent_store::Schema;
+//! use sui_consistent_store::Watermark;
 //! use sui_consistent_store::error::DecodeError;
 //! use sui_consistent_store::error::EncodeError;
 //! use sui_consistent_store::error::OpenError;
@@ -87,7 +88,7 @@
 //! let mut batch = db.batch();
 //! batch.put(&schema.items, &U64Be(1), &U64Be(100)).unwrap();
 //! batch.commit().unwrap();
-//! db.take_snapshot(1);
+//! db.take_snapshot(Watermark::for_checkpoint(1));
 //!
 //! // Mutate after the snapshot.
 //! let mut batch = db.batch();
@@ -129,21 +130,25 @@ pub struct Snapshot {
     // `Arc<DbInner>` ref is decremented.
     entry: Arc<SnapshotEntry>,
     db: Db,
-    checkpoint: u64,
 }
 
 impl Snapshot {
-    pub(crate) fn new(db: Db, entry: Arc<SnapshotEntry>, checkpoint: u64) -> Self {
-        Self {
-            entry,
-            db,
-            checkpoint,
-        }
+    pub(crate) fn new(db: Db, entry: Arc<SnapshotEntry>) -> Self {
+        Self { entry, db }
     }
 
-    /// The checkpoint number this snapshot was taken at.
+    /// The checkpoint number this snapshot was taken at. Convenience
+    /// alias for `self.watermark().checkpoint_hi_inclusive`.
     pub fn checkpoint(&self) -> u64 {
-        self.checkpoint
+        self.entry.watermark().checkpoint_hi_inclusive
+    }
+
+    /// The full [`Watermark`](crate::Watermark) recorded when this
+    /// snapshot was taken — checkpoint, epoch, transaction count,
+    /// and timestamp. Use this to recover the chain state the
+    /// snapshot captured.
+    pub fn watermark(&self) -> crate::Watermark {
+        self.entry.watermark()
     }
 
     /// Borrowed handle to the auto-registered
@@ -177,7 +182,6 @@ impl Clone for Snapshot {
         Self {
             entry: self.entry.clone(),
             db: self.db.clone(),
-            checkpoint: self.checkpoint,
         }
     }
 }
@@ -185,7 +189,7 @@ impl Clone for Snapshot {
 impl fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Snapshot")
-            .field("checkpoint", &self.checkpoint)
+            .field("checkpoint", &self.checkpoint())
             .finish_non_exhaustive()
     }
 }
@@ -222,6 +226,7 @@ mod tests {
     use crate::Schema;
     use crate::SchemaAtSnapshot;
     use crate::Snapshot;
+    use crate::Watermark;
     use crate::error::DecodeError;
     use bytes::BufMut;
 
@@ -311,9 +316,9 @@ mod tests {
     #[test]
     fn latest_snapshot_returns_highest_checkpoint() {
         let (_dir, db, _schema) = open();
-        db.take_snapshot(3);
-        db.take_snapshot(10);
-        db.take_snapshot(5);
+        db.take_snapshot(Watermark::for_checkpoint(3));
+        db.take_snapshot(Watermark::for_checkpoint(10));
+        db.take_snapshot(Watermark::for_checkpoint(5));
         let latest = db.latest_snapshot().expect("latest should exist");
         assert_eq!(latest.checkpoint(), 10);
     }
@@ -321,9 +326,9 @@ mod tests {
     #[test]
     fn latest_snapshot_after_eviction_reflects_remaining() {
         let (_dir, db, _schema) = open_with_capacity(2);
-        db.take_snapshot(1);
-        db.take_snapshot(2);
-        db.take_snapshot(3);
+        db.take_snapshot(Watermark::for_checkpoint(1));
+        db.take_snapshot(Watermark::for_checkpoint(2));
+        db.take_snapshot(Watermark::for_checkpoint(3));
         // Capacity 2 evicts checkpoint 1; latest is now 3.
         let latest = db.latest_snapshot().expect("latest should exist");
         assert_eq!(latest.checkpoint(), 3);
@@ -333,7 +338,7 @@ mod tests {
     fn latest_snapshot_reads_pre_snapshot_state() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         put(&db, &schema, 1, 999);
         let latest = db.latest_snapshot().unwrap();
         assert_eq!(
@@ -351,7 +356,7 @@ mod tests {
     #[test]
     fn take_then_at_returns_handle() {
         let (_dir, db, _schema) = open();
-        db.take_snapshot(7);
+        db.take_snapshot(Watermark::for_checkpoint(7));
         let handle = db.at_snapshot(7).expect("handle should exist");
         assert_eq!(handle.checkpoint(), 7);
     }
@@ -359,17 +364,17 @@ mod tests {
     #[test]
     fn snapshot_range_reflects_taken_snapshots() {
         let (_dir, db, _schema) = open();
-        db.take_snapshot(3);
-        db.take_snapshot(10);
-        db.take_snapshot(5);
+        db.take_snapshot(Watermark::for_checkpoint(3));
+        db.take_snapshot(Watermark::for_checkpoint(10));
+        db.take_snapshot(Watermark::for_checkpoint(5));
         assert_eq!(db.snapshot_range(), Some(3..=10));
     }
 
     #[test]
     fn snapshot_capacity_zero_disables_snapshotting() {
         let (_dir, db, _schema) = open_with_capacity(0);
-        db.take_snapshot(1);
-        db.take_snapshot(2);
+        db.take_snapshot(Watermark::for_checkpoint(1));
+        db.take_snapshot(Watermark::for_checkpoint(2));
         assert!(db.at_snapshot(1).is_none());
         assert!(db.at_snapshot(2).is_none());
         assert!(db.latest_snapshot().is_none());
@@ -379,9 +384,9 @@ mod tests {
     #[test]
     fn snapshot_capacity_evicts_oldest() {
         let (_dir, db, _schema) = open_with_capacity(2);
-        db.take_snapshot(1);
-        db.take_snapshot(2);
-        db.take_snapshot(3);
+        db.take_snapshot(Watermark::for_checkpoint(1));
+        db.take_snapshot(Watermark::for_checkpoint(2));
+        db.take_snapshot(Watermark::for_checkpoint(3));
         assert!(db.at_snapshot(1).is_none());
         assert!(db.at_snapshot(2).is_some());
         assert!(db.at_snapshot(3).is_some());
@@ -391,7 +396,7 @@ mod tests {
     #[test]
     fn drop_snapshot_removes_from_buffer() {
         let (_dir, db, _schema) = open();
-        db.take_snapshot(5);
+        db.take_snapshot(Watermark::for_checkpoint(5));
         assert!(db.drop_snapshot(5));
         assert!(db.at_snapshot(5).is_none());
         // Dropping a missing snapshot returns false.
@@ -402,7 +407,7 @@ mod tests {
     fn snapshot_sees_state_at_take_time() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         // Mutate after taking the snapshot.
         put(&db, &schema, 1, 999);
 
@@ -417,7 +422,7 @@ mod tests {
     #[test]
     fn snapshot_does_not_see_keys_inserted_after_take() {
         let (_dir, db, schema) = open();
-        db.take_snapshot(0);
+        db.take_snapshot(Watermark::for_checkpoint(0));
         put(&db, &schema, 1, 100);
         let snap = db.at_snapshot(0).unwrap();
         assert!(schema.items.at(&snap).get(&U64Be(1)).unwrap().is_none());
@@ -427,7 +432,7 @@ mod tests {
     fn snapshot_get_raw_against_pre_snapshot_state() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         put(&db, &schema, 1, 999);
         let snap = db.at_snapshot(1).unwrap();
         let bytes = schema
@@ -443,7 +448,7 @@ mod tests {
     fn snapshot_contains_key_reflects_pre_snapshot_state() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         // Mutation after snapshot must not affect snapshot's view.
         let mut batch = db.batch();
         batch.delete(&schema.items, &U64Be(1)).unwrap();
@@ -458,7 +463,7 @@ mod tests {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 10);
         put(&db, &schema, 3, 30);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         // After-snapshot writes should not affect snapshot reads.
         put(&db, &schema, 2, 20);
         put(&db, &schema, 1, 999);
@@ -476,7 +481,7 @@ mod tests {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 10);
         put(&db, &schema, 3, 30);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         put(&db, &schema, 2, 20);
 
         let snap = db.at_snapshot(1).unwrap();
@@ -493,7 +498,7 @@ mod tests {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 10);
         put(&db, &schema, 2, 20);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
 
         let snap = db.at_snapshot(1).unwrap();
         let snap_items = schema.items.at(&snap);
@@ -516,7 +521,7 @@ mod tests {
         // iteration on the snapshot path.
         put(&db, &schema, 1, 10);
         put(&db, &schema, 2, 20);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         put(&db, &schema, 1, 999);
 
         let snap = db.at_snapshot(1).unwrap();
@@ -533,7 +538,7 @@ mod tests {
     fn snapshot_survives_drop_snapshot() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         let snap = db.at_snapshot(1).unwrap();
         // Remove the snapshot from the buffer; the token still works.
         assert!(db.drop_snapshot(1));
@@ -548,7 +553,7 @@ mod tests {
     fn snapshot_clones_share_underlying_snapshot() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         let snap_a = db.at_snapshot(1).unwrap();
         let snap_b = snap_a.clone();
         // Drop the buffer ref; both clones still see the same state.
@@ -568,7 +573,7 @@ mod tests {
     fn snapshot_outlives_schema() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         let snap = db.at_snapshot(1).unwrap();
         // Schema (and its DbMap) drops; the snapshot token still
         // co-owns Arc<Db>, so the underlying database is alive.
@@ -583,11 +588,11 @@ mod tests {
     fn taking_snapshot_at_existing_checkpoint_replaces() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         put(&db, &schema, 1, 200);
         // Re-take at the same checkpoint; the new snapshot reflects
         // the updated state.
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         let snap = db.at_snapshot(1).unwrap();
         assert_eq!(
             schema.items.at(&snap).get(&U64Be(1)).unwrap(),
@@ -603,12 +608,12 @@ mod tests {
         // buffer must not break reads through the token.
         let (_dir, db, schema) = open_with_capacity(2);
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         // Hold a Snapshot (and through it, an Arc<SnapshotEntry>).
         let snap = db.at_snapshot(1).unwrap();
         // Push two more snapshots so checkpoint 1 evicts.
-        db.take_snapshot(2);
-        db.take_snapshot(3);
+        db.take_snapshot(Watermark::for_checkpoint(2));
+        db.take_snapshot(Watermark::for_checkpoint(3));
         assert!(db.at_snapshot(1).is_none(), "snapshot 1 should evict");
         // Reads through the held Snapshot still work.
         assert_eq!(
@@ -627,7 +632,7 @@ mod tests {
         put(&db, &schema, 1, 10);
         put(&db, &schema, 2, 20);
         put(&db, &schema, 3, 30);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
 
         let snap = db.at_snapshot(1).unwrap();
         let snap_items = schema.items.at(&snap);
@@ -636,8 +641,8 @@ mod tests {
         assert_eq!(iter.next().unwrap().unwrap(), (U64Be(1), U64Be(10)));
 
         // Force eviction of snapshot 1.
-        db.take_snapshot(2);
-        db.take_snapshot(3);
+        db.take_snapshot(Watermark::for_checkpoint(2));
+        db.take_snapshot(Watermark::for_checkpoint(3));
         assert!(db.at_snapshot(1).is_none());
 
         // The iterator continues to yield the snapshot's data.
@@ -652,7 +657,7 @@ mod tests {
     fn schema_at_snapshot_projects_all_fields() {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         put(&db, &schema, 1, 999);
 
         let snap = db.at_snapshot(1).unwrap();
@@ -668,7 +673,7 @@ mod tests {
         // captured state.
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         put(&db, &schema, 1, 999);
 
         let snap = db.at_snapshot(1).unwrap();
@@ -684,7 +689,7 @@ mod tests {
         // at 2 — proving no Arc clone happened in `at_ref`.
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 100);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         let snap = db.at_snapshot(1).unwrap();
         let _extra = snap.clone();
         // The buffer also holds an Arc<SnapshotEntry>, so the
@@ -702,7 +707,7 @@ mod tests {
         let (_dir, db, schema) = open();
         put(&db, &schema, 1, 10);
         put(&db, &schema, 3, 30);
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
         put(&db, &schema, 2, 20);
 
         let snap = db.at_snapshot(1).unwrap();
@@ -721,7 +726,7 @@ mod tests {
         // is a programmer error on the borrowed path too.
         let (_dir_a, db_a, schema_a) = open();
         let (_dir_b, db_b, _schema_b) = open();
-        db_b.take_snapshot(1);
+        db_b.take_snapshot(Watermark::for_checkpoint(1));
         let snap_b = db_b.at_snapshot(1).unwrap();
         let _ = &db_a;
         let _ = schema_a.items.at_ref(&snap_b);

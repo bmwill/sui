@@ -5,26 +5,30 @@
 //! pipeline driven from a stream of live objects (formal snapshot,
 //! perpetual store).
 //!
-//! `Restore` is independent of the tip-of-chain shape (the
-//! indexer-alt framework's `Processor` + `sequential::Handler`).
-//! A pipeline that needs both bulk-load and tip indexing
-//! implements both: the two traits typically share the same
-//! `Batch` accumulator type, but the framework does not require
-//! that.
+//! `Restore` is a sibling shape to the indexer-alt framework's
+//! tip-of-chain `Processor` + `sequential::Handler` (or
+//! `concurrent::Handler`). It is bounded `: Processor` so that a
+//! pipeline shares one identity (`Processor::NAME`) and one
+//! configuration type across both bulk-load and tip phases, but the
+//! tip impl is independent — `Restore` does not touch tip data.
 //!
 //! # Method roles
 //!
-//! - [`restore`](Restore::restore) folds updates derived from a
-//!   single live object into a per-shard accumulator. Restore
-//!   drivers parallelize across input objects however they see fit
-//!   (e.g. one tokio task per snapshot partition, one thread per
-//!   `ObjectID` range). Each worker owns its own accumulator; the
-//!   driver feeds it to [`commit`](Restore::commit) when the shard
-//!   is done.
-//! - [`commit`](Restore::commit) applies the folded accumulator to
-//!   a [`Batch`]. The driver commits the batch atomically alongside
-//!   any other state it owns (e.g. a partition-complete marker in
-//!   the `__restore` CF).
+//! - [`restore`](Restore::restore) takes a single live object and
+//!   stages writes derived from it onto the shared per-shard
+//!   [`Batch`]. Restore drivers parallelize across input objects
+//!   however they see fit (e.g. one tokio task per snapshot
+//!   partition, one thread per `ObjectID` range). Each worker owns
+//!   its own [`Batch`]; the driver commits the batch atomically
+//!   alongside any other state it owns (a partition-complete marker
+//!   in the `__restore` CF, for example) once the shard is done.
+//!
+//! Per-object writes that target merge-CFs combine via the
+//! registered merge operator across shards (so cross-shard sums,
+//! counters, set unions all converge correctly). Writes to put-CFs
+//! have last-write-wins semantics; drivers that need a different
+//! reconciliation strategy across shards should partition their
+//! input so that conflicting writes never hit the same key.
 //!
 //! # Why `anyhow::Error`
 //!
@@ -34,83 +38,62 @@
 //! call [`Batch`] methods (which return [`crate::error::Error`])
 //! get free conversion via `?`.
 
+use sui_indexer_alt_framework::pipeline::Processor;
 use sui_types::object::Object;
 
 use crate::Batch;
 
-/// A pipeline that can be populated from a stream of live objects.
+/// A pipeline that can be bulk-loaded from a stream of live
+/// objects.
 ///
 /// Implementations are typically unit structs whose trait methods
-/// are essentially functions; `&self` is supplied so per-instance
+/// are essentially functions; `&self` is supplied for symmetry with
+/// [`Processor::process`](Processor::process), so per-instance
 /// configuration (a config struct loaded from CLI, a logger handle)
-/// can live on the implementing type.
-pub trait Restore: Send + Sync + 'static {
-    /// Identifies the pipeline in logs, metrics, and persisted
-    /// per-pipeline progress markers (the `__restore` column
-    /// family).
-    ///
-    /// Must be unique among the pipelines registered against a
-    /// single database; drivers use it as a primary key.
-    const NAME: &'static str;
-
-    /// The portion of the schema this pipeline reads from and
-    /// writes to.
-    ///
-    /// Typically a struct of [`DbMap`](crate::DbMap) fields scoped
-    /// to the CFs this pipeline owns. The driver supplies an
-    /// `&Self::Schema` on every [`commit`](Self::commit) call.
+/// can live on the implementing type and be shared by both the
+/// processor and restore paths.
+pub trait Restore: Processor {
+    /// The portion of the schema this pipeline writes to during
+    /// restore. Typically a struct of [`DbMap`](crate::DbMap)
+    /// fields scoped to the CFs this pipeline owns. The driver
+    /// supplies an `&Self::Schema` on every [`restore`](Self::restore)
+    /// call.
     type Schema: Send + Sync;
 
-    /// The accumulator type into which [`restore`](Self::restore)
-    /// folds per-object updates. Each shard worker owns one; the
-    /// driver hands it to [`commit`](Self::commit) once the shard
-    /// is done.
-    type Batch: Default + Send + Sync + 'static;
-
-    /// Fold updates derived from a single live object into the
-    /// per-shard accumulator.
+    /// Stage writes derived from `object` onto `batch`.
     ///
-    /// Each worker owns its own `accumulator`; objects may arrive
-    /// in any order within a worker's slice. The pipeline is free
-    /// to fold (combine deltas, dedup by key) before
-    /// [`commit`](Self::commit) emits writes — this avoids staging
-    /// redundant operations in the shard's [`Batch`].
+    /// Called from worker tasks under a restore driver. Each
+    /// worker owns its own `batch`; objects may arrive in any
+    /// order within a worker's slice. The pipeline encodes each
+    /// object's resulting rows directly via the [`Batch`] API
+    /// (typed `put`, `delete`, `merge` against
+    /// [`DbMap`](crate::DbMap) handles in `schema`).
     ///
     /// Cross-shard collisions are RocksDB's concern: two shards
     /// that both touch the same key each emit their own ops, and
     /// the registered merge operator (for merge-CFs) or
     /// last-write semantics (for put-CFs) reconcile them.
-    fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()>;
-
-    /// Apply the folded accumulator to `write_batch`.
-    ///
-    /// The pipeline encodes its rows into `write_batch` via the
-    /// [`Batch`] API (typed `put`, `delete`, `merge` against
-    /// [`DbMap`](crate::DbMap) handles in `schema`). The driver
-    /// commits `write_batch` atomically — typically alongside a
-    /// partition-complete marker of its own.
-    ///
-    /// Returns the number of rows applied, for metrics.
-    fn commit(
+    fn restore(
         &self,
         schema: &Self::Schema,
-        batch: &Self::Batch,
-        write_batch: &mut Batch,
-    ) -> anyhow::Result<usize>;
+        object: &Object,
+        batch: &mut Batch,
+    ) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]
 mod tests {
-    //! End-to-end exercise of both [`Restore`] methods against an
+    //! End-to-end exercise of [`Restore::restore`] against an
     //! in-memory `Db`. No restore drivers here — the test calls
-    //! [`Restore::restore`] / [`Restore::commit`] directly to
-    //! verify the trait shape compiles and the two methods are
-    //! wired up correctly.
+    //! [`Restore::restore`] directly to verify the trait shape
+    //! compiles and integrates with the [`Batch`] write path.
 
-    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
+    use async_trait::async_trait;
     use bytes::Buf;
     use bytes::BufMut;
+    use sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint;
     use sui_types::base_types::ObjectID;
     use sui_types::object::Object;
     use tempfile::TempDir;
@@ -191,40 +174,35 @@ mod tests {
         }
     }
 
-    /// Test pipeline: tracks the latest version observed for each
-    /// object id. `restore` folds the per-shard accumulator by id,
-    /// keeping the highest version; `commit` writes the folded
-    /// entries.
+    /// Test pipeline: writes (object_id → version) per object.
     struct ObjectVersionPipeline;
 
-    impl Restore for ObjectVersionPipeline {
+    #[async_trait]
+    impl Processor for ObjectVersionPipeline {
         const NAME: &'static str = "object_version";
+        type Value = ();
 
-        type Schema = ObjectVersionSchema;
-        type Batch = BTreeMap<ObjectID, u64>;
-
-        fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()> {
-            accumulator
-                .entry(object.id())
-                .and_modify(|hi| {
-                    if object.version().value() > *hi {
-                        *hi = object.version().value();
-                    }
-                })
-                .or_insert(object.version().value());
-            Ok(())
+        async fn process(&self, _: &Arc<Checkpoint>) -> anyhow::Result<Vec<Self::Value>> {
+            // Restore-only test pipeline; tip path not exercised.
+            Ok(vec![])
         }
+    }
 
-        fn commit(
+    impl Restore for ObjectVersionPipeline {
+        type Schema = ObjectVersionSchema;
+
+        fn restore(
             &self,
             schema: &Self::Schema,
-            batch: &Self::Batch,
-            write_batch: &mut Batch,
-        ) -> anyhow::Result<usize> {
-            for (id, version) in batch {
-                write_batch.put(&schema.versions, &ObjectIdKey::new(*id), &U64Be(*version))?;
-            }
-            Ok(batch.len())
+            object: &Object,
+            batch: &mut Batch,
+        ) -> anyhow::Result<()> {
+            batch.put(
+                &schema.versions,
+                &ObjectIdKey::new(object.id()),
+                &U64Be(object.version().value()),
+            )?;
+            Ok(())
         }
     }
 
@@ -236,22 +214,17 @@ mod tests {
     }
 
     #[test]
-    fn restore_folds_into_accumulator_then_commit_writes() {
+    fn restore_writes_each_object_directly() {
         let (_dir, db, schema) = open();
         let pipeline = ObjectVersionPipeline;
 
         let o1 = Object::immutable_with_id_for_testing(ObjectID::from_single_byte(1));
         let o2 = Object::immutable_with_id_for_testing(ObjectID::from_single_byte(2));
 
-        let mut acc = <ObjectVersionPipeline as Restore>::Batch::default();
-        pipeline.restore(&mut acc, &o1).unwrap();
-        pipeline.restore(&mut acc, &o2).unwrap();
-        assert_eq!(acc.len(), 2);
-
-        let mut write_batch = db.batch();
-        let n = pipeline.commit(&schema, &acc, &mut write_batch).unwrap();
-        write_batch.commit().unwrap();
-        assert_eq!(n, 2);
+        let mut batch = db.batch();
+        pipeline.restore(&schema, &o1, &mut batch).unwrap();
+        pipeline.restore(&schema, &o2, &mut batch).unwrap();
+        batch.commit().unwrap();
 
         assert_eq!(
             schema.versions.get(&ObjectIdKey::new(o1.id())).unwrap(),
@@ -264,28 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn restore_dedups_repeated_objects_into_one_accumulator_entry() {
-        let pipeline = ObjectVersionPipeline;
-        let id = ObjectID::from_single_byte(7);
-        let obj = Object::immutable_with_id_for_testing(id);
-        let version = obj.version().value();
-
-        let mut acc = <ObjectVersionPipeline as Restore>::Batch::default();
-        pipeline.restore(&mut acc, &obj).unwrap();
-        pipeline.restore(&mut acc, &obj).unwrap();
-        assert_eq!(acc.len(), 1);
-        assert_eq!(acc.get(&id), Some(&version));
-    }
-
-    #[test]
     fn empty_batch_commit_writes_nothing() {
         let (_dir, db, schema) = open();
-        let pipeline = ObjectVersionPipeline;
-        let acc = <ObjectVersionPipeline as Restore>::Batch::default();
-        let mut write_batch = db.batch();
-        let n = pipeline.commit(&schema, &acc, &mut write_batch).unwrap();
-        write_batch.commit().unwrap();
-        assert_eq!(n, 0);
+        let batch = db.batch();
+        batch.commit().unwrap();
         let rows = schema.versions.iter(..).unwrap().count();
         assert_eq!(rows, 0);
     }

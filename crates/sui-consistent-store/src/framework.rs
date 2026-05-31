@@ -256,6 +256,19 @@ pub struct Watermark {
     pub timestamp_ms_hi_inclusive: u64,
 }
 
+impl Watermark {
+    /// Build a watermark for `checkpoint`, leaving every other
+    /// field at zero. Useful in tests and for callers that only
+    /// care about the checkpoint axis (snapshot eviction order,
+    /// `Db::at_snapshot` keying).
+    pub fn for_checkpoint(checkpoint: u64) -> Self {
+        Self {
+            checkpoint_hi_inclusive: checkpoint,
+            ..Self::default()
+        }
+    }
+}
+
 /// On-wire size of a [`Watermark`]. Used by both the encoder and
 /// the decoder to validate buffer sizes precisely.
 const WATERMARK_WIRE_SIZE: usize = 4 * 8;
@@ -527,7 +540,7 @@ mod tests {
         batch.put(&fw.watermarks, &key, &w).unwrap();
         batch.commit().unwrap();
 
-        db.take_snapshot(1);
+        db.take_snapshot(Watermark::for_checkpoint(1));
 
         let w2 = Watermark {
             checkpoint_hi_inclusive: 999,

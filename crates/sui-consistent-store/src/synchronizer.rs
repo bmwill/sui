@@ -19,6 +19,17 @@
 //! exactly the state every pipeline has up through `C`'s writes
 //! — no pipeline is half-applied when the snapshot is taken.
 //!
+//! # Pipelines must commit exactly one checkpoint per batch
+//!
+//! The synchronizer assumes each `(Watermark, Batch)` it receives
+//! corresponds to exactly one checkpoint. A pipeline driven by
+//! the indexer-alt framework's `sequential::pipeline` must therefore
+//! set `MAX_BATCH_CHECKPOINTS = 1` on its `sequential::Handler`
+//! impl so the framework's collector commits each checkpoint as
+//! its own batch rather than folding several into one. If a batch
+//! spans multiple checkpoints the synchronizer will bail with an
+//! out-of-order error on the first such batch.
+//!
 //! # Lifecycle
 //!
 //! 1. [`Synchronizer::new`] creates the service with a database,
@@ -40,19 +51,29 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use anyhow::bail;
 use anyhow::ensure;
+use sui_futures::future::with_slow_future_monitor;
+use tokio::sync::Barrier;
+use tokio::sync::mpsc;
+
 use crate::Batch;
 use crate::Db;
 use crate::PipelineTaskKey;
 use crate::Watermark;
-use tokio::sync::Barrier;
-use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::debug;
 use tracing::info;
+use tracing::warn;
+
+/// How long a per-pipeline synchronizer task may wait at a stride
+/// barrier (waiting for peer pipelines to catch up) before it logs
+/// a warning. The wait still completes normally; the warning just
+/// surfaces a likely operational issue.
+const SLOW_SYNC_WARNING_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// Write-side handle to the per-pipeline channels each
 /// [`Synchronizer`] task reads from. Held inside the
@@ -221,7 +242,13 @@ async fn synchronizer_task(
             // takes the snapshot before the post-barrier; everyone
             // proceeds afterward.
             Ordering::Equal => {
-                let take_snapshot = pre_snap.wait().await.is_leader();
+                let take_snapshot = with_slow_future_monitor(
+                    pre_snap.wait(),
+                    SLOW_SYNC_WARNING_THRESHOLD,
+                    || warn!(pipeline = %pipeline_task, "Synchronizer stuck, pre-snapshot"),
+                )
+                .await
+                .is_leader();
                 if take_snapshot {
                     let Some(watermark) = current_watermark else {
                         bail!(
@@ -229,7 +256,7 @@ async fn synchronizer_task(
                              {next_snapshot_checkpoint}"
                         );
                     };
-                    db.take_snapshot(watermark.checkpoint_hi_inclusive);
+                    db.take_snapshot(watermark);
                     debug!(
                         pipeline = %pipeline_task,
                         checkpoint = watermark.checkpoint_hi_inclusive,
@@ -237,7 +264,12 @@ async fn synchronizer_task(
                     );
                 }
                 next_snapshot_checkpoint += stride;
-                post_snap.wait().await;
+                with_slow_future_monitor(
+                    post_snap.wait(),
+                    SLOW_SYNC_WARNING_THRESHOLD,
+                    || warn!(pipeline = %pipeline_task, "Synchronizer stuck, post-snapshot"),
+                )
+                .await;
             }
         }
 
@@ -249,7 +281,9 @@ async fn synchronizer_task(
         ensure!(
             watermark.checkpoint_hi_inclusive == next_checkpoint,
             "Out-of-order batch for {pipeline_task}: expected {next_checkpoint}, \
-             got {watermark:?}",
+             got {watermark:?}. The synchronizer requires exactly one checkpoint \
+             per batch; ensure the pipeline's `sequential::Handler` impl sets \
+             `MAX_BATCH_CHECKPOINTS = 1`.",
         );
 
         batch

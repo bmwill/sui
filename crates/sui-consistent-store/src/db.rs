@@ -36,6 +36,7 @@ use crate::framework::CHAIN_ID_CF;
 use crate::framework::FrameworkSchema;
 use crate::framework::RESTORE_CF;
 use crate::framework::WATERMARK_CF;
+use crate::framework::Watermark;
 use crate::schema::CfDescriptor;
 use crate::schema::Schema;
 use crate::snapshot::Snapshot;
@@ -144,11 +145,16 @@ struct DbInner {
 ///    drops before the `Db`.
 pub(crate) struct SnapshotEntry {
     snapshot: rocksdb::Snapshot<'static>,
+    watermark: Watermark,
 }
 
 impl SnapshotEntry {
     pub(crate) fn as_snapshot(&self) -> &rocksdb::Snapshot<'static> {
         &self.snapshot
+    }
+
+    pub(crate) fn watermark(&self) -> Watermark {
+        self.watermark
     }
 }
 
@@ -288,12 +294,16 @@ impl Db {
     }
 
     /// Take a snapshot of the database state and store it under
-    /// `checkpoint`.
+    /// `watermark.checkpoint_hi_inclusive`.
     ///
     /// Snapshots are point-in-time consistent views of the data; a
     /// subsequent [`at_snapshot`](Self::at_snapshot) lookup at the
-    /// same `checkpoint` returns a handle that reads from this state
+    /// same checkpoint returns a handle that reads from this state
     /// regardless of any writes that happen after this call returns.
+    /// The full `watermark` is retained alongside the snapshot and
+    /// can be recovered via [`Snapshot::watermark`](crate::Snapshot::watermark);
+    /// downstream readers use it to recover the chain state
+    /// (epoch / tx count / timestamp) the snapshot was taken at.
     ///
     /// Both the snapshot capture and the buffer insertion happen
     /// while holding the snapshot buffer's write lock, so concurrent
@@ -304,13 +314,13 @@ impl Db {
     /// writers themselves; this method only ensures internal
     /// consistency between competing `take_snapshot` callers.
     ///
-    /// If a snapshot already exists at `checkpoint`, it is replaced.
-    /// If the buffer is at
+    /// If a snapshot already exists at this checkpoint, it is
+    /// replaced. If the buffer is at
     /// [`DbOptions::snapshot_capacity`](crate::DbOptions::snapshot_capacity),
     /// the snapshot with the lowest checkpoint number is evicted. If
     /// capacity is `0`, snapshotting is disabled and this call is a
     /// no-op.
-    pub fn take_snapshot(&self, checkpoint: u64) {
+    pub fn take_snapshot(&self, watermark: Watermark) {
         if self.inner.snapshot_capacity == 0 {
             return;
         }
@@ -330,9 +340,12 @@ impl Db {
         // drop their `Arc<SnapshotEntry>` before their `Db`, so no
         // snapshot can survive a `DbInner` drop.
         let snapshot: rocksdb::Snapshot<'static> = unsafe { std::mem::transmute(snapshot) };
-        let entry = Arc::new(SnapshotEntry { snapshot });
+        let entry = Arc::new(SnapshotEntry {
+            snapshot,
+            watermark,
+        });
 
-        snaps.insert(checkpoint, entry);
+        snaps.insert(watermark.checkpoint_hi_inclusive, entry);
         while snaps.len() > self.inner.snapshot_capacity {
             snaps.pop_first();
         }
@@ -346,7 +359,7 @@ impl Db {
     pub fn at_snapshot(&self, checkpoint: u64) -> Option<Snapshot> {
         let snaps = self.inner.snapshots.read();
         let entry = snaps.get(&checkpoint)?.clone();
-        Some(Snapshot::new(self.clone(), entry, checkpoint))
+        Some(Snapshot::new(self.clone(), entry))
     }
 
     /// Look up the snapshot with the highest checkpoint number in
@@ -358,8 +371,8 @@ impl Db {
     /// bound of [`snapshot_range`](Self::snapshot_range).
     pub fn latest_snapshot(&self) -> Option<Snapshot> {
         let snaps = self.inner.snapshots.read();
-        let (checkpoint, entry) = snaps.iter().next_back()?;
-        Some(Snapshot::new(self.clone(), entry.clone(), *checkpoint))
+        let (_, entry) = snaps.iter().next_back()?;
+        Some(Snapshot::new(self.clone(), entry.clone()))
     }
 
     /// Returns the inclusive range of checkpoints covered by the

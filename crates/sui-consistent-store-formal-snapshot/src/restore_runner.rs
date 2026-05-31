@@ -235,22 +235,18 @@ impl<P: Restore> RestoreRunner<P> {
             return Ok(());
         }
 
-        // 1. Fold objects into the typed accumulator. Per-object
-        // errors abort the shard.
-        let mut acc = <P::Batch as Default>::default();
+        // 1. Stage per-object writes directly into the shard's
+        // batch. Per-object errors abort the shard before the
+        // batch is committed.
+        let mut batch = self.db.batch();
         let mut object_count = 0usize;
         for object in objects {
             let object = object?;
-            self.pipeline.restore(&mut acc, &object)?;
+            self.pipeline.restore(&self.schema, &object, &mut batch)?;
             object_count += 1;
         }
 
-        // 2. Drain the accumulator into a Batch.
-        let mut batch = self.db.batch();
-        let row_count = self.pipeline.commit(&self.schema, &acc, &mut batch)?;
-        drop(acc);
-
-        // 3. Stage the partition-complete marker into the same
+        // 2. Stage the partition-complete marker into the same
         // batch, then commit. The state-lock guard serializes the
         // read-modify-write of `partitions_complete` against
         // concurrent shard processors, and the WriteBatch's
@@ -271,7 +267,6 @@ impl<P: Restore> RestoreRunner<P> {
             pipeline = P::NAME,
             partition = %hex_encode(partition_id),
             objects = object_count,
-            rows = row_count,
             "Shard complete",
         );
 
@@ -352,10 +347,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
+    use async_trait::async_trait;
     use bytes::Buf;
     use bytes::BufMut;
+    use sui_indexer_alt_framework::pipeline::Processor;
+    use sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint;
     use sui_types::base_types::ObjectID;
     use sui_types::object::Object;
     use tempfile::TempDir;
@@ -461,38 +457,34 @@ mod tests {
         }
     }
 
-    /// Test pipeline: per-object key → version. The accumulator
-    /// keeps the highest version observed per id.
+    /// Test pipeline: writes (object_id → version) per object.
     struct VersionsPipeline;
 
-    impl Restore for VersionsPipeline {
+    #[async_trait]
+    impl Processor for VersionsPipeline {
         const NAME: &'static str = "versions";
+        type Value = ();
 
-        type Schema = VersionsSchema;
-        type Batch = BTreeMap<ObjectID, u64>;
-
-        fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()> {
-            accumulator
-                .entry(object.id())
-                .and_modify(|hi| {
-                    if object.version().value() > *hi {
-                        *hi = object.version().value();
-                    }
-                })
-                .or_insert(object.version().value());
-            Ok(())
+        async fn process(&self, _: &Arc<Checkpoint>) -> anyhow::Result<Vec<Self::Value>> {
+            Ok(vec![])
         }
+    }
 
-        fn commit(
+    impl Restore for VersionsPipeline {
+        type Schema = VersionsSchema;
+
+        fn restore(
             &self,
             schema: &Self::Schema,
-            batch: &Self::Batch,
-            write_batch: &mut Batch,
-        ) -> anyhow::Result<usize> {
-            for (id, version) in batch {
-                write_batch.put(&schema.versions, &ObjectIdKey::new(*id), &U64Be(*version))?;
-            }
-            Ok(batch.len())
+            object: &Object,
+            batch: &mut Batch,
+        ) -> anyhow::Result<()> {
+            batch.put(
+                &schema.versions,
+                &ObjectIdKey::new(object.id()),
+                &U64Be(object.version().value()),
+            )?;
+            Ok(())
         }
     }
 
@@ -534,30 +526,32 @@ mod tests {
     }
 
     /// Test pipeline: counts how many times each id was observed.
-    /// Uses a merge operator so cross-shard merges combine.
+    /// Uses a merge operator so per-object emits (one merge per
+    /// object) combine within and across shards through RocksDB's
+    /// registered merge operator.
     struct CountersPipeline;
 
-    impl Restore for CountersPipeline {
+    #[async_trait]
+    impl Processor for CountersPipeline {
         const NAME: &'static str = "counters";
+        type Value = ();
 
-        type Schema = CountersSchema;
-        type Batch = BTreeMap<ObjectID, u64>;
-
-        fn restore(&self, accumulator: &mut Self::Batch, object: &Object) -> anyhow::Result<()> {
-            *accumulator.entry(object.id()).or_insert(0) += 1;
-            Ok(())
+        async fn process(&self, _: &Arc<Checkpoint>) -> anyhow::Result<Vec<Self::Value>> {
+            Ok(vec![])
         }
+    }
 
-        fn commit(
+    impl Restore for CountersPipeline {
+        type Schema = CountersSchema;
+
+        fn restore(
             &self,
             schema: &Self::Schema,
-            batch: &Self::Batch,
-            write_batch: &mut Batch,
-        ) -> anyhow::Result<usize> {
-            for (id, count) in batch {
-                write_batch.merge(&schema.counters, &ObjectIdKey::new(*id), &U64Be(*count))?;
-            }
-            Ok(batch.len())
+            object: &Object,
+            batch: &mut Batch,
+        ) -> anyhow::Result<()> {
+            batch.merge(&schema.counters, &ObjectIdKey::new(object.id()), &U64Be(1))?;
+            Ok(())
         }
     }
 

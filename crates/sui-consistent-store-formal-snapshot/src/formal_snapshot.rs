@@ -542,12 +542,14 @@ mod tests {
     /// the runner, then read back the pipeline's CF and confirm
     /// every object landed.
     mod driver {
-        use std::collections::BTreeMap;
         use std::sync::Arc;
 
+        use async_trait::async_trait;
         use bytes::Buf;
         use bytes::BufMut;
         use object_store::local::LocalFileSystem;
+        use sui_indexer_alt_framework::pipeline::Processor;
+        use sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint as FwCheckpoint;
         use sui_types::base_types::ObjectID;
         use sui_types::object::Object;
         use tempfile::TempDir;
@@ -663,37 +665,31 @@ mod tests {
 
         struct VersionsPipeline;
 
-        impl Restore for VersionsPipeline {
+        #[async_trait]
+        impl Processor for VersionsPipeline {
             const NAME: &'static str = "versions";
+            type Value = ();
+
+            async fn process(&self, _: &Arc<FwCheckpoint>) -> anyhow::Result<Vec<Self::Value>> {
+                Ok(vec![])
+            }
+        }
+
+        impl Restore for VersionsPipeline {
             type Schema = VersionsSchema;
-            type Batch = BTreeMap<ObjectID, u64>;
 
             fn restore(
                 &self,
-                accumulator: &mut Self::Batch,
-                object: &Object,
-            ) -> anyhow::Result<()> {
-                accumulator
-                    .entry(object.id())
-                    .and_modify(|hi| {
-                        if object.version().value() > *hi {
-                            *hi = object.version().value();
-                        }
-                    })
-                    .or_insert(object.version().value());
-                Ok(())
-            }
-
-            fn commit(
-                &self,
                 schema: &Self::Schema,
-                batch: &Self::Batch,
-                write_batch: &mut Batch,
-            ) -> anyhow::Result<usize> {
-                for (id, v) in batch {
-                    write_batch.put(&schema.versions, &ObjectIdKey::new(*id), &U64Be(*v))?;
-                }
-                Ok(batch.len())
+                object: &Object,
+                batch: &mut Batch,
+            ) -> anyhow::Result<()> {
+                batch.put(
+                    &schema.versions,
+                    &ObjectIdKey::new(object.id()),
+                    &U64Be(object.version().value()),
+                )?;
+                Ok(())
             }
         }
 

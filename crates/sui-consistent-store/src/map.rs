@@ -723,6 +723,7 @@ mod tests {
     use bytes::BufMut;
 
     use crate::Schema;
+    use crate::Watermark;
     use crate::error::DecodeError;
     use crate::error::EncodeError;
 
@@ -1048,7 +1049,7 @@ mod tests {
         let (_dir_b, db_b, _schema_b) = open();
         // Snapshot is taken on db_b, but we re-bind a DbMap from db_a.
         // Should panic to surface the misuse.
-        db_b.take_snapshot(1);
+        db_b.take_snapshot(Watermark::for_checkpoint(1));
         let snap_b = db_b.at_snapshot(1).unwrap();
         // db_a in scope so the assert message is meaningful, even
         // though we don't directly use it.

@@ -31,5 +31,6 @@ url.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+sui-indexer-alt-framework = { workspace = true, default-features = false }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

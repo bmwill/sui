@@ -42,6 +42,14 @@
 //! pipelines at stride boundaries to take cross-pipeline
 //! snapshots. With no synchronizer installed, transactions commit
 //! inline.
+//!
+//! With a synchronizer installed, the pipeline's
+//! `sequential::Handler` impl **must** set
+//! `MAX_BATCH_CHECKPOINTS = 1`: the synchronizer requires each
+//! batch shipped through its queue to correspond to exactly one
+//! checkpoint. Folding multiple checkpoints into one batch will
+//! trip the synchronizer's out-of-order check on the first
+//! multi-checkpoint batch and shut the task down.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
