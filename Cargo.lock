@@ -14459,6 +14459,7 @@ dependencies = [
  "bytes",
  "parking_lot 0.12.3",
  "prometheus",
+ "prost 0.14.1",
  "rocksdb",
  "scoped-futures",
  "sui-futures",
