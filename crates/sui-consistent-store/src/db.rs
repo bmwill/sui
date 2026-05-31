@@ -25,6 +25,7 @@ use std::fmt;
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Weak;
 
 use parking_lot::RwLock;
 use rocksdb::BoundColumnFamily;
@@ -113,6 +114,39 @@ pub struct Db {
     inner: Arc<DbInner>,
 }
 
+/// A weak handle to a [`Db`] that does not keep the underlying
+/// database open.
+///
+/// Construct with [`Db::downgrade`]. Promote back to a strong
+/// [`Db`] handle with [`upgrade`](DbRef::upgrade), which returns
+/// `None` once every strong [`Db`] has been dropped.
+///
+/// Intended for long-lived observers (Prometheus collectors,
+/// background tasks) that should not pin the database alive after
+/// the application has released it. Cloning is cheap: one `Arc`
+/// weak-count bump.
+#[derive(Clone)]
+pub struct DbRef {
+    inner: Weak<DbInner>,
+}
+
+impl DbRef {
+    /// Try to obtain a strong [`Db`] handle. Returns `None` if
+    /// every strong handle has already been dropped (the database
+    /// is closed or closing).
+    pub fn upgrade(&self) -> Option<Db> {
+        self.inner.upgrade().map(|inner| Db { inner })
+    }
+}
+
+impl fmt::Debug for DbRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DbRef")
+            .field("alive", &(self.inner.strong_count() > 0))
+            .finish_non_exhaustive()
+    }
+}
+
 /// The shared storage backing a [`Db`].
 ///
 /// Held inside an [`Arc`] inside [`Db`] so every clone of the
@@ -126,6 +160,13 @@ pub struct Db {
 struct DbInner {
     snapshots: RwLock<BTreeMap<u64, Arc<SnapshotEntry>>>,
     snapshot_capacity: usize,
+    /// The set of column-family names registered when this database
+    /// was opened. Used by [`Db::cf_names`] so observability
+    /// helpers (e.g. the Prometheus column-family stats collector)
+    /// can iterate the CFs the database knows about without having
+    /// to enumerate them off disk. Stored as `&'static str`
+    /// because [`CfDescriptor::name`] already requires that.
+    cf_names: Vec<&'static str>,
     db: rocksdb::DB,
 }
 
@@ -228,6 +269,7 @@ impl Db {
             cfs.push(CfDescriptor::new(CHAIN_ID_CF, db_options.clone()));
         }
 
+        let cf_names: Vec<&'static str> = cfs.iter().map(|cf| cf.name).collect();
         let descriptors = cfs
             .into_iter()
             .map(|cf| rocksdb::ColumnFamilyDescriptor::new(cf.name, cf.options));
@@ -240,11 +282,22 @@ impl Db {
             inner: Arc::new(DbInner {
                 snapshots: RwLock::new(BTreeMap::new()),
                 snapshot_capacity,
+                cf_names,
                 db,
             }),
         };
         let schema = S::open(&db)?;
         Ok((db, schema))
+    }
+
+    /// Names of the column families that were registered when this
+    /// database was opened — both schema-declared CFs and the
+    /// framework-internal ones (`__restore`, `__watermark`,
+    /// `__chain_id`), plus `default`. Order matches what
+    /// [`Schema::cfs`] returned, with framework CFs and `default`
+    /// appended.
+    pub fn cf_names(&self) -> &[&'static str] {
+        &self.inner.cf_names
     }
 
     /// Returns `true` if `self` and `other` are handles to the same
@@ -253,6 +306,20 @@ impl Db {
     /// the shared inner [`Arc`].
     pub fn ptr_eq(&self, other: &Db) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Build a weak handle to this database. The returned [`DbRef`]
+    /// does not contribute to the owner count; the underlying
+    /// database closes when the last strong [`Db`] handle drops,
+    /// independent of how many [`DbRef`]s remain.
+    ///
+    /// Use this for long-lived observers (Prometheus collectors,
+    /// background log scrapers) that should not pin the database
+    /// alive after the rest of the application has released it.
+    pub fn downgrade(&self) -> DbRef {
+        DbRef {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     /// Borrowed handle to the auto-registered [`FrameworkSchema`].

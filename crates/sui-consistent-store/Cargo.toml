@@ -11,6 +11,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
+prometheus.workspace = true
 rocksdb = { version = "0.22.0", default-features = false, features = ["snappy", "lz4", "zstd", "zlib", "multi-threaded-cf"] }
 scoped-futures.workspace = true
 sui-futures.workspace = true

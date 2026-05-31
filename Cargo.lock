@@ -14458,6 +14458,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "parking_lot 0.12.3",
+ "prometheus",
  "rocksdb",
  "scoped-futures",
  "sui-futures",
