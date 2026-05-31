@@ -248,8 +248,11 @@ impl<S: Send + Sync + 'static> SequentialStore for Store<S> {
             // Synchronizer mode: route the batch through the
             // pipeline's per-task queue. The synchronizer commits
             // it and coordinates the cross-pipeline snapshot
-            // cadence.
-            let sender = queue.get(&pipeline_task).with_context(|| {
+            // cadence. The queue is keyed by `&'static str`; the
+            // lookup resolves via `Borrow<str>` so passing the
+            // String's slice (rather than the static name we
+            // registered with) Just Works.
+            let sender = queue.get(pipeline_task.as_str()).with_context(|| {
                 format!("pipeline {pipeline_task} not registered with the synchronizer")
             })?;
             sender

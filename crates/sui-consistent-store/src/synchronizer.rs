@@ -80,7 +80,13 @@ const SLOW_SYNC_WARNING_THRESHOLD: Duration = Duration::from_secs(60);
 /// [`Synchronizer`] task reads from. Held inside the
 /// [`Store`](crate::Store)'s `OnceLock` so transactions can route
 /// through it after the synchronizer is installed.
-pub(crate) type Queue = HashMap<String, mpsc::Sender<(Watermark, Batch)>>;
+///
+/// Pipeline identifiers are `&'static str` (typically a
+/// pipeline's `Processor::NAME`) so the map key is a single
+/// pointer rather than a heap-allocated `String`. The
+/// `HashMap<&'static str, _>` still accepts `&str` lookups via
+/// the standard `Borrow<str>` blanket impl.
+pub(crate) type Queue = HashMap<&'static str, mpsc::Sender<(Watermark, Batch)>>;
 
 /// Builder + runner for the per-pipeline synchronizer tasks.
 ///
@@ -90,7 +96,7 @@ pub(crate) type Queue = HashMap<String, mpsc::Sender<(Watermark, Batch)>>;
 /// [`Queue`] + a [`JoinSet`] driving the per-pipeline tasks.
 pub struct Synchronizer {
     db: Db,
-    last_watermarks: HashMap<String, Option<Watermark>>,
+    last_watermarks: HashMap<&'static str, Option<Watermark>>,
     first_checkpoint: u64,
     stride: NonZero<u64>,
     buffer_size: usize,
@@ -137,6 +143,15 @@ impl Synchronizer {
 
     /// Register a pipeline by its `pipeline_task` identifier.
     ///
+    /// `pipeline_task` is `&'static str` because the canonical
+    /// source of a pipeline's name is its
+    /// [`Processor::NAME`](sui_indexer_alt_framework::pipeline::Processor::NAME)
+    /// constant, which is already `&'static str`. Storing it that
+    /// way avoids a per-pipeline heap allocation and lets the
+    /// synchronizer's per-pipeline state, queue entry, and task
+    /// share a single static string slice instead of cloned
+    /// `String`s.
+    ///
     /// Reads the pipeline's existing committer watermark (if any)
     /// from the framework schema so the synchronizer knows what
     /// checkpoint to expect next.
@@ -144,9 +159,8 @@ impl Synchronizer {
     /// Registering a brand-new pipeline (no persisted watermark)
     /// is *not* an error — the synchronizer expects its first
     /// write to be at `first_checkpoint`.
-    pub fn register_pipeline(&mut self, pipeline_task: impl Into<String>) -> anyhow::Result<()> {
-        let pipeline_task = pipeline_task.into();
-        let key = PipelineTaskKey::new(pipeline_task.clone());
+    pub fn register_pipeline(&mut self, pipeline_task: &'static str) -> anyhow::Result<()> {
+        let key = PipelineTaskKey::new(pipeline_task);
         let watermark = self
             .db
             .framework()
@@ -191,7 +205,7 @@ impl Synchronizer {
         let mut join_set = JoinSet::new();
         for (pipeline_task, last_watermark) in self.last_watermarks {
             let (tx, rx) = mpsc::channel(self.buffer_size);
-            queue.insert(pipeline_task.clone(), tx);
+            queue.insert(pipeline_task, tx);
             join_set.spawn(synchronizer_task(
                 self.db.clone(),
                 rx,
@@ -215,7 +229,7 @@ impl Synchronizer {
 async fn synchronizer_task(
     db: Db,
     mut rx: mpsc::Receiver<(Watermark, Batch)>,
-    pipeline_task: String,
+    pipeline_task: &'static str,
     first_checkpoint: u64,
     stride: u64,
     mut next_snapshot_checkpoint: u64,
