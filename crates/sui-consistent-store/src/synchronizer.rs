@@ -50,6 +50,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,7 +92,7 @@ pub struct Synchronizer {
     db: Db,
     last_watermarks: HashMap<String, Option<Watermark>>,
     first_checkpoint: u64,
-    stride: u64,
+    stride: NonZero<u64>,
     buffer_size: usize,
 }
 
@@ -106,7 +107,11 @@ impl Synchronizer {
     /// `stride` is the number of checkpoints between snapshots
     /// (snapshots are taken before the write of checkpoint
     /// `next * stride`, after every pipeline has applied
-    /// `next * stride - 1`).
+    /// `next * stride - 1`). Typed as
+    /// [`NonZero<u64>`](std::num::NonZero) so a zero stride is
+    /// unrepresentable: it would divide by zero in the stride
+    /// arithmetic and snapshot on every checkpoint anyway is
+    /// expressed as `NonZero::new(1).unwrap()`.
     ///
     /// `buffer_size` is the capacity of each per-pipeline channel.
     /// Smaller values backpressure faster pipelines so they don't
@@ -117,7 +122,7 @@ impl Synchronizer {
     /// to `0`.
     pub fn new(
         db: Db,
-        stride: u64,
+        stride: NonZero<u64>,
         buffer_size: usize,
         first_checkpoint: Option<u64>,
     ) -> Self {
@@ -179,7 +184,7 @@ impl Synchronizer {
             .map(|w| w.map_or(self.first_checkpoint, |w| w.checkpoint_hi_inclusive))
             .max()
             .expect("non-empty by ensure! above");
-        let next_snapshot_checkpoint = ((init_checkpoint / self.stride) + 1) * self.stride;
+        let next_snapshot_checkpoint = ((init_checkpoint / stride) + 1) * stride;
 
         let mut queue: Queue = HashMap::new();
         let mut join_set = JoinSet::new();
@@ -191,7 +196,7 @@ impl Synchronizer {
                 rx,
                 pipeline_task,
                 self.first_checkpoint,
-                self.stride,
+                stride,
                 next_snapshot_checkpoint,
                 last_watermark,
                 pre_snap.clone(),
@@ -335,10 +340,15 @@ mod tests {
         (dir, db)
     }
 
+    /// Test-only helper: wrap a literal stride as `NonZero<u64>`.
+    fn nz(x: u64) -> NonZero<u64> {
+        NonZero::new(x).expect("test stride must be > 0")
+    }
+
     #[test]
     fn register_pipeline_with_no_watermark_succeeds() {
         let (_dir, db) = open();
-        let mut sync = Synchronizer::new(db, 8, 4, None);
+        let mut sync = Synchronizer::new(db, nz(8), 4, None);
         sync.register_pipeline("p").unwrap();
     }
 
@@ -357,7 +367,7 @@ mod tests {
         wb.put(&framework.watermarks, &key, &w).unwrap();
         wb.commit().unwrap();
 
-        let mut sync = Synchronizer::new(db, 8, 4, None);
+        let mut sync = Synchronizer::new(db, nz(8), 4, None);
         sync.register_pipeline("p").unwrap();
         assert_eq!(
             sync.last_watermarks
@@ -371,7 +381,7 @@ mod tests {
     #[test]
     fn run_refuses_no_pipelines() {
         let (_dir, db) = open();
-        let sync = Synchronizer::new(db, 8, 4, None);
+        let sync = Synchronizer::new(db, nz(8), 4, None);
         let err = sync.run().unwrap_err();
         assert!(format!("{err:#}").contains("no pipelines registered"));
     }
@@ -379,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn run_returns_one_queue_entry_per_pipeline() {
         let (_dir, db) = open();
-        let mut sync = Synchronizer::new(db, 8, 4, None);
+        let mut sync = Synchronizer::new(db, nz(8), 4, None);
         sync.register_pipeline("a").unwrap();
         sync.register_pipeline("b").unwrap();
         let (mut joinset, queue) = sync.run().unwrap();
@@ -414,7 +424,7 @@ mod tests {
         .unwrap();
         wb.commit().unwrap();
 
-        let mut sync = Synchronizer::new(db.clone(), 5, 4, None);
+        let mut sync = Synchronizer::new(db.clone(), nz(5), 4, None);
         sync.register_pipeline("p").unwrap();
         let (mut joinset, queue) = sync.run().unwrap();
 
@@ -448,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn synchronizer_rejects_out_of_order_batch() {
         let (_dir, db) = open();
-        let mut sync = Synchronizer::new(db.clone(), 100, 4, None);
+        let mut sync = Synchronizer::new(db.clone(), nz(100), 4, None);
         sync.register_pipeline("p").unwrap();
         let (mut joinset, queue) = sync.run().unwrap();
 
@@ -477,7 +487,7 @@ mod tests {
         // checkpoint. Send checkpoint 0, observe the snapshot
         // buffer contain a snapshot at 0.
         let (_dir, db) = open();
-        let mut sync = Synchronizer::new(db.clone(), 1, 4, None);
+        let mut sync = Synchronizer::new(db.clone(), nz(1), 4, None);
         sync.register_pipeline("p").unwrap();
         let (mut joinset, queue) = sync.run().unwrap();
 

@@ -553,16 +553,36 @@ impl Db {
         )
     }
 
-    /// Flush all column families to disk, blocking until each
-    /// memtable has been written.
+    /// Flush every registered column family's memtable to disk,
+    /// blocking until each flush completes.
     ///
-    /// Equivalent to RocksDB's `flush()` operation. Useful before a
-    /// graceful shutdown or before opening a [filesystem
-    /// checkpoint][rocksdb::checkpoint::Checkpoint] of the
-    /// database. Routine writes do not require this call; RocksDB
-    /// flushes automatically as memtables fill.
+    /// Useful before a graceful shutdown or before opening a
+    /// [filesystem checkpoint][rocksdb::checkpoint::Checkpoint] of
+    /// the database. Routine writes do not require this call;
+    /// RocksDB flushes automatically as memtables fill.
+    ///
+    /// RocksDB's `DB::flush` C API targets only the default column
+    /// family; this method walks the full set of column families
+    /// registered at open time (see [`Db::cf_names`]) and issues
+    /// `flush_cfs_opt` so that every CF is flushed. If
+    /// [`Options::set_atomic_flush`](rocksdb::Options::set_atomic_flush)
+    /// was enabled on the database options, the flushes are atomic
+    /// (all CFs at one shared sequence number); otherwise the call
+    /// is equivalent to flushing each CF in sequence.
+    ///
+    /// CFs that were dropped at runtime via [`drop_cf`](Self::drop_cf)
+    /// are silently skipped; their entries remain in `cf_names` for
+    /// the database's lifetime but no longer have a live handle.
     pub fn flush(&self) -> Result<(), Error> {
-        self.inner.db.flush()?;
+        let handles: Vec<Arc<BoundColumnFamily<'_>>> = self
+            .inner
+            .cf_names
+            .iter()
+            .filter_map(|name| self.inner.db.cf_handle(name))
+            .collect();
+        let refs: Vec<&Arc<BoundColumnFamily<'_>>> = handles.iter().collect();
+        let opts = rocksdb::FlushOptions::default();
+        self.inner.db.flush_cfs_opt(&refs, &opts)?;
         Ok(())
     }
 
@@ -824,6 +844,46 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
         db.flush().unwrap();
+    }
+
+    #[test]
+    fn flush_drains_non_default_cf_memtables() {
+        // Write into a non-default CF, flush, and confirm an L0
+        // SST file landed for that CF. Guards against the
+        // regression where `Db::flush` only flushed the default
+        // CF (the C API's default behavior) and silently left
+        // writes to schema CFs sitting in memory. A direct check
+        // on memtable size doesn't work — RocksDB pre-allocates
+        // the next active memtable on flush, so
+        // `cur-size-active-mem-table` does not snap to zero —
+        // but L0 file count rising from 0 to >= 1 is an
+        // unambiguous signal the flush hit disk for the CF.
+        let dir = TempDir::new().unwrap();
+        let (db, _schema) = Db::open::<TestSchema>(dir.path(), DbOptions::default()).unwrap();
+        let cf = db.cf_handle("foo").unwrap();
+        let l0 = |cf: &Arc<BoundColumnFamily<'_>>| {
+            db.rocksdb()
+                .property_int_value_cf(cf, "rocksdb.num-files-at-level0")
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(l0(&cf), 0, "expected no L0 files before any writes");
+        for i in 0..32u64 {
+            db.rocksdb()
+                .put_cf(&cf, i.to_be_bytes(), i.to_be_bytes())
+                .unwrap();
+        }
+        assert_eq!(
+            l0(&cf),
+            0,
+            "expected writes to sit in the memtable before flush",
+        );
+        db.flush().unwrap();
+        assert!(
+            l0(&cf) >= 1,
+            "expected at least one L0 SST file after flush, got {}",
+            l0(&cf),
+        );
     }
 
     #[test]
