@@ -16,7 +16,8 @@ proto-build = { git = "https://github.com/MystenLabs/sui-rust-sdk", branch = "ma
 // SPDX-License-Identifier: Apache-2.0
 
 //! Single-file cargo script that regenerates the Rust code under
-//! `src/proto/generated/` from the `.proto` files under `proto/`.
+//! `crates/sui-consistent-store/src/proto/generated/` from the
+//! `.proto` files under `crates/sui-consistent-store/proto/`.
 //!
 //! Mirrors the structure of the codegen `main.rs` in
 //! [`sui-rust-sdk/crates/proto-build`](https://github.com/MystenLabs/sui-rust-sdk/tree/master/crates/proto-build),
@@ -25,16 +26,19 @@ proto-build = { git = "https://github.com/MystenLabs/sui-rust-sdk", branch = "ma
 //! omitted — the consistent-store crate only consumes the protobuf
 //! wire format.
 //!
-//! Run from the `crates/sui-consistent-store/` directory:
+//! Invoke from anywhere with:
 //!
 //! ```bash
-//! ./codegen.rs
+//! cargo +nightly -Zscript path/to/codegen.rs
 //! ```
 //!
-//! Output files are written to `src/proto/generated/` (one
-//! `<package>.rs` per proto package, plus per-package accessor and
-//! field-info files). Re-run after any change to `proto/*.proto`
-//! and commit the regenerated files alongside the proto change.
+//! Cargo's `CARGO_MANIFEST_DIR` env var anchors the input/output
+//! paths to the script's own directory, so the working directory
+//! at invocation does not matter. Output files are written to
+//! `src/proto/generated/` within this crate (one `<package>.rs`
+//! per proto package, plus per-package accessor and field-info
+//! files). Re-run after any change to `proto/*.proto` and commit
+//! the regenerated files alongside the proto change.
 
 use std::path::PathBuf;
 
@@ -43,12 +47,16 @@ use proto_build::context;
 use proto_build::message_graph::DescriptorGraph;
 
 fn main() {
-    // The script must be invoked from the crate root so the
-    // proto/ and src/ paths below resolve correctly.
-    let crate_dir = std::env::current_dir().expect("failed to read current dir");
+    // Cargo sets `CARGO_MANIFEST_DIR` at compile time to the
+    // directory containing this script (the script's
+    // embedded-manifest equivalent of a package root). Reading it
+    // via `env!` instead of at runtime makes the path absolute
+    // and resolves it against the script's location regardless of
+    // the working directory at invocation.
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let proto_dir = crate_dir.join("proto").canonicalize().expect(
-        "expected a `proto/` subdirectory; run this script from \
-         crates/sui-consistent-store/",
+        "expected a `proto/` subdirectory alongside this script; the script must \
+         live in the crate root",
     );
     let out_dir = crate_dir.join("src/proto/generated");
     std::fs::create_dir_all(&out_dir).expect("failed to create out dir");
