@@ -37,8 +37,6 @@
 //! typed writes), construct with
 //! [`FrameworkSchema::new(db.clone())`](FrameworkSchema::new).
 
-use std::collections::BTreeSet;
-
 use bytes::Buf;
 use bytes::BufMut;
 
@@ -99,162 +97,39 @@ impl Decode for PipelineTaskKey {
 
 /// Per-pipeline restore progress, persisted in [`RESTORE_CF`].
 ///
-/// Drivers transition a pipeline:
-/// 1. `None` → `InProgress { partitions_complete: empty, target_checkpoint: T }`
-///    when restore begins.
+/// Re-export of the generated protobuf message. Drivers transition
+/// a pipeline:
+/// 1. `None` (no entry) → `InProgress` when restore begins.
 /// 2. `InProgress` → `InProgress` with one more partition marked
 ///    complete, atomically with each shard's data writes.
-/// 3. `InProgress` → `Complete { restored_at: T }` when every
-///    partition has been committed.
+/// 3. `InProgress` → `Complete` when every partition has been
+///    committed.
 ///
 /// Tip indexing for a pipeline must wait until its state reaches
 /// `Complete`. Drivers check this on startup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RestoreState {
-    /// Restore has started for this pipeline.
-    ///
-    /// `partitions_complete` enumerates which of the driver's
-    /// shards or partitions have been atomically ingested. The
-    /// driver decides what bytes identify a partition; this crate
-    /// treats them as opaque.
-    ///
-    /// `target_checkpoint` is the checkpoint number the restore is
-    /// aimed at. The restore source dictates this value (the
-    /// formal snapshot's anchor checkpoint, or the validator's
-    /// genesis-up-to checkpoint), and tip indexing resumes at
-    /// `target_checkpoint + 1` once the pipeline reaches
-    /// [`Complete`](RestoreState::Complete).
-    InProgress {
-        target_checkpoint: u64,
-        partitions_complete: BTreeSet<Vec<u8>>,
-    },
-    /// Restore has finished for this pipeline.
-    ///
-    /// `restored_at` is the checkpoint number the pipeline was
-    /// restored to. Tip indexing resumes at `restored_at + 1`.
-    Complete { restored_at: u64 },
-}
-
-/// Tag byte distinguishing [`RestoreState::InProgress`] from
-/// [`RestoreState::Complete`] on the wire.
-const TAG_IN_PROGRESS: u8 = 0;
-const TAG_COMPLETE: u8 = 1;
+pub use crate::proto::sui::db::v1alpha::RestoreState;
+pub use crate::proto::sui::db::v1alpha::restore_state;
 
 impl Encode for RestoreState {
     fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
-        match self {
-            Self::InProgress {
-                target_checkpoint,
-                partitions_complete,
-            } => {
-                buf.put_u8(TAG_IN_PROGRESS);
-                buf.put_u64(*target_checkpoint);
-                let count: u32 = partitions_complete
-                    .len()
-                    .try_into()
-                    .map_err(|_| EncodeError::msg("partitions_complete count exceeds u32::MAX"))?;
-                buf.put_u32(count);
-                for partition in partitions_complete {
-                    let len: u32 = partition
-                        .len()
-                        .try_into()
-                        .map_err(|_| EncodeError::msg("partition id exceeds u32::MAX bytes"))?;
-                    buf.put_u32(len);
-                    buf.put_slice(partition);
-                }
-            }
-            Self::Complete { restored_at } => {
-                buf.put_u8(TAG_COMPLETE);
-                buf.put_u64(*restored_at);
-            }
-        }
-        Ok(())
+        crate::protobuf::encode_into(self, buf)
     }
 }
 
 impl Decode for RestoreState {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
-        if buf.remaining() < 1 {
-            return Err(DecodeError::msg("RestoreState missing tag byte"));
-        }
-        let tag = buf.get_u8();
-        match tag {
-            TAG_IN_PROGRESS => {
-                if buf.remaining() < 8 + 4 {
-                    return Err(DecodeError::msg(
-                        "RestoreState::InProgress truncated header",
-                    ));
-                }
-                let target_checkpoint = buf.get_u64();
-                let count = buf.get_u32() as usize;
-                let mut partitions_complete = BTreeSet::new();
-                for _ in 0..count {
-                    if buf.remaining() < 4 {
-                        return Err(DecodeError::msg(
-                            "RestoreState::InProgress truncated partition length",
-                        ));
-                    }
-                    let len = buf.get_u32() as usize;
-                    if buf.remaining() < len {
-                        return Err(DecodeError::msg(
-                            "RestoreState::InProgress truncated partition bytes",
-                        ));
-                    }
-                    let mut partition = vec![0u8; len];
-                    buf.copy_to_slice(&mut partition);
-                    if !partitions_complete.insert(partition) {
-                        return Err(DecodeError::msg(
-                            "RestoreState::InProgress duplicate partition id",
-                        ));
-                    }
-                }
-                if buf.has_remaining() {
-                    return Err(DecodeError::msg(
-                        "RestoreState::InProgress trailing bytes after partition list",
-                    ));
-                }
-                Ok(Self::InProgress {
-                    target_checkpoint,
-                    partitions_complete,
-                })
-            }
-            TAG_COMPLETE => {
-                if buf.remaining() != 8 {
-                    return Err(DecodeError::msg(
-                        "RestoreState::Complete wrong length after tag",
-                    ));
-                }
-                let restored_at = buf.get_u64();
-                Ok(Self::Complete { restored_at })
-            }
-            other => Err(DecodeError::msg(format!(
-                "RestoreState unknown tag byte: {other}"
-            ))),
-        }
+        crate::protobuf::decode(buf)
     }
 }
 
 /// Per-pipeline committer watermark, persisted in [`WATERMARK_CF`].
 ///
-/// Holds the highest checkpoint each pipeline has committed plus
-/// the corresponding epoch / tx / timestamp. Tip-mode drivers
-/// advance this atomically with each pipeline's data writes, and
-/// read it on restart to decide where to resume.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Watermark {
-    /// Highest epoch number observed at or before
-    /// `checkpoint_hi_inclusive`.
-    pub epoch_hi_inclusive: u64,
-    /// Inclusive upper bound of checkpoints whose effects are
-    /// persisted for this pipeline.
-    pub checkpoint_hi_inclusive: u64,
-    /// Network-total transaction count at
-    /// `checkpoint_hi_inclusive`.
-    pub tx_hi: u64,
-    /// Wall-clock timestamp (ms since epoch) of the checkpoint at
-    /// `checkpoint_hi_inclusive`.
-    pub timestamp_ms_hi_inclusive: u64,
-}
+/// Re-export of the generated protobuf message. Holds the highest
+/// checkpoint each pipeline has committed plus the corresponding
+/// epoch / tx / timestamp. Tip-mode drivers advance this
+/// atomically with each pipeline's data writes, and read it on
+/// restart to decide where to resume.
+pub use crate::proto::sui::db::v1alpha::Watermark;
 
 impl Watermark {
     /// Build a watermark for `checkpoint`, leaving every other
@@ -269,34 +144,15 @@ impl Watermark {
     }
 }
 
-/// On-wire size of a [`Watermark`]. Used by both the encoder and
-/// the decoder to validate buffer sizes precisely.
-const WATERMARK_WIRE_SIZE: usize = 4 * 8;
-
 impl Encode for Watermark {
     fn encode_into<B: BufMut>(&self, buf: &mut B) -> Result<(), EncodeError> {
-        buf.put_u64(self.epoch_hi_inclusive);
-        buf.put_u64(self.checkpoint_hi_inclusive);
-        buf.put_u64(self.tx_hi);
-        buf.put_u64(self.timestamp_ms_hi_inclusive);
-        Ok(())
+        crate::protobuf::encode_into(self, buf)
     }
 }
 
 impl Decode for Watermark {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
-        if buf.remaining() != WATERMARK_WIRE_SIZE {
-            return Err(DecodeError::msg(format!(
-                "Watermark wire size mismatch: expected {WATERMARK_WIRE_SIZE} bytes, got {}",
-                buf.remaining()
-            )));
-        }
-        Ok(Self {
-            epoch_hi_inclusive: buf.get_u64(),
-            checkpoint_hi_inclusive: buf.get_u64(),
-            tx_hi: buf.get_u64(),
-            timestamp_ms_hi_inclusive: buf.get_u64(),
-        })
+        crate::protobuf::decode(buf)
     }
 }
 
@@ -457,7 +313,8 @@ mod tests {
         let (_dir, db) = open();
         let fw = FrameworkSchema::new(db.clone());
         let key = PipelineTaskKey::new("p");
-        let state = RestoreState::Complete { restored_at: 7 };
+        let state =
+            RestoreState::default().with_complete(restore_state::Complete { restored_at: 7 });
 
         let mut batch = db.batch();
         batch.put(&fw.restore, &key, &state).unwrap();
@@ -477,35 +334,37 @@ mod tests {
     }
 
     #[test]
-    fn watermark_round_trips_through_db() {
+    fn watermark_round_trips_through_encoding() {
         let w = Watermark {
             epoch_hi_inclusive: 3,
             checkpoint_hi_inclusive: 12345,
             tx_hi: 99,
             timestamp_ms_hi_inclusive: 1_700_000_000_000,
         };
-        let mut buf = Vec::new();
-        w.encode_into(&mut buf).unwrap();
-        assert_eq!(buf.len(), WATERMARK_WIRE_SIZE);
-        let mut slice = buf.as_slice();
-        let decoded = Watermark::decode(&mut slice).unwrap();
+        let buf = w.encode().unwrap();
+        let decoded = Watermark::decode(&mut buf.as_slice()).unwrap();
         assert_eq!(decoded, w);
     }
 
     #[test]
-    fn watermark_decode_rejects_short_buffer() {
-        let bytes = [0u8; WATERMARK_WIRE_SIZE - 1];
-        let mut slice = bytes.as_slice();
-        let err = Watermark::decode(&mut slice).unwrap_err();
-        assert!(format!("{err:#}").contains("wire size mismatch"));
+    fn watermark_for_checkpoint_sets_only_checkpoint_field() {
+        let w = Watermark::for_checkpoint(42);
+        assert_eq!(w.checkpoint_hi_inclusive, 42);
+        assert_eq!(w.epoch_hi_inclusive, 0);
+        assert_eq!(w.tx_hi, 0);
+        assert_eq!(w.timestamp_ms_hi_inclusive, 0);
     }
 
     #[test]
-    fn watermark_decode_rejects_long_buffer() {
-        let bytes = [0u8; WATERMARK_WIRE_SIZE + 1];
-        let mut slice = bytes.as_slice();
-        let err = Watermark::decode(&mut slice).unwrap_err();
-        assert!(format!("{err:#}").contains("wire size mismatch"));
+    fn watermark_default_round_trips() {
+        // A default Watermark has every field at 0; prost
+        // serializes it to an empty buffer (proto3 skips default
+        // scalars) and decoding returns the all-zeros value.
+        let w = Watermark::default();
+        let buf = w.encode().unwrap();
+        assert!(buf.is_empty(), "default watermark should encode to 0 bytes");
+        let decoded = Watermark::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(decoded, w);
     }
 
     #[test]
@@ -514,15 +373,6 @@ mod tests {
         let mut slice = bytes.as_slice();
         let err = ChainId::decode(&mut slice).unwrap_err();
         assert!(format!("{err:#}").contains("wire size mismatch"));
-    }
-
-    #[test]
-    fn default_watermark_has_zero_fields() {
-        let w = Watermark::default();
-        assert_eq!(w.epoch_hi_inclusive, 0);
-        assert_eq!(w.checkpoint_hi_inclusive, 0);
-        assert_eq!(w.tx_hi, 0);
-        assert_eq!(w.timestamp_ms_hi_inclusive, 0);
     }
 
     #[test]
@@ -555,113 +405,50 @@ mod tests {
         assert_eq!(fw_snap.watermarks.get(&key).unwrap(), Some(w));
     }
 
-    // RestoreState wire format tests.
+    // RestoreState encoding tests.
 
     fn round_trip(state: &RestoreState) -> RestoreState {
-        let mut buf = Vec::new();
-        state.encode_into(&mut buf).unwrap();
-        let mut slice = buf.as_slice();
-        let decoded = RestoreState::decode(&mut slice).unwrap();
-        assert!(
-            !slice.has_remaining(),
-            "decode did not consume the full buffer",
-        );
-        decoded
+        let buf = state.encode().unwrap();
+        RestoreState::decode(&mut buf.as_slice()).unwrap()
     }
 
     #[test]
     fn restore_state_round_trip_complete() {
-        let s = RestoreState::Complete {
+        let s = RestoreState::default().with_complete(restore_state::Complete {
             restored_at: 12_345,
-        };
+        });
         assert_eq!(round_trip(&s), s);
     }
 
     #[test]
     fn restore_state_round_trip_in_progress_empty() {
-        let s = RestoreState::InProgress {
+        let s = RestoreState::default().with_in_progress(restore_state::InProgress {
             target_checkpoint: 999,
-            partitions_complete: BTreeSet::new(),
-        };
+            partitions_complete: vec![],
+        });
         assert_eq!(round_trip(&s), s);
     }
 
     #[test]
     fn restore_state_round_trip_in_progress_with_partitions() {
-        let mut partitions = BTreeSet::new();
-        partitions.insert(vec![0u8, 1, 2, 3]);
-        partitions.insert(b"shard-7".to_vec());
-        partitions.insert(vec![]); // Zero-length partition id is allowed.
-        let s = RestoreState::InProgress {
+        let s = RestoreState::default().with_in_progress(restore_state::InProgress {
             target_checkpoint: 1,
-            partitions_complete: partitions,
-        };
+            partitions_complete: vec![
+                bytes::Bytes::from_static(&[]),
+                bytes::Bytes::from_static(&[0u8, 1, 2, 3]),
+                bytes::Bytes::from_static(b"shard-7"),
+            ],
+        });
         assert_eq!(round_trip(&s), s);
     }
 
     #[test]
-    fn restore_state_decode_rejects_unknown_tag() {
-        let bytes = [42u8];
-        let mut slice = bytes.as_slice();
-        let err = RestoreState::decode(&mut slice).unwrap_err();
-        assert!(err.to_string().contains("unknown tag"));
-    }
-
-    #[test]
-    fn restore_state_decode_rejects_empty_buffer() {
+    fn restore_state_empty_message_round_trips_to_empty_message() {
+        // An empty buffer decodes to a RestoreState with no oneof
+        // variant set. Callers that care about "is there a state?"
+        // inspect `restore_state.state` directly.
         let bytes: [u8; 0] = [];
-        let mut slice = bytes.as_slice();
-        let err = RestoreState::decode(&mut slice).unwrap_err();
-        assert!(err.to_string().contains("missing tag"));
-    }
-
-    #[test]
-    fn restore_state_decode_rejects_truncated_in_progress_header() {
-        let bytes = [TAG_IN_PROGRESS];
-        let mut slice = bytes.as_slice();
-        let err = RestoreState::decode(&mut slice).unwrap_err();
-        assert!(err.to_string().contains("truncated header"));
-    }
-
-    #[test]
-    fn restore_state_decode_rejects_truncated_partition_length() {
-        let mut bytes = vec![TAG_IN_PROGRESS];
-        bytes.extend_from_slice(&1u64.to_be_bytes());
-        bytes.extend_from_slice(&1u32.to_be_bytes()); // claim 1 partition
-        // No partition-length bytes follow.
-        let mut slice = bytes.as_slice();
-        let err = RestoreState::decode(&mut slice).unwrap_err();
-        assert!(err.to_string().contains("truncated partition length"));
-    }
-
-    #[test]
-    fn restore_state_decode_rejects_truncated_partition_bytes() {
-        let mut bytes = vec![TAG_IN_PROGRESS];
-        bytes.extend_from_slice(&1u64.to_be_bytes());
-        bytes.extend_from_slice(&1u32.to_be_bytes()); // claim 1 partition
-        bytes.extend_from_slice(&10u32.to_be_bytes()); // ...of 10 bytes
-        bytes.extend_from_slice(&[1, 2, 3]); // ...but only 3 follow.
-        let mut slice = bytes.as_slice();
-        let err = RestoreState::decode(&mut slice).unwrap_err();
-        assert!(err.to_string().contains("truncated partition bytes"));
-    }
-
-    #[test]
-    fn restore_state_decode_rejects_trailing_bytes_in_in_progress() {
-        let mut bytes = vec![TAG_IN_PROGRESS];
-        bytes.extend_from_slice(&0u64.to_be_bytes());
-        bytes.extend_from_slice(&0u32.to_be_bytes()); // zero partitions
-        bytes.push(0xFF); // unexpected trailing byte
-        let mut slice = bytes.as_slice();
-        let err = RestoreState::decode(&mut slice).unwrap_err();
-        assert!(err.to_string().contains("trailing bytes"));
-    }
-
-    #[test]
-    fn restore_state_decode_rejects_wrong_length_for_complete() {
-        let bytes = [TAG_COMPLETE, 1, 2];
-        let mut slice = bytes.as_slice();
-        let err = RestoreState::decode(&mut slice).unwrap_err();
-        assert!(err.to_string().contains("wrong length"));
+        let decoded = RestoreState::decode(&mut bytes.as_slice()).unwrap();
+        assert!(decoded.state.is_none());
     }
 }

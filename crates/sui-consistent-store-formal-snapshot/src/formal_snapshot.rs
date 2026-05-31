@@ -749,9 +749,9 @@ mod tests {
             }
 
             // Restore state is Complete at the snapshot's epoch.
-            match read_restore_state(&db, "versions") {
-                Some(RestoreState::Complete { restored_at }) => {
-                    assert_eq!(restored_at, 42);
+            match read_restore_state(&db, "versions").and_then(|s| s.state) {
+                Some(sui_consistent_store::restore_state::State::Complete(complete)) => {
+                    assert_eq!(complete.restored_at, 42);
                 }
                 other => panic!("expected Complete, got {other:?}"),
             }
@@ -792,7 +792,6 @@ mod tests {
             // First run: only mark partition 0 as complete (simulate
             // a crash after partition 0 ingested but before
             // partition 1).
-            let mut done = std::collections::BTreeSet::new();
             let p0 = FormalSnapshot::partition_id(&FileMetadata {
                 file_type: FileType::Object,
                 bucket: 0,
@@ -800,14 +799,15 @@ mod tests {
                 compression: FileCompression::None,
                 digest: [0u8; 32],
             });
-            done.insert(p0.to_vec());
             write_restore_state(
                 &db,
                 "versions",
-                &RestoreState::InProgress {
-                    target_checkpoint: 7,
-                    partitions_complete: done,
-                },
+                &RestoreState::default().with_in_progress(
+                    sui_consistent_store::restore_state::InProgress {
+                        target_checkpoint: 7,
+                        partitions_complete: vec![bytes::Bytes::copy_from_slice(&p0)],
+                    },
+                ),
             );
 
             // Resume the restore. Only partition 1 should be

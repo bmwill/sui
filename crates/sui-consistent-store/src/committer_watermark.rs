@@ -6,10 +6,10 @@
 //! [`CommitterWatermark`] (the indexer-alt framework's
 //! per-pipeline progress type).
 //!
-//! The two types share the same four fields. We can't supply `From`
-//! impls because [`CommitterWatermark`] is not local to this crate
-//! (orphan rule), so the conversion is exposed as plain functions
-//! instead.
+//! The two types share the same four `u64` fields. We can't
+//! supply `From` impls because [`CommitterWatermark`] is not local
+//! to this crate (orphan rule), so the conversion is exposed as
+//! plain functions instead.
 
 use sui_indexer_alt_framework_store_traits::CommitterWatermark;
 

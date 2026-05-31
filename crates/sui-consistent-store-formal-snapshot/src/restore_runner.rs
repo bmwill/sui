@@ -74,6 +74,7 @@ use sui_consistent_store::PipelineTaskKey;
 use sui_consistent_store::Restore;
 use sui_consistent_store::RestoreState;
 use sui_consistent_store::error::Error;
+use sui_consistent_store::restore_state;
 use sui_types::object::Object;
 use tracing::debug;
 use tracing::info;
@@ -149,12 +150,14 @@ impl<P: Restore> RestoreRunner<P> {
     ///   `target_checkpoint` — refuse to mix two restore runs.
     pub fn begin(&self) -> anyhow::Result<BTreeSet<Vec<u8>>> {
         let _guard = self.state_lock.lock();
-        match self.read_state()? {
+        match self.read_state()?.and_then(|s| s.state) {
             None => {
-                self.write_state(&RestoreState::InProgress {
-                    target_checkpoint: self.target_checkpoint,
-                    partitions_complete: BTreeSet::new(),
-                })?;
+                self.write_state(&RestoreState::default().with_in_progress(
+                    restore_state::InProgress {
+                        target_checkpoint: self.target_checkpoint,
+                        partitions_complete: vec![],
+                    },
+                ))?;
                 info!(
                     pipeline = P::NAME,
                     target_checkpoint = self.target_checkpoint,
@@ -162,30 +165,32 @@ impl<P: Restore> RestoreRunner<P> {
                 );
                 Ok(BTreeSet::new())
             }
-            Some(RestoreState::InProgress {
-                target_checkpoint,
-                partitions_complete,
-            }) => {
+            Some(restore_state::State::InProgress(in_progress)) => {
                 anyhow::ensure!(
-                    target_checkpoint == self.target_checkpoint,
+                    in_progress.target_checkpoint == self.target_checkpoint,
                     "pipeline {} is mid-restore at checkpoint {}, but this runner targets {}",
                     P::NAME,
-                    target_checkpoint,
+                    in_progress.target_checkpoint,
                     self.target_checkpoint,
                 );
+                let partitions_complete: BTreeSet<Vec<u8>> = in_progress
+                    .partitions_complete
+                    .iter()
+                    .map(|p| p.as_ref().to_vec())
+                    .collect();
                 info!(
                     pipeline = P::NAME,
-                    target_checkpoint,
+                    target_checkpoint = in_progress.target_checkpoint,
                     skip_count = partitions_complete.len(),
                     "Resuming restore",
                 );
                 Ok(partitions_complete)
             }
-            Some(RestoreState::Complete { restored_at }) => {
+            Some(restore_state::State::Complete(complete)) => {
                 anyhow::bail!(
                     "pipeline {} is already restored at checkpoint {}; refusing to restart",
                     P::NAME,
-                    restored_at,
+                    complete.restored_at,
                 );
             }
         }
@@ -201,12 +206,12 @@ impl<P: Restore> RestoreRunner<P> {
     /// with [`begin`](Self::begin) returning.
     pub fn already_complete(&self, partition_id: &[u8]) -> anyhow::Result<bool> {
         let _guard = self.state_lock.lock();
-        match self.read_state()? {
-            Some(RestoreState::InProgress {
-                partitions_complete,
-                ..
-            }) => Ok(partitions_complete.contains(partition_id)),
-            Some(RestoreState::Complete { .. }) => Ok(true),
+        match self.read_state()?.and_then(|s| s.state) {
+            Some(restore_state::State::InProgress(in_progress)) => Ok(in_progress
+                .partitions_complete
+                .iter()
+                .any(|p: &bytes::Bytes| p.as_ref() == partition_id)),
+            Some(restore_state::State::Complete(_)) => Ok(true),
             None => Ok(false),
         }
     }
@@ -282,9 +287,11 @@ impl<P: Restore> RestoreRunner<P> {
     /// driver owns that list.
     pub fn finish(&self) -> anyhow::Result<()> {
         let _guard = self.state_lock.lock();
-        self.write_state(&RestoreState::Complete {
-            restored_at: self.target_checkpoint,
-        })?;
+        self.write_state(
+            &RestoreState::default().with_complete(restore_state::Complete {
+                restored_at: self.target_checkpoint,
+            }),
+        )?;
         info!(
             pipeline = P::NAME,
             restored_at = self.target_checkpoint,
@@ -304,18 +311,14 @@ impl<P: Restore> RestoreRunner<P> {
     /// concurrent shard processors do not race on the
     /// read-modify-write of `partitions_complete`.
     fn next_partition_state(&self, partition_id: &[u8]) -> Result<RestoreState, Error> {
-        let current = self.read_state()?;
-        let mut partitions_complete = match current {
-            Some(RestoreState::InProgress {
-                target_checkpoint,
-                partitions_complete,
-            }) => {
+        let mut in_progress = match self.read_state()?.and_then(|s| s.state) {
+            Some(restore_state::State::InProgress(in_progress)) => {
                 debug_assert_eq!(
-                    target_checkpoint, self.target_checkpoint,
+                    in_progress.target_checkpoint, self.target_checkpoint,
                     "partition update after target_checkpoint mismatch — \
                      should have been caught at begin()",
                 );
-                partitions_complete
+                in_progress
             }
             // Mid-restore should always be InProgress; if we see
             // something else, the state was changed under us, which
@@ -326,11 +329,10 @@ impl<P: Restore> RestoreRunner<P> {
                 ));
             }
         };
-        partitions_complete.insert(partition_id.to_vec());
-        Ok(RestoreState::InProgress {
-            target_checkpoint: self.target_checkpoint,
-            partitions_complete,
-        })
+        in_progress
+            .partitions_complete
+            .push(bytes::Bytes::copy_from_slice(partition_id));
+        Ok(RestoreState::default().with_in_progress(in_progress))
     }
 }
 
@@ -369,6 +371,47 @@ mod tests {
     use sui_consistent_store::rocksdb;
 
     use super::*;
+
+    /// Build an `InProgress` restore state with the supplied
+    /// partition ids. Useful in test helpers that previously
+    /// constructed `RestoreState::InProgress { ... }` directly.
+    fn in_progress(
+        target_checkpoint: u64,
+        partitions: impl IntoIterator<Item = Vec<u8>>,
+    ) -> RestoreState {
+        RestoreState::default().with_in_progress(restore_state::InProgress {
+            target_checkpoint,
+            partitions_complete: partitions.into_iter().map(bytes::Bytes::from).collect(),
+        })
+    }
+
+    /// Build a `Complete` restore state.
+    fn complete(restored_at: u64) -> RestoreState {
+        RestoreState::default().with_complete(restore_state::Complete { restored_at })
+    }
+
+    /// Extract the `InProgress` payload (panics otherwise). Mirrors
+    /// the old `match Some(RestoreState::InProgress { .. })` pattern
+    /// that tests used to write directly.
+    fn expect_in_progress(state: Option<RestoreState>) -> restore_state::InProgress {
+        match state.and_then(|s| s.state) {
+            Some(restore_state::State::InProgress(in_progress)) => in_progress,
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+    }
+
+    /// Extract the `Complete` payload (panics otherwise).
+    fn expect_complete(state: Option<RestoreState>) -> restore_state::Complete {
+        match state.and_then(|s| s.state) {
+            Some(restore_state::State::Complete(complete)) => complete,
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    /// True if `partitions` contains a byte sequence equal to `id`.
+    fn partitions_contain(partitions: &[bytes::Bytes], id: &[u8]) -> bool {
+        partitions.iter().any(|p| p.as_ref() == id)
+    }
 
     /// Test helper: read the persisted `RestoreState` for
     /// `pipeline`. Mirrors the production
@@ -586,49 +629,27 @@ mod tests {
         let (_db_dir, db, _schema, runner) = setup_versions(100);
         let skip = runner.begin().unwrap();
         assert!(skip.is_empty());
-        match read_restore_state(&db, "versions") {
-            Some(RestoreState::InProgress {
-                target_checkpoint,
-                partitions_complete,
-            }) => {
-                assert_eq!(target_checkpoint, 100);
-                assert!(partitions_complete.is_empty());
-            }
-            other => panic!("expected InProgress, got {other:?}"),
-        }
+        let in_progress = expect_in_progress(read_restore_state(&db, "versions"));
+        assert_eq!(in_progress.target_checkpoint, 100);
+        assert!(in_progress.partitions_complete.is_empty());
     }
 
     #[test]
     fn begin_returns_completed_partitions_from_prior_run() {
         let (_db_dir, db, _schema, runner) = setup_versions(100);
         // Simulate a prior partial run.
-        let mut prior = BTreeSet::new();
-        prior.insert(vec![0xAAu8]);
-        prior.insert(vec![0xBBu8]);
-        write_restore_state(
-            &db,
-            "versions",
-            &RestoreState::InProgress {
-                target_checkpoint: 100,
-                partitions_complete: prior.clone(),
-            },
-        );
+        let prior_ids = [vec![0xAAu8], vec![0xBBu8]];
+        write_restore_state(&db, "versions", &in_progress(100, prior_ids.clone()));
 
         let skip = runner.begin().unwrap();
-        assert_eq!(skip, prior);
+        let expected: BTreeSet<Vec<u8>> = prior_ids.into_iter().collect();
+        assert_eq!(skip, expected);
     }
 
     #[test]
     fn begin_refuses_target_mismatch() {
         let (_db_dir, db, _schema, runner) = setup_versions(100);
-        write_restore_state(
-            &db,
-            "versions",
-            &RestoreState::InProgress {
-                target_checkpoint: 200,
-                partitions_complete: BTreeSet::new(),
-            },
-        );
+        write_restore_state(&db, "versions", &in_progress(200, []));
         let err = runner.begin().unwrap_err();
         assert!(format!("{err}").contains("mid-restore at checkpoint 200"));
     }
@@ -636,11 +657,7 @@ mod tests {
     #[test]
     fn begin_refuses_already_complete() {
         let (_db_dir, db, _schema, runner) = setup_versions(100);
-        write_restore_state(
-            &db,
-            "versions",
-            &RestoreState::Complete { restored_at: 50 },
-        );
+        write_restore_state(&db, "versions", &complete(50));
         let err = runner.begin().unwrap_err();
         assert!(format!("{err}").contains("already restored"));
     }
@@ -674,15 +691,8 @@ mod tests {
         );
 
         // Partition is recorded.
-        match read_restore_state(&db, "versions") {
-            Some(RestoreState::InProgress {
-                partitions_complete,
-                ..
-            }) => {
-                assert!(partitions_complete.contains(b"shard-0".as_slice()));
-            }
-            other => panic!("expected InProgress, got {other:?}"),
-        }
+        let in_progress = expect_in_progress(read_restore_state(&db, "versions"));
+        assert!(partitions_contain(&in_progress.partitions_complete, b"shard-0"));
     }
 
     #[test]
@@ -691,16 +701,7 @@ mod tests {
         runner.begin().unwrap();
 
         // Pre-mark shard-0 as complete.
-        let mut done = BTreeSet::new();
-        done.insert(b"shard-0".to_vec());
-        write_restore_state(
-            &db,
-            "versions",
-            &RestoreState::InProgress {
-                target_checkpoint: 100,
-                partitions_complete: done,
-            },
-        );
+        write_restore_state(&db, "versions", &in_progress(100, [b"shard-0".to_vec()]));
 
         // Running shard-0 again must not write anything new.
         runner.process_shard(b"shard-0", vec![Ok(obj(1))]).unwrap();
@@ -721,15 +722,8 @@ mod tests {
         runner
             .process_shard(b"empty", Vec::<anyhow::Result<Object>>::new())
             .unwrap();
-        match read_restore_state(&db, "versions") {
-            Some(RestoreState::InProgress {
-                partitions_complete,
-                ..
-            }) => {
-                assert!(partitions_complete.contains(b"empty".as_slice()));
-            }
-            other => panic!("expected InProgress, got {other:?}"),
-        }
+        let in_progress = expect_in_progress(read_restore_state(&db, "versions"));
+        assert!(partitions_contain(&in_progress.partitions_complete, b"empty"));
     }
 
     #[test]
@@ -745,15 +739,8 @@ mod tests {
         let err = runner.process_shard(b"bad", stream).unwrap_err();
         assert!(format!("{err}").contains("source-side IO failed"));
 
-        match read_restore_state(&db, "versions") {
-            Some(RestoreState::InProgress {
-                partitions_complete,
-                ..
-            }) => {
-                assert!(!partitions_complete.contains(b"bad".as_slice()));
-            }
-            other => panic!("expected InProgress, got {other:?}"),
-        }
+        let in_progress = expect_in_progress(read_restore_state(&db, "versions"));
+        assert!(!partitions_contain(&in_progress.partitions_complete, b"bad"));
     }
 
     #[test]
@@ -805,10 +792,8 @@ mod tests {
         );
 
         // Restore is marked complete.
-        match read_restore_state(&db, "counters") {
-            Some(RestoreState::Complete { restored_at }) => assert_eq!(restored_at, 42),
-            other => panic!("expected Complete, got {other:?}"),
-        }
+        let complete = expect_complete(read_restore_state(&db, "counters"));
+        assert_eq!(complete.restored_at, 42);
     }
 
     #[test]
@@ -817,10 +802,8 @@ mod tests {
         runner.begin().unwrap();
         runner.process_shard(b"only", vec![Ok(obj(1))]).unwrap();
         runner.finish().unwrap();
-        match read_restore_state(&db, "versions") {
-            Some(RestoreState::Complete { restored_at }) => assert_eq!(restored_at, 100),
-            other => panic!("expected Complete, got {other:?}"),
-        }
+        let complete = expect_complete(read_restore_state(&db, "versions"));
+        assert_eq!(complete.restored_at, 100);
     }
 
     #[test]
@@ -853,17 +836,10 @@ mod tests {
             h.join().unwrap();
         }
 
-        match read_restore_state(&db, "versions") {
-            Some(RestoreState::InProgress {
-                partitions_complete,
-                ..
-            }) => {
-                assert_eq!(partitions_complete.len(), 16);
-                for i in 0..16u8 {
-                    assert!(partitions_complete.contains(&vec![i]));
-                }
-            }
-            other => panic!("expected InProgress, got {other:?}"),
+        let in_progress = expect_in_progress(read_restore_state(&db, "versions"));
+        assert_eq!(in_progress.partitions_complete.len(), 16);
+        for i in 0..16u8 {
+            assert!(partitions_contain(&in_progress.partitions_complete, &[i]));
         }
     }
 

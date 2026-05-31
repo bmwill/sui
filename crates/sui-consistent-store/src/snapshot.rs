@@ -137,8 +137,8 @@ impl Snapshot {
         Self { entry, db }
     }
 
-    /// The checkpoint number this snapshot was taken at. Convenience
-    /// alias for `self.watermark().checkpoint_hi_inclusive`.
+    /// The checkpoint number this snapshot was taken at.
+    /// Convenience alias for `self.watermark().checkpoint_hi_inclusive`.
     pub fn checkpoint(&self) -> u64 {
         self.entry.watermark().checkpoint_hi_inclusive
     }
