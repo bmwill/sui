@@ -170,6 +170,7 @@ impl Synchronizer {
             "no pipelines registered with the synchronizer",
         );
 
+        let stride = self.stride.get();
         let pre_snap = Arc::new(Barrier::new(self.last_watermarks.len()));
         let post_snap = Arc::new(Barrier::new(self.last_watermarks.len()));
 
